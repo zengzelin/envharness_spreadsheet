@@ -28,7 +28,7 @@
 
 """SpreadsheetBench tool registry.
 
-Two tools, both dispatched directly by `SpreadsheetBenchEnv.step` (the working
+Three tools, all dispatched directly by `SpreadsheetBenchEnv.step` (the working
 directory + subprocess execution live on the Bridge, not in env_state, so we
 bypass `Tool.invoke` exactly like the alfworld / swebench bridges). These stubs
 exist only so `tool_schemas()` can emit the function-call schema the Policy and
@@ -47,7 +47,8 @@ class RunPython(Tool):
         "Execute a Python 3 snippet inside the task's working directory "
         "(openpyxl and pandas are available). Use it to inspect the input "
         "spreadsheet and to produce the answer. You MUST save your final "
-        "result to the absolute output_path given in the observation. The "
+        "result to output_path. The runtime predefines input_path, output_path, "
+        "working_directory, load_workbook_for_edit(), and save_workbook(). The "
         "snippet's combined stdout+stderr is returned as the next observation. "
         "Commands are stateless between calls (each runs in a fresh process), "
         "so write a self-contained script each time."
@@ -58,6 +59,22 @@ class RunPython(Tool):
         raise NotImplementedError(
             "RunPython.invoke is unused; SpreadsheetBenchEnv.step executes the "
             "code in the episode working directory directly."
+        )
+
+
+class ValidateWorkbook(Tool):
+    name = "validate_workbook"
+    description = (
+        "Check that output_path exists, opens as an Excel workbook, and "
+        "contains every sheet and range named by answer_position. This does "
+        "not compare against the hidden target and does not end the episode."
+    )
+
+    @classmethod
+    def invoke(cls, env_state: Any) -> Any:
+        raise NotImplementedError(
+            "ValidateWorkbook.invoke is unused; SpreadsheetBenchEnv.step "
+            "validates the episode output directly."
         )
 
 

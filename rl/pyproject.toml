@@ -16,7 +16,7 @@
 name = "envharness_rl"
 version = "0.1.0"
 description = "RL-training adapters (verl-agent GRPO) on top of release_version EnvHarness"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
     "gymnasium",
     "ray",
@@ -27,4 +27,8 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["envharness_rl", "envharness_rl.alfworld"]
+packages = [
+    "envharness_rl",
+    "envharness_rl.alfworld",
+    "envharness_rl.spreadsheetbench",
+]

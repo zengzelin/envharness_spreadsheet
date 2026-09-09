@@ -7,21 +7,25 @@ into this repository** — `rl/scripts/fetch_verl_agent.sh` clones upstream at
 that commit and applies the patch, reproducing the tree the RL experiments
 ran against.
 
-**The default fetch applies a SINGLE change vs upstream — `env_manager.py`
-(the env route), via `rl/integration/verl_agent_env_manager.patch`.** For the
-default Qwen2.5-1.5B ALFWorld example that is all that is needed. The other
+**The default fetch applies the environment routes plus a small tracking
+lifecycle compatibility patch.** The route is maintained in
+`rl/integration/verl_agent_env_manager.patch`; explicit, idempotent W&B and
+TensorBoard shutdown is maintained in
+`rl/integration/verl_agent_tracking_lifecycle.patch`. The other
 adaptations below (Qwen3-8B / DAPO / webshop / SWE-Gym) are preserved in
 `rl/integration/verl_agent_all_changes.patch` — fetch with `PATCH=all` to
 apply them instead.
 
 Below is every change we originally made relative to upstream (10 files);
-only the first (`env_manager.py`) is applied by the default fetch.
+the route and tracking lifecycle changes are applied by the default fetch.
 
 ## Environment integration (the core adaptation — LIVE)
 
 | file | change |
 |---|---|
-| `agent_system/environments/env_manager.py` | **Additive env routes** selected by `env.env_name`, all inside the existing `alfworld` / new branches — they build EnvHarness-wrapped envs and reuse the stock EnvironmentManagers:<br>• `envharness_rl/alfworld` → release_version `AlfworldEnv` + `Rules` (via `release_version_rl`)<br>• `envharness/alfworld` → legacy `AlfworldBridge` + `MutationLayer`<br>• `envharness_webshop` → `envharness.bridges.webshop.WebshopBridge`<br>• `envharness_swegym` / `envharness_swegym_openhands` → SWE-Gym bridges<br>Legacy/stock routes are left untouched. |
+| `agent_system/environments/env_manager.py` | **Additive env routes** selected by `env.env_name`, all inside the existing `alfworld` / new branches — they build EnvHarness-wrapped envs and reuse or import the corresponding EnvironmentManagers:<br>• `envharness_rl/spreadsheetbench` → `SpreadsheetBenchEnv` + OJ verifier, with distinct train/validation trajectory labels<br>• `envharness_rl/alfworld` → release_version `AlfworldEnv` + `Rules` (via `release_version_rl`)<br>• `envharness/alfworld` → legacy `AlfworldBridge` + `MutationLayer`<br>• `envharness_webshop` → `envharness.bridges.webshop.WebshopBridge`<br>• `envharness_swegym` / `envharness_swegym_openhands` → SWE-Gym bridges<br>Legacy/stock routes are left untouched. |
+| `agent_system/multi_turn_rollout/rollout_loop.py` | Exports SpreadsheetBench parser, output-length, and structured Python error diagnostics into rollout batches. |
+| `verl/trainer/ppo/ray_trainer.py`, `recipe/hgpo/hgpo_ray_trainer.py` | Aggregates SpreadsheetBench syntax, runtime, timeout, parser, and output diagnostics into training metrics. |
 | `agent_system/environments/prompts/alfworld.py` | Added non-task-specific anti-loop **tips** to the ALFWorld prompt templates (nudges against repeated/ineffective commands; +~10pp SR for Qwen3-8B non-thinking OOD). |
 | `agent_system/environments/env_package/webshop/projection.py` | Added a lightweight **`WS_PROJ_DIAG` diagnostic print** (running valid_action_ratio + chinese_rate), since the webshop env manager doesn't report valid_action_ratio. No effect on returned actions/valids. |
 
@@ -42,12 +46,19 @@ only the first (`env_manager.py`) is applied by the default fetch.
 | `verl/utils/vllm_utils.py` | Small util patch for Qwen3 / newer vLLM. |
 | `verl/workers/sharding_manager/fsdp_vllm.py` | FSDP→vLLM weight-sync patch for the above. |
 
+## Tracking lifecycle (LIVE)
+
+| file | change |
+|---|---|
+| `verl/utils/tracking.py` | Adds an explicit, idempotent `finish()` and leaves `__del__` as a best-effort fallback, avoiding W&B asyncio re-entry during Ray worker destruction. |
+| `verl/trainer/ppo/ray_trainer.py` | Calls `logger.finish()` on both normal and validation-only completion paths. |
+
 ## Not required for the basic examples
 
-For the default **Qwen2.5-1.5B ALFWorld example** (`release_version_rl`), only the
-`env_manager.py` route is strictly required. The `rollout_loop.py`,
+For the default **Qwen2.5-1.5B ALFWorld example** and SpreadsheetBench adapter,
+only the `env_manager.py` routes are strictly required. The `rollout_loop.py`,
 `prompts/alfworld.py`, and `verl/*` changes matter only for Qwen3-8B / DAPO /
 webshop / SWE-Gym runs.
 
 The full diff vs upstream is also saved at
-`release_version_rl/integration/verl_agent_all_changes.patch` in the EnvHarness repo.
+`rl/integration/verl_agent_all_changes.patch` in the EnvHarness repo.

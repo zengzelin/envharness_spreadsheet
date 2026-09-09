@@ -36,10 +36,12 @@ folder" model, the file-based analogue of the swebench Docker container or the
 alfworld TextWorld engine. Rules-written code never sees the working dir, only
 the `SpreadsheetBenchEnvState` dataclass (pure data).
 
-Action contract (multi-turn ReAct, two tools):
+Action contract (multi-turn ReAct, three tools):
     run_python(code: str) -- execute a Python snippet in the working dir
                              (openpyxl/pandas available); the agent must save
                              its result to `output_path`. Stateless per call.
+    validate_workbook()  -- check output workbook structure without accessing
+                             the hidden golden workbook.
     submit()              -- declare output_path final; ends the episode and
                              triggers grading.
     If the agent never submits, the episode runs to max_steps and we grade
@@ -71,10 +73,15 @@ Reset options (passed through `options` in reset()):
     preview_rows/cols: int -- size of the spreadsheet preview in the obs.
     recalc_golden: bool  -- recalc the golden before comparison (default True;
                             cached per golden path).
+    python_error_penalty: float -- reward for a failed non-syntax Python call
+                                   (default -0.05).
+    syntax_error_penalty: float -- reward for Syntax/Indentation/TabError
+                                   (default -0.1).
 """
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -92,15 +99,26 @@ from envharness.core.types import (
 )
 from . import online_judge_eval
 from .dataset import (
-    DATA_PATH_ENV, SBTask, load_dataset, select_task,
+    DATA_PATH_ENV, SBTask, load_dataset, load_spreadsheet_rl_dataset, select_task,
 )
-from .tools import RunPython, Submit
+from .tools import RunPython, Submit, ValidateWorkbook
 
 
 DEFAULT_STEP_TIMEOUT = 60
 DEFAULT_OBS_TRUNCATE = 6000
 DEFAULT_PREVIEW_ROWS = 20
 DEFAULT_PREVIEW_COLS = 16
+DEFAULT_PYTHON_ERROR_PENALTY = -0.05
+DEFAULT_SYNTAX_ERROR_PENALTY = -0.1
+_PYTHON_EXCEPTION_RE = re.compile(
+    r"(?m)^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)):\s*"
+)
+_SYNTAX_ERROR_TYPES = {"SyntaxError", "IndentationError", "TabError"}
+
+
+def _safe_file_stem(value: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
+    return stem or "task"
 
 
 @dataclass
@@ -119,6 +137,7 @@ class SpreadsheetBenchEnvState:
     last_code: str = ""                     # most recent run_python snippet
     last_output: str = ""                   # most recent stdout+stderr (truncated)
     last_returncode: int = 0                # most recent run_python returncode
+    last_error_type: str = ""               # final Python exception class, if any
     submitted: bool = False                 # True once the agent called submit()
     step_count: int = 0
     extras: dict[str, Any] = field(default_factory=dict)
@@ -129,7 +148,9 @@ class SpreadsheetBenchEnv(ActionableEnv):
     """SpreadsheetBench ActionableEnv. Per-episode sandbox working dir;
     multi-turn run_python ReAct; LibreOffice Online-Judge grading."""
 
-    tool_registry: ClassVar[list[type[Tool]]] = [RunPython, Submit]
+    tool_registry: ClassVar[list[type[Tool]]] = [
+        RunPython, ValidateWorkbook, Submit
+    ]
 
     def __init__(self) -> None:
         super().__init__()
@@ -144,6 +165,8 @@ class SpreadsheetBenchEnv(ActionableEnv):
         self._preview_rows: int = DEFAULT_PREVIEW_ROWS
         self._preview_cols: int = DEFAULT_PREVIEW_COLS
         self._recalc_golden: bool = True
+        self._python_error_penalty: float = DEFAULT_PYTHON_ERROR_PENALTY
+        self._syntax_error_penalty: float = DEFAULT_SYNTAX_ERROR_PENALTY
         self._terminated: bool = False
         self._eval_cache: EvaluationResult | None = None
         self.state: SpreadsheetBenchEnvState = SpreadsheetBenchEnvState()
@@ -174,13 +197,21 @@ class SpreadsheetBenchEnv(ActionableEnv):
         self._preview_rows = int(opts.get("preview_rows") or DEFAULT_PREVIEW_ROWS)
         self._preview_cols = int(opts.get("preview_cols") or DEFAULT_PREVIEW_COLS)
         self._recalc_golden = bool(opts.get("recalc_golden", True))
+        self._python_error_penalty = float(opts.get(
+            "python_error_penalty", DEFAULT_PYTHON_ERROR_PENALTY
+        ))
+        self._syntax_error_penalty = float(opts.get(
+            "syntax_error_penalty", DEFAULT_SYNTAX_ERROR_PENALTY
+        ))
 
         # `instance_id` (explicit id, used by the eval driver) wins; otherwise
         # select by seed. The orchestrator-injected options["task_id"] is the
         # project label, NOT an instance -- see data.select_task.
         instance_id = opts.get("instance_id") or None
+        split_file = opts.get("split_file") or None
         task, _idx = select_task(self._data_path, seed, instance_id,
-                                 multi=bool(opts.get("multi_test_case")))
+                                 multi=bool(opts.get("multi_test_case")),
+                                 split_file=split_file)
         self._task = task
 
         if not task.init_path or not os.path.isfile(task.init_path):
@@ -192,10 +223,11 @@ class SpreadsheetBenchEnv(ActionableEnv):
         # Fresh sandbox working dir; copy the input in, pre-seed the output as a
         # copy so a no-op agent still leaves a gradeable file at output_path.
         self._teardown_workdir()
-        self._workdir = tempfile.mkdtemp(prefix=f"sb_{task.id}_",
+        safe_task_id = _safe_file_stem(task.id)
+        self._workdir = tempfile.mkdtemp(prefix=f"sb_{safe_task_id}_",
                                          dir=self._sandbox_root)
-        input_path = os.path.join(self._workdir, f"{task.id}_input.xlsx")
-        output_path = os.path.join(self._workdir, f"{task.id}_output.xlsx")
+        input_path = os.path.join(self._workdir, f"{safe_task_id}_input.xlsx")
+        output_path = os.path.join(self._workdir, f"{safe_task_id}_output.xlsx")
         shutil.copyfile(task.init_path, input_path)
         shutil.copyfile(task.init_path, output_path)
 
@@ -243,11 +275,22 @@ class SpreadsheetBenchEnv(ActionableEnv):
                 info={"submitted": True, "won": None},
             )
 
+        if action.name == ValidateWorkbook.name:
+            validation_output, validation_ok = self._validate_output()
+            return EnvResponse(
+                observation=self._observe(run_output=validation_output),
+                reward=0.0, terminated=False, truncated=False,
+                info={
+                    "validation_ok": validation_ok,
+                    "won": None,
+                },
+            )
+
         if action.name != RunPython.name:
             return EnvResponse(
                 observation=Observation(
                     text=f"[unknown tool: {action.name}] valid tools: "
-                         "run_python(code), submit()",
+                         "run_python(code), validate_workbook(), submit()",
                     data={"error": "unknown_tool"},
                 ),
                 reward=0.0, terminated=False, truncated=False,
@@ -269,18 +312,30 @@ class SpreadsheetBenchEnv(ActionableEnv):
             )
 
         self.state.step_count += 1
-        stdout, returncode = self._run_python(code)
+        stdout, returncode, error_type = self._run_python(code)
         self.state.last_code = code
         self.state.last_output = stdout
         self.state.last_returncode = returncode
+        self.state.last_error_type = error_type
+        python_error = returncode != 0
+        syntax_error = error_type in _SYNTAX_ERROR_TYPES
+        reward = 0.0
+        if syntax_error:
+            reward = self._syntax_error_penalty
+        elif python_error:
+            reward = self._python_error_penalty
 
         return EnvResponse(
             observation=self._observe(run_output=stdout),
-            reward=0.0, terminated=False, truncated=False,
+            reward=reward, terminated=False, truncated=False,
             info={
                 "result": {"returncode": returncode,
-                           "output": stdout[:1000]},
+                           "output": stdout[:1000],
+                           "error_type": error_type},
                 "returncode": returncode,
+                "python_error": python_error,
+                "python_error_type": error_type,
+                "syntax_error": syntax_error,
                 "won": None,
             },
         )
@@ -317,6 +372,7 @@ class SpreadsheetBenchEnv(ActionableEnv):
             "  last_code: str             -- most recent run_python snippet\n"
             "  last_output: str           -- most recent stdout+stderr (truncated)\n"
             "  last_returncode: int       -- most recent run_python exit code\n"
+            "  last_error_type: str       -- final Python exception class\n"
             "  submitted: bool            -- True once the agent called submit()\n"
             "  step_count: int            -- run_python actions taken so far\n"
             "  extras: dict               -- free scratch dict for Rules hook state\n"
@@ -360,7 +416,12 @@ class SpreadsheetBenchEnv(ActionableEnv):
                 "SpreadsheetBenchEnv.list_tasks: no data_path "
                 f"(reset_options['data_path'] or ${DATA_PATH_ENV})."
             )
-        tasks = load_dataset(data_path)
+        split_file = opts.get("split_file") or None
+        tasks = (
+            load_spreadsheet_rl_dataset(data_path, split_file)
+            if split_file
+            else load_dataset(data_path)
+        )
         n = limit if limit is not None else len(tasks)
         out: list[TaskSummary] = []
         for i, t in enumerate(tasks[:n]):
@@ -387,7 +448,44 @@ class SpreadsheetBenchEnv(ActionableEnv):
             shutil.rmtree(self._workdir, ignore_errors=True)
         self._workdir = None
 
-    def _run_python(self, code: str) -> tuple[str, int]:
+    @staticmethod
+    def _python_bootstrap() -> str:
+        return """import os
+import sys
+import openpyxl
+
+agent_script, input_path, output_path, working_directory = sys.argv[1:5]
+
+def load_workbook_for_edit(**kwargs):
+    return openpyxl.load_workbook(output_path, **kwargs)
+
+def save_workbook(workbook):
+    workbook.save(output_path)
+
+namespace = {
+    "__name__": "__main__",
+    "__file__": agent_script,
+    "input_path": input_path,
+    "output_path": output_path,
+    "working_directory": working_directory,
+    "load_workbook_for_edit": load_workbook_for_edit,
+    "save_workbook": save_workbook,
+}
+with open(agent_script, "rb") as handle:
+    source = handle.read()
+exec(compile(source, agent_script, "exec"), namespace)
+"""
+
+    @staticmethod
+    def _python_error_type(output: str, returncode: int) -> str:
+        if returncode == 0:
+            return ""
+        if "run_python timed out" in output:
+            return "TimeoutExpired"
+        matches = _PYTHON_EXCEPTION_RE.findall(output)
+        return matches[-1].rsplit(".", 1)[-1] if matches else "ProcessError"
+
+    def _run_python(self, code: str) -> tuple[str, int, str]:
         """Write `code` to a unique file in the working dir and execute it with
         `python_exe` (cwd = working dir). Return (combined_output, returncode)."""
         assert self._workdir is not None
@@ -401,15 +499,29 @@ class SpreadsheetBenchEnv(ActionableEnv):
             with os.fdopen(fd, "w") as f:
                 f.write(code)
             proc = subprocess.run(
-                [self._python_exe, script],
+                [
+                    self._python_exe,
+                    "-c",
+                    self._python_bootstrap(),
+                    script,
+                    self.state.input_path,
+                    self.state.output_path,
+                    self._workdir,
+                ],
                 cwd=self._workdir, capture_output=True, text=True,
                 timeout=self._step_timeout,
             )
         except subprocess.TimeoutExpired:
-            return (f"[ERROR] run_python timed out after {self._step_timeout}s",
-                    -1)
+            output = (
+                f"[ERROR] run_python timed out after {self._step_timeout}s"
+            )
+            return output, -1, "TimeoutExpired"
         except Exception as e:  # noqa: BLE001
-            return (f"[ERROR] failed to execute: {type(e).__name__}: {e}", -1)
+            return (
+                f"[ERROR] failed to execute: {type(e).__name__}: {e}",
+                -1,
+                type(e).__name__,
+            )
         finally:
             try:
                 os.remove(script)
@@ -423,9 +535,79 @@ class SpreadsheetBenchEnv(ActionableEnv):
         if proc.returncode != 0:
             parts.append(f"[exit code: {proc.returncode}]")
         out = "\n".join(parts).strip() or "[run_python completed with no output]"
+        error_type = self._python_error_type(out, proc.returncode)
         if len(out) > self._obs_truncate:
             out = out[: self._obs_truncate] + "\n...[output truncated]"
-        return out, proc.returncode
+        return out, proc.returncode, error_type
+
+    def _validate_output(self) -> tuple[str, bool]:
+        """Validate output structure without consulting the golden workbook."""
+        output_path = self.state.output_path
+        if not os.path.isfile(output_path):
+            return "[validation failed] output_path does not exist.", False
+        try:
+            import openpyxl
+
+            workbook = openpyxl.load_workbook(
+                output_path, data_only=False, read_only=True
+            )
+        except Exception as exc:  # noqa: BLE001
+            return (
+                "[validation failed] output workbook cannot be opened: "
+                f"{type(exc).__name__}: {exc}",
+                False,
+            )
+
+        sheet_names = list(workbook.sheetnames)
+        details: list[str] = []
+        errors: list[str] = []
+        try:
+            for segment in online_judge_eval._split_answer_position(
+                self.state.answer_position
+            ):
+                if "!" in segment:
+                    sheet_name, cell_range = segment.rsplit("!", 1)
+                    sheet_name = sheet_name.strip().strip("'")
+                else:
+                    sheet_name = self.state.answer_sheet or sheet_names[0]
+                    cell_range = segment
+                cell_range = cell_range.strip().strip("'")
+                if sheet_name not in sheet_names:
+                    errors.append(f"missing worksheet: {sheet_name}")
+                    continue
+                sheet = workbook[sheet_name]
+                try:
+                    cells = online_judge_eval._generate_cell_names(
+                        cell_range, max_row=max(sheet.max_row, 1)
+                    )
+                except (TypeError, ValueError) as exc:
+                    errors.append(
+                        f"invalid answer range {segment!r}: {exc}"
+                    )
+                    continue
+                nonempty = 0
+                formulas = 0
+                for cell_name in cells:
+                    value = sheet[cell_name].value
+                    nonempty += int(value is not None and value != "")
+                    formulas += int(
+                        isinstance(value, str) and value.startswith("=")
+                    )
+                details.append(
+                    f"{sheet_name}!{cell_range}: cells={len(cells)}, "
+                    f"nonempty={nonempty}, formulas={formulas}"
+                )
+        finally:
+            workbook.close()
+
+        if errors:
+            return "[validation failed] " + "; ".join(errors), False
+        sheet_list = ", ".join(sheet_names)
+        return (
+            "[validation ok] workbook opens; sheets=" + sheet_list + "\n"
+            + "\n".join(details),
+            True,
+        )
 
     def _grade(self, task: SBTask) -> EvaluationResult:
         """Recalc the agent output (and golden), run the official cell compare.
@@ -468,7 +650,7 @@ class SpreadsheetBenchEnv(ActionableEnv):
         cache_dir = os.path.join(self._sandbox_root or tempfile.gettempdir(),
                                  "_sb_golden_cache")
         os.makedirs(cache_dir, exist_ok=True)
-        cached = os.path.join(cache_dir, f"{task.id}_golden.xlsx")
+        cached = os.path.join(cache_dir, f"{_safe_file_stem(task.id)}_golden.xlsx")
         if not os.path.isfile(cached):
             tmp = cached + f".{uuid.uuid4().hex[:6]}.tmp"
             shutil.copyfile(task.golden_path, tmp)

@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -169,29 +170,75 @@ def _col_name2num(name: str) -> int:
     return num
 
 
-def _parse_cell_range(range_str: str):
+_CELL_RE = re.compile(r"^([A-Za-z]*)([0-9]*)$")
+
+
+def _split_answer_position(answer_position: str) -> list[str]:
+    """Split comma-separated Sheet!Range segments, preserving quoted commas."""
+    segments: list[str] = []
+    start = 0
+    in_quote = False
+    for index, char in enumerate(answer_position):
+        if char == "'":
+            # Some SpreadsheetBench rows use Sheet3'!A:G rather than
+            # 'Sheet3'!A:G. Treat a quote immediately before ! as closing
+            # punctuation, not the start of a quoted sheet name.
+            if not in_quote and index + 1 < len(answer_position):
+                if answer_position[index + 1] == "!":
+                    continue
+            in_quote = not in_quote
+        elif char == "," and not in_quote:
+            segment = answer_position[start:index].strip()
+            if segment:
+                segments.append(segment)
+            start = index + 1
+    tail = answer_position[start:].strip()
+    if tail:
+        segments.append(tail)
+    return segments
+
+
+def _split_cell_ref(cell_ref: str) -> tuple[str, str]:
+    match = _CELL_RE.match(cell_ref.strip())
+    if not match:
+        raise ValueError(f"invalid cell reference: {cell_ref!r}")
+    return match.group(1).upper(), match.group(2)
+
+
+def _parse_cell_range(range_str: str, max_row: int | None = None):
     start_cell, end_cell = range_str.split(":")
-    sc = "".join(ch for ch in start_cell if not ch.isdigit())
-    sr = "".join(ch for ch in start_cell if ch.isdigit())
-    ec = "".join(ch for ch in end_cell if not ch.isdigit())
-    er = "".join(ch for ch in end_cell if ch.isdigit())
+    sc, sr = _split_cell_ref(start_cell)
+    ec, er = _split_cell_ref(end_cell)
+    if sc and sr and not ec and er:
+        ec = sc
+    if not sr and not er and sc and ec:
+        if max_row is None:
+            raise ValueError(
+                f"whole-column range {range_str!r} needs max_row"
+            )
+        sr, er = "1", str(max_row)
+    if not sc or not sr or not ec or not er:
+        raise ValueError(f"invalid cell range: {range_str!r}")
     return (_col_name2num(sc), int(sr)), (_col_name2num(ec), int(er))
 
 
-def _generate_cell_names(range_str: str) -> list[str]:
+def _generate_cell_names(range_str: str, max_row: int | None = None) -> list[str]:
     if ":" not in range_str:
         return [range_str]
-    (sc, sr), (ec, er) = _parse_cell_range(range_str)
+    (sc, sr), (ec, er) = _parse_cell_range(range_str, max_row=max_row)
     cols = [_col_num2name(i) for i in range(sc, ec + 1)]
     return [f"{c}{r}" for c in cols for r in range(sr, er + 1)]
 
 
 def _cell_level_compare(wb_gt, wb_proc, sheet_name: str, cell_range: str):
+    if sheet_name not in wb_gt:
+        return False, f"golden worksheet not found: {sheet_name}"
     if sheet_name not in wb_proc:
-        return False, "worksheet not found"
+        return False, f"processed worksheet not found: {sheet_name}"
     ws_gt = wb_gt[sheet_name]
     ws_proc = wb_proc[sheet_name]
-    for cell_name in _generate_cell_names(cell_range):
+    max_row = max(ws_gt.max_row, ws_proc.max_row)
+    for cell_name in _generate_cell_names(cell_range, max_row=max_row):
         cg = ws_gt[cell_name]
         cp = ws_proc[cell_name]
         if not _compare_cell_value(cg.value, cp.value):
@@ -214,9 +261,9 @@ def compare_workbooks(gt_file: str, proc_file: str,
         return False, f"load error: {e}"
 
     results, msgs = [], []
-    for segment in answer_position.split(","):
+    for segment in _split_answer_position(answer_position):
         if "!" in segment:
-            sheet_name, cell_range = segment.split("!")
+            sheet_name, cell_range = segment.rsplit("!", 1)
         else:
             sheet_name, cell_range = wb_gt.sheetnames[0], segment
         sheet_name = sheet_name.strip().strip("'")

@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+# Recreated by rl/scripts/fetch_verl_agent.sh.
+third_party/
+
+# Downloaded benchmark data is local experiment state.
+experiments/spreadsheetbench/data/
+
+# Local logs, Ray connection state, and training outputs.
+runs/

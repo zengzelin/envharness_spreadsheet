@@ -1,8 +1,75 @@
 diff --git a/agent_system/environments/env_manager.py b/agent_system/environments/env_manager.py
-index ab09dff..2c0c19b 100644
+index ab09dff..71ed495 100644
 --- a/agent_system/environments/env_manager.py
 +++ b/agent_system/environments/env_manager.py
-@@ -628,6 +628,112 @@ def make_envs(config):
+@@ -609,6 +609,66 @@ def make_envs(config):
+     group_n = config.env.rollout.n if config.env.rollout.n > 0 else 1
+     resources_per_worker = OmegaConf.to_container(config.env.resources_per_worker, resolve=True)
+ 
++    if config.env.env_name.lower().startswith("envharness_rl/spreadsheetbench"):
++        import sys as _sys
++        from pathlib import Path as _Path
++
++        # This checkout lives at <envharness>/third_party/verl-agent. Resolve
++        # both tracked packages relative to it so host and cluster mount paths
++        # work without hardcoded prefixes.
++        _envharness_root = _Path(__file__).resolve().parents[4]
++        for _path in (_envharness_root, _envharness_root / "rl"):
++            if str(_path) not in _sys.path:
++                _sys.path.insert(0, str(_path))
++
++        from envharness_rl.spreadsheetbench.envs import (
++            build_envharness_spreadsheetbench_envs,
++        )
++        from envharness_rl.spreadsheetbench.manager import (
++            SpreadsheetBenchEnvironmentManager,
++        )
++        from envharness_rl.spreadsheetbench.projection import (
++            envharness_spreadsheetbench_projection,
++        )
++
++        _data_path = os.environ.get("SPREADSHEETBENCH_DATA", "")
++        if not _data_path:
++            raise RuntimeError(
++                "envharness_rl/spreadsheetbench requires "
++                "$SPREADSHEETBENCH_DATA"
++            )
++        _reset_options = {
++            "data_path": _data_path,
++            "max_steps": config.env.max_steps,
++            "step_timeout": int(os.environ.get(
++                "SPREADSHEETBENCH_STEP_TIMEOUT", "60")),
++            "obs_truncate": int(os.environ.get(
++                "SPREADSHEETBENCH_OBS_TRUNCATE", "6000")),
++        }
++        _envs = build_envharness_spreadsheetbench_envs(
++            seed=config.env.seed,
++            env_num=config.data.train_batch_size,
++            group_n=group_n,
++            resources_per_worker=resources_per_worker,
++            is_train=True,
++            env_kwargs=_reset_options,
++        )
++        _val_envs = build_envharness_spreadsheetbench_envs(
++            seed=config.env.seed + 1000,
++            env_num=config.data.val_batch_size,
++            group_n=1,
++            resources_per_worker=resources_per_worker,
++            is_train=False,
++            env_kwargs=_reset_options,
++        )
++        envs = SpreadsheetBenchEnvironmentManager(
++            _envs, envharness_spreadsheetbench_projection, config,
++            split="train")
++        val_envs = SpreadsheetBenchEnvironmentManager(
++            _val_envs, envharness_spreadsheetbench_projection, config,
++            split="val")
++        return envs, val_envs
++
+     if "search" in config.env.env_name.lower():
+         from agent_system.environments.env_package.search import build_search_envs, search_projection
+         _envs = build_search_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_config=config.env)
+@@ -628,6 +688,112 @@ def make_envs(config):
          val_envs = GymCardEnvironmentManager(_val_envs, projection_f, config)
          return envs, val_envs
      elif "alfworld" in config.env.env_name.lower():
@@ -115,7 +182,7 @@ index ab09dff..2c0c19b 100644
          from agent_system.environments.env_package.alfworld import build_alfworld_envs, alfworld_projection
          if config.env.env_name == 'alfworld/AlfredThorEnv':
              alf_config_path = os.path.join(os.path.dirname(__file__), 'env_package/alfworld/configs/config_tw.yaml')
-@@ -641,7 +747,7 @@ def make_envs(config):
+@@ -641,7 +805,7 @@ def make_envs(config):
          }
          _envs = build_alfworld_envs(alf_config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
          _val_envs = build_alfworld_envs(alf_config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
@@ -124,7 +191,7 @@ index ab09dff..2c0c19b 100644
          projection_f = partial(alfworld_projection)
          envs = AlfWorldEnvironmentManager(_envs, projection_f, config)
          val_envs = AlfWorldEnvironmentManager(_val_envs, projection_f, config)
-@@ -661,6 +767,60 @@ def make_envs(config):
+@@ -661,6 +825,60 @@ def make_envs(config):
          envs = SokobanEnvironmentManager(_envs, projection_f, config)
          val_envs = SokobanEnvironmentManager(_val_envs, projection_f, config)
          return envs, val_envs
@@ -185,7 +252,7 @@ index ab09dff..2c0c19b 100644
      elif "webshop" in config.env.env_name.lower():
          from agent_system.environments.env_package.webshop import build_webshop_envs, webshop_projection
          if config.env.webshop.use_small:
-@@ -689,11 +849,25 @@ def make_envs(config):
+@@ -689,11 +907,25 @@ def make_envs(config):
          from agent_system.environments.env_package.appworld import build_appworld_envs, appworld_projection
          _envs = build_appworld_envs(dataset_name='train', seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, start_server_id=0, resources_per_worker=resources_per_worker)
          _val_envs = build_appworld_envs(dataset_name='test_normal', seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, start_server_id=config.data.train_batch_size*group_n, resources_per_worker=resources_per_worker)
@@ -211,5 +278,6 @@ index ab09dff..2c0c19b 100644
 +        return make_envharness_swegym_envs(config)
      else:
          print("Environment not supported")
-         exit(1)
+-        exit(1)
 \ No newline at end of file
++        exit(1)

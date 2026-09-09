@@ -1,0 +1,381 @@
+from __future__ import annotations
+
+import importlib.util
+import os
+from pathlib import Path
+import subprocess
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load_prepare_module():
+    path = ROOT / "rl/scripts/prepare_spreadsheetbench_verl_data.py"
+    spec = importlib.util.spec_from_file_location("prepare_spreadsheetbench_verl_data", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_placeholder_rows_are_offline_text_agent_examples() -> None:
+    module = _load_prepare_module()
+
+    rows = module.build_rows("train", 2)
+
+    assert rows == [
+        {
+            "data_source": "text",
+            "prompt": [{"role": "user", "content": ""}],
+            "ability": "agent",
+            "extra_info": {"split": "train", "index": 0},
+        },
+        {
+            "data_source": "text",
+            "prompt": [{"role": "user", "content": ""}],
+            "ability": "agent",
+            "extra_info": {"split": "train", "index": 1},
+        },
+    ]
+
+
+def test_training_dry_run_targets_external_ray_and_spreadsheetbench(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "dataset.json").write_text("[]\n")
+    data_dir = tmp_path / "verl-data"
+    run_root = tmp_path / "runs"
+    env = dict(os.environ)
+    env.update({
+        "DRY_RUN": "1",
+        "RAY_ADDRESS": "auto",
+        "SPREADSHEETBENCH_DATA": str(dataset),
+        "VERL_DATA_DIR": str(data_dir),
+        "RUN_ROOT": str(run_root),
+        "PY": "/usr/bin/python",
+    })
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "rl/scripts/run_spreadsheetbench_grpo.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "env.env_name=envharness_rl/spreadsheetbench" in completed.stdout
+    assert "+ray_init.address=auto" in completed.stdout
+    assert "data.train_files=" + str(data_dir / "train.parquet") in completed.stdout
+    assert "trainer.nnodes=1" in completed.stdout
+    assert "trainer.n_gpus_per_node=2" in completed.stdout
+    assert "logger=['console','wandb','tensorboard']" in completed.stdout
+    assert "trainer.logger=" in completed.stdout
+    assert "trainer.rollout_data_dir=" in completed.stdout
+    assert "rollouts/verl" in completed.stdout
+    assert "dry run complete" in completed.stdout
+
+
+def test_training_dry_run_accepts_spreadsheet_rl_parquet_splits(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "Spreadsheet-RL"
+    dataset.mkdir()
+    (dataset / "train_hermes.parquet").write_bytes(b"placeholder")
+    (dataset / "test_verified_hermes.parquet").write_bytes(b"placeholder")
+    env = dict(os.environ)
+    env.update({
+        "DRY_RUN": "1",
+        "RAY_ADDRESS": "auto",
+        "SPREADSHEETBENCH_DATA_FORMAT": "spreadsheet_rl",
+        "SPREADSHEET_RL_DATA_ROOT": str(dataset),
+        "RUN_ROOT": str(tmp_path / "runs"),
+        "PY": "/usr/bin/python",
+    })
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "rl/scripts/run_spreadsheetbench_grpo.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "data_format=spreadsheet_rl data=" + str(dataset) in completed.stdout
+    assert "train_split=train_hermes.parquet" in completed.stdout
+    assert "val_split=test_verified_hermes.parquet" in completed.stdout
+    assert "dry run complete" in completed.stdout
+
+
+def test_full_training_uses_qwen3_4b_for_150_steps_and_periodic_checkpoints(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "dataset.json").write_text("[]\n")
+    env = dict(os.environ)
+    env.update({
+        "DRY_RUN": "1",
+        "MODE": "full",
+        "RAY_ADDRESS": "auto",
+        "SPREADSHEETBENCH_DATA": str(dataset),
+        "RUN_ROOT": str(tmp_path / "runs"),
+        "PY": "/usr/bin/python",
+    })
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "rl/scripts/run_spreadsheetbench_grpo.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (
+        "actor_rollout_ref.model.path=/mnt/geminisgceph1/geminicephfs/"
+        "mmsearch-luban-universal/luban/common/models/Qwen3-4B-Thinking-2507"
+    ) in completed.stdout
+    assert "env.max_steps=15" in completed.stdout
+    assert "data.max_prompt_length=8192" in completed.stdout
+    assert "data.max_response_length=24576" in completed.stdout
+    assert "+data.apply_chat_template_kwargs.enable_thinking=True" in completed.stdout
+    assert "actor_rollout_ref.rollout.tensor_model_parallel_size=2" in completed.stdout
+    assert "actor_rollout_ref.rollout.gpu_memory_utilization=0.85" in completed.stdout
+    assert "actor_rollout_ref.rollout.max_model_len=32768" in completed.stdout
+    assert "actor_rollout_ref.rollout.max_num_batched_tokens=32768" in completed.stdout
+    assert "actor_rollout_ref.rollout.top_k=20" in completed.stdout
+    assert "actor_rollout_ref.rollout.top_p=0.95" in completed.stdout
+    assert "actor_rollout_ref.rollout.temperature=0.6" in completed.stdout
+    assert "actor_rollout_ref.rollout.val_kwargs.temperature=0.0" in completed.stdout
+    assert "actor_rollout_ref.rollout.val_kwargs.do_sample=False" in completed.stdout
+    assert "actor_rollout_ref.actor.kl_loss_coef=0.001" in completed.stdout
+    assert "actor_rollout_ref.actor.entropy_coeff=0" in completed.stdout
+    assert "trainer.total_training_steps=150" in completed.stdout
+    assert "trainer.total_epochs=150" in completed.stdout
+    assert "trainer.test_freq=10" in completed.stdout
+    assert "trainer.save_freq=10" in completed.stdout
+    assert "trainer.val_before_train=True" in completed.stdout
+    assert "checkpoint.contents=" in completed.stdout
+
+
+def test_training_refuses_to_start_without_external_ray(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "dataset.json").write_text("[]\n")
+    env = dict(os.environ)
+    env.pop("RAY_ADDRESS", None)
+    env.update({
+        "DRY_RUN": "1",
+        "SPREADSHEETBENCH_DATA": str(dataset),
+        "RUN_ROOT": str(tmp_path / "runs"),
+    })
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "rl/scripts/run_spreadsheetbench_grpo.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode != 0
+    assert "external Ray" in completed.stderr
+
+
+def test_submit_dry_run_uses_saved_ray_addresses(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "dataset.json").write_text("[]\n")
+    state_file = tmp_path / "ray_address.env"
+    state_file.write_text(
+        "export RAY_ADDRESS=10.0.0.1:6379\n"
+        "export RAY_DASHBOARD_ADDRESS=http://10.0.0.1:8265\n"
+        "export NNODES=1\n"
+        "export GPUS_PER_NODE=8\n"
+    )
+    env = dict(os.environ)
+    env.update({
+        "DRY_RUN": "1",
+        "RAY_STATE_FILE": str(state_file),
+        "SPREADSHEETBENCH_DATA": str(dataset),
+        "WANDB_API_KEY": "must-not-appear-in-output",
+    })
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "rl/scripts/submit_spreadsheetbench_grpo.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "verifying 10.0.0.1:6379" in completed.stdout
+    assert "submitting through http://10.0.0.1:8265" in completed.stdout
+    assert "[spreadsheet-train-submit] job_log=" in completed.stdout
+    assert '"RAY_ADDRESS": "auto"' in completed.stdout
+    assert '"WANDB_BASE_URL": "https://wandb.lubanml.woa.com"' in completed.stdout
+    assert '"WANDB_API_KEY": "***"' in completed.stdout
+    assert '"WANDB_DIR":' in completed.stdout
+    assert '"TENSORBOARD_DIR":' in completed.stdout
+    assert '"SPREADSHEETBENCH_TRAJECTORY_DIR":' in completed.stdout
+    assert "must-not-appear-in-output" not in completed.stdout
+    assert "dry run complete" in completed.stdout
+
+
+def test_submit_dry_run_forwards_spreadsheet_rl_splits_to_ray(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "Spreadsheet-RL"
+    dataset.mkdir()
+    (dataset / "train_hermes.parquet").write_bytes(b"placeholder")
+    (dataset / "test_verified_hermes.parquet").write_bytes(b"placeholder")
+    state_file = tmp_path / "ray_address.env"
+    state_file.write_text(
+        "export RAY_ADDRESS=10.0.0.1:6379\n"
+        "export RAY_DASHBOARD_ADDRESS=http://10.0.0.1:8265\n"
+        "export NNODES=1\n"
+        "export GPUS_PER_NODE=8\n"
+    )
+    env = dict(os.environ)
+    env.update({
+        "DRY_RUN": "1",
+        "RAY_STATE_FILE": str(state_file),
+        "SPREADSHEETBENCH_DATA_FORMAT": "spreadsheet_rl",
+        "SPREADSHEET_RL_DATA_ROOT": str(dataset),
+        "WANDB_API_KEY": "must-not-appear-in-output",
+    })
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "rl/scripts/submit_spreadsheetbench_grpo.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "data_format=spreadsheet_rl data=" + str(dataset) in completed.stdout
+    assert '"SPREADSHEETBENCH_DATA_FORMAT": "spreadsheet_rl"' in completed.stdout
+    assert '"SPREADSHEET_RL_DATA_ROOT": "' + str(dataset) + '"' in completed.stdout
+    assert '"SPREADSHEET_RL_TRAIN_FILE": "train_hermes.parquet"' in completed.stdout
+    assert '"SPREADSHEET_RL_VAL_FILE": "test_verified_hermes.parquet"' in completed.stdout
+    assert "must-not-appear-in-output" not in completed.stdout
+
+
+def test_submit_dry_run_accepts_explicit_ray_addresses_without_state_file(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "dataset.json").write_text("[]\n")
+    missing_state_file = tmp_path / "missing-ray-address.env"
+    env = dict(os.environ)
+    env.update({
+        "DRY_RUN": "1",
+        "RAY_STATE_FILE": str(missing_state_file),
+        "RAY_ADDRESS": "10.0.0.2:6379",
+        "RAY_DASHBOARD_ADDRESS": "http://10.0.0.2:8265",
+        "NNODES": "2",
+        "GPUS_PER_NODE": "8",
+        "SPREADSHEETBENCH_DATA": str(dataset),
+        "WANDB_API_KEY": "must-not-appear-in-output",
+    })
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "rl/scripts/submit_spreadsheetbench_grpo.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "using explicit Ray addresses" in completed.stdout
+    assert "verifying 10.0.0.2:6379" in completed.stdout
+    assert "submitting through http://10.0.0.2:8265" in completed.stdout
+    assert "working_dir=" + str(ROOT) in completed.stdout
+    assert '"NNODES": "2"' in completed.stdout
+    assert '"GPUS_PER_NODE": "8"' in completed.stdout
+    assert '"N_GPUS_PER_NODE": "8"' in completed.stdout
+    assert '"excludes":' in completed.stdout
+    assert '".git"' in completed.stdout
+    assert "must-not-appear-in-output" not in completed.stdout
+
+
+def test_full_submit_forwards_qwen3_4b_model_to_ray(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "dataset.json").write_text("[]\n")
+    state_file = tmp_path / "ray_address.env"
+    state_file.write_text(
+        "export RAY_ADDRESS=10.0.0.1:6379\n"
+        "export RAY_DASHBOARD_ADDRESS=http://10.0.0.1:8265\n"
+        "export NNODES=1\n"
+        "export GPUS_PER_NODE=8\n"
+    )
+    env = dict(os.environ)
+    env.update({
+        "DRY_RUN": "1",
+        "MODE": "full",
+        "RAY_STATE_FILE": str(state_file),
+        "SPREADSHEETBENCH_DATA": str(dataset),
+        "ROLLOUT_MAX_MODEL_LEN": "28672",
+        "ROLLOUT_MAX_NUM_BATCHED_TOKENS": "24576",
+        "ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU": "32768",
+        "LOG_PROB_MAX_TOKEN_LEN_PER_GPU": "65536",
+        "ROLLOUT_ENABLE_CHUNKED_PREFILL": "True",
+    })
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "rl/scripts/submit_spreadsheetbench_grpo.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert '"MODE": "full"' in completed.stdout
+    assert (
+        '"MODEL": "/mnt/geminisgceph1/geminicephfs/mmsearch-luban-universal/'
+        'luban/common/models/Qwen3-4B-Thinking-2507"'
+    ) in completed.stdout
+    assert '"ROLLOUT_MAX_MODEL_LEN": "28672"' in completed.stdout
+    assert '"ROLLOUT_MAX_NUM_BATCHED_TOKENS": "24576"' in completed.stdout
+    assert '"ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU": "32768"' in completed.stdout
+    assert '"LOG_PROB_MAX_TOKEN_LEN_PER_GPU": "65536"' in completed.stdout
+    assert '"ROLLOUT_ENABLE_CHUNKED_PREFILL": "True"' in completed.stdout
+
+
+def test_training_rejects_batch_size_not_divisible_by_total_gpus(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "dataset.json").write_text("[]\n")
+    env = dict(os.environ)
+    env.update({
+        "DRY_RUN": "1",
+        "RAY_ADDRESS": "auto",
+        "SPREADSHEETBENCH_DATA": str(dataset),
+        "RUN_ROOT": str(tmp_path / "runs"),
+        "TRAIN_BS": "3",
+        "N_GPUS_PER_NODE": "2",
+        "NNODES": "1",
+    })
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "rl/scripts/run_spreadsheetbench_grpo.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode != 0
+    assert "TRAIN_BS must be divisible by total GPUs" in completed.stderr

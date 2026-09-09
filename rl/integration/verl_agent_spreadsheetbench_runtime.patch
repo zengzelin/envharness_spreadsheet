@@ -1,0 +1,137 @@
+diff --git a/agent_system/environments/env_manager.py b/agent_system/environments/env_manager.py
+--- a/agent_system/environments/env_manager.py
++++ b/agent_system/environments/env_manager.py
+@@ -633,15 +633,36 @@ def make_envs(config):
+-        _data_path = os.environ.get("SPREADSHEETBENCH_DATA", "")
++        _data_format = os.environ.get(
++            "SPREADSHEETBENCH_DATA_FORMAT", "spreadsheetbench"
++        ).lower().replace("-", "_")
++        _data_path = os.environ.get("SPREADSHEETBENCH_DATA", "")
++        if _data_format in ("spreadsheet_rl", "spreadsheetrl"):
++            _data_path = (
++                os.environ.get("SPREADSHEET_RL_DATA_ROOT")
++                or _data_path
++            )
+         if not _data_path:
+             raise RuntimeError(
+                 "envharness_rl/spreadsheetbench requires "
+-                "$SPREADSHEETBENCH_DATA"
++                "$SPREADSHEETBENCH_DATA or $SPREADSHEET_RL_DATA_ROOT"
+             )
+-        _reset_options = {
++        _common_reset_options = {
+             "data_path": _data_path,
+             "max_steps": config.env.max_steps,
+             "step_timeout": int(os.environ.get(
+                 "SPREADSHEETBENCH_STEP_TIMEOUT", "60")),
+             "obs_truncate": int(os.environ.get(
+                 "SPREADSHEETBENCH_OBS_TRUNCATE", "6000")),
++            "python_error_penalty": float(os.environ.get(
++                "SPREADSHEETBENCH_PYTHON_ERROR_PENALTY", "-0.05")),
++            "syntax_error_penalty": float(os.environ.get(
++                "SPREADSHEETBENCH_SYNTAX_ERROR_PENALTY", "-0.1")),
+         }
++        _train_reset_options = dict(_common_reset_options)
++        _val_reset_options = dict(_common_reset_options)
++        if _data_format in ("spreadsheet_rl", "spreadsheetrl"):
++            _train_reset_options["split_file"] = os.environ.get(
++                "SPREADSHEET_RL_TRAIN_FILE", "train_hermes.parquet"
++            )
++            _val_reset_options["split_file"] = os.environ.get(
++                "SPREADSHEET_RL_VAL_FILE", "test_verified_hermes.parquet"
++            )
+         _envs = build_envharness_spreadsheetbench_envs(
+@@ -653,6 +674,6 @@ def make_envs(config):
+             group_n=group_n,
+             resources_per_worker=resources_per_worker,
+             is_train=True,
+-            env_kwargs=_reset_options,
++            env_kwargs=_train_reset_options,
+         )
+         _val_envs = build_envharness_spreadsheetbench_envs(
+@@ -663,5 +684,5 @@ def make_envs(config):
+             group_n=1,
+             resources_per_worker=resources_per_worker,
+             is_train=False,
+-            env_kwargs=_reset_options,
++            env_kwargs=_val_reset_options,
+         )
+diff --git a/agent_system/multi_turn_rollout/rollout_loop.py b/agent_system/multi_turn_rollout/rollout_loop.py
+--- a/agent_system/multi_turn_rollout/rollout_loop.py
++++ b/agent_system/multi_turn_rollout/rollout_loop.py
+@@ -389,5 +389,25 @@ class TrajectoryCollector:
+             else:
+                 batch.non_tensor_batch['is_action_valid'] = np.ones(batch_size, dtype=bool)
+ 
++            spreadsheetbench_diagnostic_keys = {
++                'parser_native_valid': 'parser/native_valid',
++                'parser_recovered': 'parser/recovered',
++                'parser_invalid': 'parser/invalid',
++                'output_char_len': 'output/char_len',
++                'output_has_think': 'output/has_think',
++                'output_has_markdown_fence': 'output/has_markdown_fence',
++                'output_tool_call_pos': 'output/tool_call_pos',
++                'env_python_error': 'env/python_error',
++                'env_syntax_error': 'env/syntax_error',
++                'env_python_runtime_error': 'env/python_runtime_error',
++                'env_python_timeout': 'env/python_timeout',
++            }
++            for batch_key, info_key in spreadsheetbench_diagnostic_keys.items():
++                if info_key in infos[0]:
++                    batch.non_tensor_batch[batch_key] = np.array(
++                        [info.get(info_key, 0) for info in infos],
++                        dtype=np.float32,
++                    )
++
+             if 'tool_calling' in infos[0]:
+                 tool_callings[active_masks] += np.array([info['tool_calling'] for info in infos], dtype=np.float32)[active_masks]
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -223,3 +223,21 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
+     valid_action_ratio = np.mean(data.non_tensor_batch['is_action_valid'].astype(np.float32)).item()
+     metrics = {'episode/valid_action_ratio': valid_action_ratio}
++    diagnostic_metrics = {
++        'parser_native_valid': 'parser/native_valid_ratio',
++        'parser_recovered': 'parser/recovered_ratio',
++        'parser_invalid': 'parser/invalid_ratio',
++        'output_char_len': 'output/char_len_mean',
++        'output_has_think': 'output/has_think_ratio',
++        'output_has_markdown_fence': 'output/has_markdown_fence_ratio',
++        'output_tool_call_pos': 'output/tool_call_pos_mean',
++        'env_python_error': 'env/python_error_ratio',
++        'env_syntax_error': 'env/syntax_error_ratio',
++        'env_python_runtime_error': 'env/python_runtime_error_ratio',
++        'env_python_timeout': 'env/python_timeout_ratio',
++    }
++    for batch_key, metric_key in diagnostic_metrics.items():
++        if batch_key in data.non_tensor_batch:
++            metrics[metric_key] = np.mean(
++                data.non_tensor_batch[batch_key].astype(np.float32)
++            ).item()
+     return data, metrics
+diff --git a/recipe/hgpo/hgpo_ray_trainer.py b/recipe/hgpo/hgpo_ray_trainer.py
+--- a/recipe/hgpo/hgpo_ray_trainer.py
++++ b/recipe/hgpo/hgpo_ray_trainer.py
+@@ -226,3 +226,21 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
+     valid_action_ratio = np.mean(data.non_tensor_batch['is_action_valid'].astype(np.float32)).item()
+     metrics = {'episode/valid_action_ratio': valid_action_ratio}
++    diagnostic_metrics = {
++        'parser_native_valid': 'parser/native_valid_ratio',
++        'parser_recovered': 'parser/recovered_ratio',
++        'parser_invalid': 'parser/invalid_ratio',
++        'output_char_len': 'output/char_len_mean',
++        'output_has_think': 'output/has_think_ratio',
++        'output_has_markdown_fence': 'output/has_markdown_fence_ratio',
++        'output_tool_call_pos': 'output/tool_call_pos_mean',
++        'env_python_error': 'env/python_error_ratio',
++        'env_syntax_error': 'env/syntax_error_ratio',
++        'env_python_runtime_error': 'env/python_runtime_error_ratio',
++        'env_python_timeout': 'env/python_timeout_ratio',
++    }
++    for batch_key, metric_key in diagnostic_metrics.items():
++        if batch_key in data.non_tensor_batch:
++            metrics[metric_key] = np.mean(
++                data.non_tensor_batch[batch_key].astype(np.float32)
++            ).item()
+     return data, metrics

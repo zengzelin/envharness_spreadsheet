@@ -1,10 +1,11 @@
-# EnvHarness RL — ALFWorld GRPO
+# EnvHarness RL — Agentic GRPO Adapters
 
-RL-training adapter that drives [verl-agent](https://github.com/langfengQ/verl-agent)
-GRPO on the base `envharness` package's ALFWorld harness (`AlfworldEnv` + `Rules`). The env is
-selected purely by `env.env_name=envharness_rl/alfworld`; verl-agent is NOT
+RL-training adapters that drive [verl-agent](https://github.com/langfengQ/verl-agent)
+GRPO on EnvHarness environments. ALFWorld is selected with
+`env.env_name=envharness_rl/alfworld`; SpreadsheetBench is selected with
+`env.env_name=envharness_rl/spreadsheetbench`. verl-agent is NOT
 checked in — a fetch script reproduces the exact tree (upstream at a pinned
-commit + one additive route).
+commit + additive EnvHarness routes).
 
 ## Environment
 
@@ -13,11 +14,86 @@ commit + one additive route).
 - ALFWorld game data in `~/.cache/alfworld/`.
 - GPUs (2 for the smoke, 8 for the full run).
 
+SpreadsheetBench uses an externally started Ray cluster. The adapter does not
+start a local Ray instance; this keeps cluster bootstrap separate from
+environment reset, `run_python`, LibreOffice grading, and training submission.
+
 ```bash
 # env layer loads (no GPU)
 PYTHONPATH=..:. \
   ~/miniconda3/envs/verl-agent/bin/python scripts/smoke_worker.py
+
+# SpreadsheetBench worker + real OJ grading (run from repository root)
+export SPREADSHEETBENCH_DATA="$PWD/experiments/spreadsheetbench/data/spreadsheetbench_verified_400"
+PYTHONPATH=.:rl python rl/scripts/smoke_spreadsheetbench_worker.py
 ```
+
+## External Ray workflow
+
+Start Ray first and wait for a successful readiness check:
+
+```bash
+bash rl/scripts/mpi_ray_up.sh
+```
+
+The command writes `runs/ray/ray_address.env`. Submit the full Ray adapter
+smoke only after that file exists:
+
+```bash
+bash rl/scripts/submit_spreadsheetbench_ray_smoke.sh
+```
+
+The submitted job connects with `ray.init(address="auto")`, creates train and
+validation environment actors, executes `run_python`, submits all train
+workbooks, and checks grouped rewards. Training launchers must follow the same
+pattern and pass `+ray_init.address=auto` to verl-agent.
+
+After the external-Ray smoke succeeds, launch the one-epoch GRPO smoke:
+
+```bash
+bash rl/scripts/submit_spreadsheetbench_grpo.sh
+```
+
+This defaults to the shared local model at
+`../llm_model/Qwen2.5-1.5B-Instruct`, two GPUs, two prompts, two rollouts per
+prompt, three environment steps, one epoch, and a checkpoint after the smoke
+step. Override settings through
+environment variables, for example:
+
+```bash
+MODEL=/shared/models/Qwen2.5-7B-Instruct \
+N_GPUS_PER_NODE=8 TP=4 TRAIN_BS=8 GROUP_N=4 EPOCHS=10 MAX_STEPS=8 \
+bash rl/scripts/submit_spreadsheetbench_grpo.sh
+```
+
+The formal configuration uses the shared `Qwen2.5-7B-Instruct` model, eight
+GPUs, and exactly 150 optimizer steps. It validates before training, then
+evaluates and saves a checkpoint every 10 steps; the trainer also evaluates
+and saves at the final step:
+
+```bash
+MODE=full bash rl/scripts/submit_spreadsheetbench_grpo.sh
+```
+
+The launcher writes `launch.log`, `train.log`, and checkpoints under
+`runs/grpo_spreadsheetbench_<mode>_<timestamp>/`; the corresponding
+`*_latest` symlink points at the newest run. The parquet inputs are generated
+offline under `runs/data/spreadsheetbench_agent/text/`.
+
+Training enables console, W&B, and TensorBoard logging by default. Set the
+credential in the shell rather than storing it in the repository:
+
+```bash
+export WANDB_API_KEY='...'
+bash rl/scripts/submit_spreadsheetbench_grpo.sh
+```
+
+The default W&B endpoint is `https://wandb.lubanml.woa.com`; use
+`WANDB_MODE=offline` when the service is unavailable. Each run stores W&B and
+TensorBoard files under `wandb/` and `tensorboard/`, decoded verl generations
+under `rollouts/verl/`, and complete train/validation environment trajectories
+under `rollouts/env/{train,val}/`. `run_manifest.json` records the source commit,
+resolved settings, and Hydra command without credentials.
 
 ## Getting verl-agent (clone + patch)
 
@@ -50,7 +126,7 @@ the per-file breakdown):
 
 | Patch | What it applies | When |
 |---|---|---|
-| `verl_agent_env_manager.patch` | the env route only — the single live change | default; all you need for the ALFWorld runs |
+| `verl_agent_env_manager.patch` | maintained EnvHarness environment routes | default; enough for ALFWorld and SpreadsheetBench |
 | `verl_agent_all_changes.patch` | superset: env route + DAPO / Qwen3-8B / webshop / SWE-Gym adaptations | `PATCH=all bash rl/scripts/fetch_verl_agent.sh`, or apply manually INSTEAD of the default |
 
 Apply exactly one of the two — they overlap, so applying both fails.
@@ -92,13 +168,21 @@ reports per-task-type success rates; each step logs `actor/pg_loss`,
 | `scripts/run_grpo.sh` | GRPO launcher (smoke / full) |
 | `scripts/fetch_verl_agent.sh` | fetch verl-agent @ pinned commit + apply the env route patch |
 | `scripts/smoke_worker.py` | no-GPU env sanity check |
+| `scripts/smoke_spreadsheetbench_worker.py` | no-GPU SpreadsheetBench reset/grade sanity check |
+| `scripts/mpi_ray_up.sh` / `scripts/mpi_ray_node.sh` | start and readiness-check the external Ray cluster |
+| `scripts/submit_spreadsheetbench_ray_smoke.sh` | submit the full adapter smoke through Ray Jobs |
+| `scripts/smoke_spreadsheetbench_ray.py` | external-Ray reset/run/submit/OJ integration driver |
+| `scripts/submit_spreadsheetbench_grpo.sh` | submit SpreadsheetBench GRPO to the ready Ray cluster |
+| `scripts/run_spreadsheetbench_grpo.sh` | build and execute the verl-agent GRPO command |
+| `scripts/prepare_spreadsheetbench_verl_data.py` | generate offline text parquet placeholders for verl-agent |
 | `scripts/build_corpus.py` | build the example corpus + subset from a legacy corpus |
 | `envharness_rl/alfworld/envs.py` | Ray-actor parallel `AlfworldEnv` + `Rules` workers |
 | `envharness_rl/alfworld/projection.py` | `<action>`/`<think>` extraction + admissible-command normalize |
+| `envharness_rl/spreadsheetbench/` | SpreadsheetBench projection, workers, and verl-agent manager |
 | `experiments/alfworld/data/` | `example_corpus.jsonl` (6 mutated games) + `train_subset.jsonl` |
-| `../third_party/verl-agent/` | fetched verl-agent (gitignored; upstream + the `envharness_rl/alfworld` route) |
+| `../third_party/verl-agent/` | fetched verl-agent (gitignored; upstream + maintained EnvHarness routes) |
 | `integration/ENVHARNESS_CHANGES.md` | what differs from upstream |
-| `integration/verl_agent_env_manager.patch` | the single live change (the env route) — applied by the fetch script |
+| `integration/verl_agent_env_manager.patch` | maintained environment routes applied by the fetch script |
 | `integration/verl_agent_all_changes.patch` | full patch (re-enables DAPO / Qwen3-8B / webshop / SWE-Gym) |
 
 ## Acknowledgements
@@ -107,7 +191,7 @@ The RL experiments run on the third-party
 [**verl-agent**](https://github.com/langfengQ/verl-agent) repository (GiGPO;
 Apache-2.0), at upstream commit `796ed31` — fetched by
 `scripts/fetch_verl_agent.sh`, not redistributed here. All RL training /
-rollout infrastructure is theirs — we only add the additive
-`envharness_rl/alfworld` env route (see `integration/ENVHARNESS_CHANGES.md`).
+rollout infrastructure is theirs — we only add additive EnvHarness environment
+routes (see `integration/ENVHARNESS_CHANGES.md`).
 verl-agent in turn builds on [verl](https://github.com/volcengine/verl).
 Please cite/credit them when using this.

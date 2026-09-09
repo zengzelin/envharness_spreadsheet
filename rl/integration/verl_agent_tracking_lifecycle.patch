@@ -1,0 +1,61 @@
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -1035,6 +1035,7 @@ class RayPPOTrainer:
+             pprint(f"Initial validation metrics: {val_metrics}")
+             logger.log(data=val_metrics, step=self.global_steps)
+             if self.config.trainer.get("val_only", False):
++                logger.finish()
+                 return
+ 
+         # add tqdm
+@@ -1301,4 +1302,5 @@ class RayPPOTrainer:
+                 if is_last_step:
+                     pprint(f"Final validation metrics: {last_val_metrics}")
+                     progress_bar.close()
++                    logger.finish()
+                     return
+diff --git a/verl/utils/tracking.py b/verl/utils/tracking.py
+--- a/verl/utils/tracking.py
++++ b/verl/utils/tracking.py
+@@ -47,6 +47,7 @@ class Tracking:
+                 assert backend in self.supported_backend, f"{backend} is not supported"
+ 
+         self.logger = {}
++        self._finished = False
+ 
+         if "tracking" in default_backend or "wandb" in default_backend:
+             import wandb
+@@ -129,7 +130,12 @@ class Tracking:
+             if backend is None or default_backend in backend:
+                 logger_instance.log(data=data, step=step)
+ 
+-    def __del__(self):
++    def finish(self):
++        """Flush and close all tracking backends exactly once."""
++        if self._finished:
++            return
++        self._finished = True
++
+         if "wandb" in self.logger:
+             self.logger["wandb"].finish(exit_code=0)
+         if "swanlab" in self.logger:
+@@ -139,8 +145,16 @@ class Tracking:
+         if "tensorboard" in self.logger:
+             self.logger["tensorboard"].finish()
+ 
+-        if "clearnml" in self.logger:
+-            self.logger["clearnml"].finish()
++        if "clearml" in self.logger:
++            self.logger["clearml"].finish()
++
++    def __del__(self):
++        try:
++            self.finish()
++        except Exception:
++            # Destructors may run in a backend-owned async thread during
++            # interpreter shutdown. Normal training paths call finish explicitly.
++            pass
+ 
+ 
+ class ClearMLLogger:

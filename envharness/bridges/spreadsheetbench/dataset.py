@@ -54,6 +54,8 @@ import os
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import PurePosixPath
+from typing import Any
 
 # Env var the Bridge falls back to when reset_options omits `data_path`.
 DATA_PATH_ENV = "SPREADSHEETBENCH_DATA"
@@ -101,6 +103,63 @@ def _resolve_one(folder: str, id_: str, keyword: str,
             return os.path.join(folder, n)
     fuzzy = sorted(glob.glob(os.path.join(folder, f"*{keyword}*.xlsx")))
     return fuzzy[0] if fuzzy else ""
+
+
+def _coerce_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _normalize_thread_dir(value: Any) -> str:
+    """Normalize Spreadsheet-RL reward_model.ground_truth to a safe relative dir."""
+    if not isinstance(value, (str, list, tuple)) and hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            raise ValueError(
+                "Spreadsheet-RL ground_truth must be a string or one-item list, "
+                f"got {value!r}"
+            )
+        value = value[0]
+    thread_dir = str(value or "").strip()
+    if not thread_dir:
+        raise ValueError("Spreadsheet-RL ground_truth is empty")
+    posix_path = PurePosixPath(thread_dir)
+    if posix_path.is_absolute() or any(part in ("", ".", "..") for part in posix_path.parts):
+        raise ValueError(f"Unsafe Spreadsheet-RL ground_truth path: {thread_dir!r}")
+    if "\x00" in thread_dir or "_workspaces" in posix_path.parts:
+        raise ValueError(f"Unsafe Spreadsheet-RL ground_truth path: {thread_dir!r}")
+    return "/".join(posix_path.parts)
+
+
+def _read_spreadsheet_rl_parquet_rows(parquet_path: str) -> list[dict[str, Any]]:
+    """Read Spreadsheet-RL parquet rows.
+
+    Kept as a small helper so tests can monkeypatch it without requiring a
+    local parquet engine. The cluster image normally has pandas/pyarrow.
+    """
+    try:
+        import pandas as pd
+
+        return pd.read_parquet(parquet_path).to_dict(orient="records")
+    except ImportError:
+        from datasets import Dataset
+
+        return list(Dataset.from_parquet(parquet_path))
+
+
+def _resolve_split_path(data_path: str, split_file: str) -> str:
+    path = os.path.expanduser(str(split_file))
+    if not os.path.isabs(path):
+        path = os.path.join(data_path, path)
+    return os.path.abspath(path)
 
 
 @lru_cache(maxsize=8)
@@ -194,6 +253,81 @@ def load_dataset_multi(data_path: str) -> tuple[SBTask, ...]:
     return tuple(tasks)
 
 
+@lru_cache(maxsize=8)
+def load_spreadsheet_rl_dataset(data_path: str, split_file: str) -> tuple[SBTask, ...]:
+    """Load a Spreadsheet-RL parquet split as SBTask rows.
+
+    Spreadsheet-RL rows point at task directories through
+    `reward_model.ground_truth`. In that layout, `output.xlsx` is the initial
+    workbook copied into the agent workspace and `target.xlsx` is the oracle
+    workbook used for reward.
+    """
+    data_path = os.path.abspath(os.path.expanduser(data_path))
+    parquet_path = _resolve_split_path(data_path, split_file)
+    if not os.path.isfile(parquet_path):
+        raise FileNotFoundError(
+            f"Spreadsheet-RL split file not found at {parquet_path!r}."
+        )
+
+    tasks: list[SBTask] = []
+    for row_idx, row in enumerate(_read_spreadsheet_rl_parquet_rows(parquet_path)):
+        reward_model = _coerce_mapping(row.get("reward_model"))
+        extra_info = _coerce_mapping(row.get("extra_info"))
+        thread_dir = _normalize_thread_dir(reward_model.get("ground_truth"))
+        folder = os.path.join(data_path, thread_dir)
+        instruction_path = os.path.join(folder, "instruction.json")
+        metadata: dict[str, Any] = {}
+        if os.path.isfile(instruction_path):
+            with open(instruction_path, encoding="utf-8") as handle:
+                metadata = json.load(handle)
+
+        task_id = (
+            extra_info.get("id")
+            or metadata.get("id")
+            or PurePosixPath(thread_dir).name
+            or f"row-{row_idx}"
+        )
+        init_path = os.path.join(folder, "output.xlsx")
+        golden_path = os.path.join(folder, "target.xlsx")
+        missing = (
+            not os.path.isdir(folder)
+            or not os.path.isfile(instruction_path)
+            or not os.path.isfile(init_path)
+            or not os.path.isfile(golden_path)
+        )
+        tasks.append(SBTask(
+            id=str(task_id),
+            instruction=str(metadata.get("instruction", "")),
+            instruction_type=str(
+                metadata.get("instruction_type")
+                or metadata.get("type")
+                or extra_info.get("type")
+                or ""
+            ),
+            answer_position=_norm_pos(
+                metadata.get("answer_position")
+                or extra_info.get("answer_position")
+                or ""
+            ),
+            answer_sheet=str(
+                metadata.get("answer_sheet")
+                or extra_info.get("answer_sheet")
+                or ""
+            ),
+            data_position=str(
+                metadata.get("data_position")
+                or extra_info.get("data_position")
+                or ""
+            ),
+            excluded=False,
+            missing=missing,
+            folder=folder,
+            init_path=init_path if os.path.isfile(init_path) else "",
+            golden_path=golden_path if os.path.isfile(golden_path) else "",
+        ))
+    return tuple(tasks)
+
+
 def base_id(instance_id: str) -> str:
     """'13-1#2' -> '13-1' (group key for the all-test-cases-pass hard metric)."""
     return str(instance_id).split("#", 1)[0]
@@ -201,7 +335,8 @@ def base_id(instance_id: str) -> str:
 
 def select_task(data_path: str, seed: int | None,
                 instance_id: str | None = None,
-                multi: bool = False) -> tuple[SBTask, int]:
+                multi: bool = False,
+                split_file: str | None = None) -> tuple[SBTask, int]:
     """Resolve (task, index) for an episode.
 
     Priority:
@@ -214,7 +349,10 @@ def select_task(data_path: str, seed: int | None,
     instance comes from `seed` (= ctx.task_id int). `instance_id` is the
     explicit hook used by the eval driver, which drives the env directly.
     """
-    tasks = load_dataset_multi(data_path) if multi else load_dataset(data_path)
+    if split_file:
+        tasks = load_spreadsheet_rl_dataset(data_path, split_file)
+    else:
+        tasks = load_dataset_multi(data_path) if multi else load_dataset(data_path)
     if not tasks:
         raise RuntimeError(f"No SpreadsheetBench tasks loaded from {data_path!r}.")
     if instance_id:

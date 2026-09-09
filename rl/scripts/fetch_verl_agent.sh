@@ -13,15 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Fetch verl-agent into third_party/verl-agent and apply the EnvHarness route.
+# Fetch verl-agent into third_party/verl-agent and apply the EnvHarness routes.
 #
 # verl-agent is NOT vendored in this repository. This script reproduces the
 # exact tree the RL experiments ran against:
 #
 #   1. clone https://github.com/langfengQ/verl-agent at the pinned commit
-#   2. apply rl/integration/verl_agent_env_manager.patch -- the single
-#      ADDITIVE change (the `envharness_rl/alfworld` env route). See
+#   2. apply rl/integration/verl_agent_env_manager.patch -- additive
+#      `envharness_rl/alfworld` and `envharness_rl/spreadsheetbench` routes. See
 #      rl/integration/ENVHARNESS_CHANGES.md for the full modification notes.
+#   3. apply rl/integration/verl_agent_tracking_lifecycle.patch -- explicit,
+#      idempotent tracker shutdown for Ray-hosted training jobs.
+#   4. apply rl/integration/verl_agent_spreadsheetbench_runtime.patch --
+#      Spreadsheet-RL splits, structured diagnostics, and error metrics.
 #
 # The result lands at third_party/verl-agent/ (gitignored). Optional extras
 # (DAPO / Qwen3-8B / webshop / SWE-Gym) live in
@@ -42,10 +46,23 @@ case "${PATCH:-env_manager}" in
   all) PATCH_FILE="$ROOT/rl/integration/verl_agent_all_changes.patch" ;;
   *)   PATCH_FILE="$ROOT/rl/integration/verl_agent_env_manager.patch" ;;
 esac
+TRACKING_PATCH_FILE="$ROOT/rl/integration/verl_agent_tracking_lifecycle.patch"
+SPREADSHEET_RUNTIME_PATCH_FILE="$ROOT/rl/integration/verl_agent_spreadsheetbench_runtime.patch"
 
 if [ -e "$DEST" ]; then
-  if git -C "$DEST" apply --reverse --check "$PATCH_FILE" 2>/dev/null; then
-    echo "[fetch_verl_agent] $DEST already at $COMMIT + patch; nothing to do."
+  HEAD_COMMIT="$(git -C "$DEST" rev-parse HEAD 2>/dev/null || true)"
+  ROUTE_MARKER='envharness_rl/spreadsheetbench'
+  if [ "${PATCH:-env_manager}" = "all" ]; then
+    MODE_MARKER='envharness_swegym_openhands'
+  else
+    MODE_MARKER='envharness_rl/alfworld'
+  fi
+  if [ "$HEAD_COMMIT" = "$COMMIT" ] &&
+     grep -q "$ROUTE_MARKER" "$DEST/agent_system/environments/env_manager.py" &&
+     grep -q "$MODE_MARKER" "$DEST/agent_system/environments/env_manager.py" &&
+     grep -q 'env_python_runtime_error' "$DEST/agent_system/multi_turn_rollout/rollout_loop.py" &&
+     grep -q 'def finish' "$DEST/verl/utils/tracking.py"; then
+    echo "[fetch_verl_agent] $DEST already at $COMMIT + patches; nothing to do."
     exit 0
   fi
   echo "[fetch_verl_agent] $DEST exists but is not upstream+patch." >&2
@@ -66,6 +83,10 @@ git -C "$DEST" checkout -q "$COMMIT"
 
 echo "[fetch_verl_agent] applying $(basename "$PATCH_FILE")"
 git -C "$DEST" apply "$PATCH_FILE"
+echo "[fetch_verl_agent] applying $(basename "$SPREADSHEET_RUNTIME_PATCH_FILE")"
+git -C "$DEST" apply "$SPREADSHEET_RUNTIME_PATCH_FILE"
+echo "[fetch_verl_agent] applying $(basename "$TRACKING_PATCH_FILE")"
+git -C "$DEST" apply "$TRACKING_PATCH_FILE"
 
-echo "[fetch_verl_agent] done: $DEST (upstream $COMMIT + $(basename "$PATCH_FILE"))"
+echo "[fetch_verl_agent] done: $DEST (upstream $COMMIT + integration patches)"
 echo "  license: Apache-2.0 -- see $DEST/LICENSE and $DEST/Notice.txt"
