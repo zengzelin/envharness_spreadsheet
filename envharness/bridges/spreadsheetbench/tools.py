@@ -28,7 +28,7 @@
 
 """SpreadsheetBench tool registry.
 
-Three tools, all dispatched directly by `SpreadsheetBenchEnv.step` (the working
+Tools are dispatched directly by `SpreadsheetBenchEnv.step` (the working
 directory + subprocess execution live on the Bridge, not in env_state, so we
 bypass `Tool.invoke` exactly like the alfworld / swebench bridges). These stubs
 exist only so `tool_schemas()` can emit the function-call schema the Policy and
@@ -60,6 +60,61 @@ class RunPython(Tool):
             "RunPython.invoke is unused; SpreadsheetBenchEnv.step executes the "
             "code in the episode working directory directly."
         )
+
+
+class ListSheets(Tool):
+    name = "list_sheets"
+    description = (
+        "Read the current output workbook and list worksheet names, order, "
+        "visibility, active state, and dimensions."
+    )
+
+    @classmethod
+    def invoke(cls, env_state: Any) -> Any:
+        raise NotImplementedError("SpreadsheetBenchEnv.step executes list_sheets")
+
+
+class InspectRange(Tool):
+    name = "inspect_range"
+    description = (
+        "Read a finite A1 range from the current output workbook. cells mode "
+        "returns values/formulas; summary mode returns content counts."
+    )
+
+    @classmethod
+    def invoke(
+        cls,
+        env_state: Any,
+        range: str,
+        sheet_name: str = "",
+        include_details: bool = False,
+        mode: str = "cells",
+    ) -> Any:
+        raise NotImplementedError("SpreadsheetBenchEnv.step executes inspect_range")
+
+
+class FindCells(Tool):
+    name = "find_cells"
+    description = (
+        "Find text in values or formulas in the current output workbook. "
+        "Optionally restrict the search to a worksheet or finite A1 range."
+    )
+
+    @classmethod
+    def invoke(
+        cls,
+        env_state: Any,
+        query: str,
+        sheet_name: str = "",
+        range: str = "",
+        match: str = "contains",
+        search_in: str = "values",
+        case_sensitive: bool = False,
+        include_values: bool = False,
+        return_mode: str = "first",
+        max_results: int = 20,
+    ) -> Any:
+        raise NotImplementedError("SpreadsheetBenchEnv.step executes find_cells")
 
 
 class ValidateWorkbook(Tool):

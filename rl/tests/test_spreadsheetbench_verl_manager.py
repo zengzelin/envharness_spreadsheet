@@ -64,6 +64,39 @@ def test_manager_builds_tool_prompt_and_preserves_history() -> None:
     assert next_infos[0]["output/has_think"] == 0
 
 
+def test_manager_native_read_prompt_describes_structured_tools(monkeypatch) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_read")
+    envs = FakeVectorEnvs()
+    config = SimpleNamespace(env=SimpleNamespace(history_length=2))
+    manager = SpreadsheetBenchEnvironmentManager(
+        envs, envharness_spreadsheetbench_projection, config
+    )
+
+    observations, _ = manager.reset(kwargs={})
+
+    prompt = observations["text"][0]
+    assert '"name":"list_sheets"' in prompt
+    assert '"name":"inspect_range"' in prompt
+    assert '"name":"find_cells"' in prompt
+    assert "read the current output workbook" in prompt
+
+
+def test_manager_python_prompt_omits_native_read_tools(monkeypatch) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "python")
+    envs = FakeVectorEnvs()
+    config = SimpleNamespace(env=SimpleNamespace(history_length=2))
+    manager = SpreadsheetBenchEnvironmentManager(
+        envs, envharness_spreadsheetbench_projection, config
+    )
+
+    observations, _ = manager.reset(kwargs={})
+
+    prompt = observations["text"][0]
+    assert '"name":"list_sheets"' not in prompt
+    assert '"name":"inspect_range"' not in prompt
+    assert '"name":"find_cells"' not in prompt
+
+
 def test_manager_returns_parser_error_observation_after_invalid_action() -> None:
     envs = FakeVectorEnvs()
     config = SimpleNamespace(env=SimpleNamespace(history_length=2))
@@ -220,3 +253,34 @@ def test_manager_does_not_classify_parser_failure_as_python_error() -> None:
     assert infos[0]["parser/invalid"] == 1
     assert infos[0]["env/python_error"] == 0
     assert infos[0]["env/syntax_error"] == 0
+
+
+class ReadToolVectorEnvs(FakeVectorEnvs):
+    def step(self, actions):
+        self.actions = actions
+        return ["read result"], None, [0.0], [False], [{
+            "task_id": "task-1",
+            "won": False,
+            "tool_name": "inspect_range",
+            "tool_ok": True,
+            "tool_error": "",
+        }]
+
+
+def test_manager_records_read_tool_diagnostics(monkeypatch) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_read")
+    envs = ReadToolVectorEnvs()
+    config = SimpleNamespace(env=SimpleNamespace(history_length=2))
+    manager = SpreadsheetBenchEnvironmentManager(
+        envs, envharness_spreadsheetbench_projection, config
+    )
+    manager.reset(kwargs={})
+
+    _, _, _, infos = manager.step([
+        '<tool_call>{"name":"inspect_range","arguments":'
+        '{"range":"A1:B2"}}</tool_call>'
+    ])
+
+    assert infos[0]["env/read_tool_call"] == 1
+    assert infos[0]["env/read_tool_success"] == 1
+    assert infos[0]["env/read_tool_error"] == 0

@@ -60,6 +60,42 @@ def test_projection_accepts_submit_without_arguments() -> None:
     assert actions[0].kwargs == {}
 
 
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("list_sheets", {}),
+        ("inspect_range", {"range": "A1:B3", "mode": "cells"}),
+        ("find_cells", {"query": "Total", "return_mode": "all"}),
+    ],
+)
+def test_projection_accepts_native_read_tools(
+    monkeypatch, name: str, arguments: dict,
+) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_read")
+
+    actions, valids = envharness_spreadsheetbench_projection([
+        _tool_call(name, arguments)
+    ])
+
+    assert valids == [1]
+    assert actions[0].name == name
+    assert actions[0].kwargs == arguments
+
+
+def test_projection_rejects_native_read_tools_in_python_tool_set(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "python")
+
+    actions, valids = envharness_spreadsheetbench_projection([
+        _tool_call("list_sheets", {})
+    ])
+
+    assert valids == [0]
+    assert actions[0].name == "invalid"
+    assert "native_read" in actions[0].kwargs["error"]
+
+
 def test_projection_parses_tool_call_after_final_think_close() -> None:
     code = "print('after thinking')"
     model_output = (

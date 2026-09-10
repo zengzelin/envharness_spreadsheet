@@ -36,7 +36,7 @@ folder" model, the file-based analogue of the swebench Docker container or the
 alfworld TextWorld engine. Rules-written code never sees the working dir, only
 the `SpreadsheetBenchEnvState` dataclass (pure data).
 
-Action contract (multi-turn ReAct, three tools):
+Action contract (multi-turn ReAct):
     run_python(code: str) -- execute a Python snippet in the working dir
                              (openpyxl/pandas available); the agent must save
                              its result to `output_path`. Stateless per call.
@@ -44,6 +44,9 @@ Action contract (multi-turn ReAct, three tools):
                              the hidden golden workbook.
     submit()              -- declare output_path final; ends the episode and
                              triggers grading.
+    With tool_set=native_read, three structured read-only tools are also
+    available: list_sheets(), inspect_range(), and find_cells(). They always
+    read the current output workbook and cannot access arbitrary paths.
     If the agent never submits, the episode runs to max_steps and we grade
     whatever is at output_path (it is pre-seeded as a copy of the input).
 
@@ -77,6 +80,7 @@ Reset options (passed through `options` in reset()):
                                    (default -0.05).
     syntax_error_penalty: float -- reward for Syntax/Indentation/TabError
                                    (default -0.1).
+    tool_set: str        -- python (default) or native_read.
 """
 from __future__ import annotations
 
@@ -101,7 +105,17 @@ from . import online_judge_eval
 from .dataset import (
     DATA_PATH_ENV, SBTask, load_dataset, load_spreadsheet_rl_dataset, select_task,
 )
-from .tools import RunPython, Submit, ValidateWorkbook
+from .read_tools import (
+    NATIVE_READ_TOOLS,
+    ReadToolError,
+    TOOL_SET_NATIVE_READ,
+    error_payload,
+    execute_read_tool,
+    normalize_tool_set,
+)
+from .tools import (
+    FindCells, InspectRange, ListSheets, RunPython, Submit, ValidateWorkbook,
+)
 
 
 DEFAULT_STEP_TIMEOUT = 60
@@ -149,8 +163,18 @@ class SpreadsheetBenchEnv(ActionableEnv):
     multi-turn run_python ReAct; LibreOffice Online-Judge grading."""
 
     tool_registry: ClassVar[list[type[Tool]]] = [
-        RunPython, ValidateWorkbook, Submit
+        RunPython, ListSheets, InspectRange, FindCells, ValidateWorkbook, Submit
     ]
+
+    @classmethod
+    def tool_schemas(cls) -> list[dict]:
+        tool_set = normalize_tool_set(
+            os.environ.get("SPREADSHEETBENCH_TOOL_SET", "python")
+        )
+        selected = [RunPython, ValidateWorkbook, Submit]
+        if tool_set == TOOL_SET_NATIVE_READ:
+            selected[1:1] = [ListSheets, InspectRange, FindCells]
+        return [tool.get_info() for tool in selected]
 
     def __init__(self) -> None:
         super().__init__()
@@ -167,6 +191,9 @@ class SpreadsheetBenchEnv(ActionableEnv):
         self._recalc_golden: bool = True
         self._python_error_penalty: float = DEFAULT_PYTHON_ERROR_PENALTY
         self._syntax_error_penalty: float = DEFAULT_SYNTAX_ERROR_PENALTY
+        self._tool_set: str = normalize_tool_set(
+            os.environ.get("SPREADSHEETBENCH_TOOL_SET", "python")
+        )
         self._terminated: bool = False
         self._eval_cache: EvaluationResult | None = None
         self.state: SpreadsheetBenchEnvState = SpreadsheetBenchEnvState()
@@ -203,6 +230,10 @@ class SpreadsheetBenchEnv(ActionableEnv):
         self._syntax_error_penalty = float(opts.get(
             "syntax_error_penalty", DEFAULT_SYNTAX_ERROR_PENALTY
         ))
+        self._tool_set = normalize_tool_set(
+            opts.get("tool_set")
+            or os.environ.get("SPREADSHEETBENCH_TOOL_SET", "python")
+        )
 
         # `instance_id` (explicit id, used by the eval driver) wins; otherwise
         # select by seed. The orchestrator-injected options["task_id"] is the
@@ -250,6 +281,7 @@ class SpreadsheetBenchEnv(ActionableEnv):
                 "task_id": task.id,
                 "instruction_type": task.instruction_type,
                 "answer_position": task.answer_position,
+                "tool_set": self._tool_set,
                 "won": False,
             },
         )
@@ -286,11 +318,59 @@ class SpreadsheetBenchEnv(ActionableEnv):
                 },
             )
 
+        if action.name in NATIVE_READ_TOOLS:
+            if self._tool_set != TOOL_SET_NATIVE_READ:
+                return EnvResponse(
+                    observation=Observation(
+                        text=(
+                            f"[tool disabled: {action.name}] Set "
+                            "SPREADSHEETBENCH_TOOL_SET=native_read to enable "
+                            "structured read tools."
+                        ),
+                        data={"error": "tool_disabled", "tool": action.name},
+                    ),
+                    reward=0.0,
+                    terminated=False,
+                    truncated=False,
+                    info={"error": "tool_disabled", "won": None},
+                )
+            try:
+                payload, tool_output = execute_read_tool(
+                    action.name, self.state.output_path, dict(action.kwargs)
+                )
+                tool_ok = True
+                tool_error = ""
+            except ReadToolError as exc:
+                payload, tool_output = error_payload(exc)
+                tool_ok = False
+                tool_error = exc.code
+            except Exception as exc:  # noqa: BLE001
+                wrapped = ReadToolError("tool_execution_failed", str(exc))
+                payload, tool_output = error_payload(wrapped)
+                tool_ok = False
+                tool_error = wrapped.code
+            self.state.last_output = tool_output
+            return EnvResponse(
+                observation=self._observe(
+                    run_output=tool_output, output_label="last tool output"
+                ),
+                reward=0.0,
+                terminated=False,
+                truncated=False,
+                info={
+                    "tool_name": action.name,
+                    "tool_ok": tool_ok,
+                    "tool_error": tool_error,
+                    "tool_result": payload,
+                    "won": None,
+                },
+            )
+
         if action.name != RunPython.name:
             return EnvResponse(
                 observation=Observation(
                     text=f"[unknown tool: {action.name}] valid tools: "
-                         "run_python(code), validate_workbook(), submit()",
+                         + self._valid_tool_summary(),
                     data={"error": "unknown_tool"},
                 ),
                 reward=0.0, terminated=False, truncated=False,
@@ -702,7 +782,21 @@ exec(compile(source, agent_script, "exec"), namespace)
             wb.close()
         return "\n".join(lines).strip()
 
-    def _observe(self, run_output: str | None = None) -> Observation:
+    def _valid_tool_summary(self) -> str:
+        tools = ["run_python(code)", "validate_workbook()", "submit()"]
+        if self._tool_set == TOOL_SET_NATIVE_READ:
+            tools[1:1] = [
+                "list_sheets()",
+                "inspect_range(range, ...)",
+                "find_cells(query, ...)",
+            ]
+        return ", ".join(tools)
+
+    def _observe(
+        self,
+        run_output: str | None = None,
+        output_label: str = "last run_python output",
+    ) -> Observation:
         s = self.state
         parts = [
             f"working_directory: {self._workdir}",
@@ -717,7 +811,7 @@ exec(compile(source, agent_script, "exec"), namespace)
         parts.append("spreadsheet_content (preview of the input):\n"
                      + s.spreadsheet_preview)
         if run_output is not None:
-            parts.append("last run_python output:\n" + run_output)
+            parts.append(output_label + ":\n" + run_output)
         text = "\n\n".join(parts)
         return Observation(
             text=text,
@@ -733,5 +827,6 @@ exec(compile(source, agent_script, "exec"), namespace)
                 "step_count": s.step_count,
                 "last_returncode": s.last_returncode,
                 "submitted": s.submitted,
+                "tool_set": self._tool_set,
             },
         )

@@ -14,7 +14,7 @@ from envharness_rl.spreadsheetbench.projection import (
 )
 
 
-_TOOL_INSTRUCTIONS = """You are solving a SpreadsheetBench task by editing the workbook with Python.
+_PYTHON_TOOL_INSTRUCTIONS = """You are solving a SpreadsheetBench task by editing the workbook with Python.
 The Python runtime predefines input_path, output_path, working_directory,
 load_workbook_for_edit(), and save_workbook(wb). load_workbook_for_edit() opens
 the current output workbook, which is initially a copy of the input and retains
@@ -39,6 +39,32 @@ Submit the finished output workbook:
 Python imports and local variables are stateless between calls; workbook edits
 persist through output_path. Do not submit until output_path contains the final
 answer."""
+
+_NATIVE_READ_TOOL_INSTRUCTIONS = """
+
+Structured read tools are enabled. They read the current output workbook, so
+they include edits from earlier turns. Do not pass a file path.
+
+List worksheets before assuming their names or dimensions:
+<tool_call>{"name":"list_sheets","arguments":{}}</tool_call>
+
+Inspect one finite A1 range. mode is cells or summary:
+<tool_call>{"name":"inspect_range","arguments":{"sheet_name":"Sheet1","range":"A1:D20","mode":"cells"}}</tool_call>
+
+Find text in values or formulas. match is contains, equals, or prefix; search_in
+is values, formulas, or both; return_mode is first or all:
+<tool_call>{"name":"find_cells","arguments":{"query":"Total","search_in":"values","return_mode":"all","max_results":20}}</tool_call>
+
+Prefer these tools over run_python for workbook discovery. They are read-only;
+use run_python for edits, then validate_workbook and submit as usual."""
+
+
+def _tool_instructions() -> str:
+    tool_set = os.environ.get("SPREADSHEETBENCH_TOOL_SET", "python")
+    normalized = tool_set.strip().lower().replace("-", "_")
+    if normalized == "native_read":
+        return _PYTHON_TOOL_INSTRUCTIONS + _NATIVE_READ_TOOL_INSTRUCTIONS
+    return _PYTHON_TOOL_INSTRUCTIONS
 
 
 class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
@@ -80,6 +106,7 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
         self._history_obs_chars = int(
             os.environ.get("SPREADSHEETBENCH_HISTORY_OBS_CHARS", "2000")
         )
+        self._tool_instructions = _tool_instructions()
 
     @staticmethod
     def _jsonable(value: Any) -> Any:
@@ -149,6 +176,8 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
         python_error = int(bool(env_info.get("python_error", False)))
         syntax_error = int(bool(env_info.get("syntax_error", False)))
         error_type = str(env_info.get("python_error_type") or "")
+        tool_name = str(env_info.get("tool_name") or "")
+        tool_error = str(env_info.get("tool_error") or "")
         return {
             "parser/status": parser_diagnostic.get("status", "unknown"),
             "parser/native_valid": int(
@@ -176,6 +205,12 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             ),
             "env/python_timeout": int(error_type == "TimeoutExpired"),
             "env/python_error_type": error_type,
+            "env/read_tool_call": int(bool(tool_name)),
+            "env/read_tool_success": int(
+                bool(tool_name) and bool(env_info.get("tool_ok", False))
+            ),
+            "env/read_tool_error": int(bool(tool_error)),
+            "env/read_tool_error_type": tool_error,
         }
 
     def _format_history_action(
@@ -198,7 +233,10 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             f"output_char_len: {output_chars}",
         ]
         if parser_error:
-            parts.append(f"parser_error: {parser_error}")
+            parts.append(
+                "parser_error: "
+                + self._truncate_text(parser_error, self._history_action_chars)
+            )
         return "\n".join(parts)
 
     def reset(self, kwargs):
@@ -293,16 +331,13 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
                         observation = self._truncate_text(
                             observation, self._history_obs_chars
                         )
-                        raw_action = self._truncate_text(
-                            raw_action, self._history_action_chars
-                        )
                     turns.append(
                         f"Turn {turn} observation:\n{observation}\n"
                         f"Turn {turn} tool call:\n{raw_action}"
                     )
                 history_text = "\n\nRecent interaction history:\n" + "\n\n".join(turns)
             prompts.append(
-                f"{_TOOL_INSTRUCTIONS}{history_text}\n\n"
+                f"{self._tool_instructions}{history_text}\n\n"
                 f"Current environment observation:\n{current_observation}"
             )
         return prompts

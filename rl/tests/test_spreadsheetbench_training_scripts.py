@@ -78,6 +78,32 @@ def test_training_dry_run_targets_external_ray_and_spreadsheetbench(
     assert "dry run complete" in completed.stdout
 
 
+def test_training_dry_run_tracks_native_read_tool_set(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "dataset.json").write_text("[]\n")
+    env = dict(os.environ)
+    env.update({
+        "DRY_RUN": "1",
+        "RAY_ADDRESS": "auto",
+        "SPREADSHEETBENCH_DATA": str(dataset),
+        "SPREADSHEETBENCH_TOOL_SET": "native_read",
+        "RUN_ROOT": str(tmp_path / "runs"),
+        "PY": "/usr/bin/python",
+    })
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "rl/scripts/run_spreadsheetbench_grpo.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "tool_set=native_read" in completed.stdout
+
+
 def test_training_dry_run_accepts_spreadsheet_rl_parquet_splits(
     tmp_path: Path,
 ) -> None:
@@ -223,6 +249,7 @@ def test_submit_dry_run_uses_saved_ray_addresses(tmp_path: Path) -> None:
     assert '"WANDB_DIR":' in completed.stdout
     assert '"TENSORBOARD_DIR":' in completed.stdout
     assert '"SPREADSHEETBENCH_TRAJECTORY_DIR":' in completed.stdout
+    assert '"SPREADSHEETBENCH_TOOL_SET": "python"' in completed.stdout
     assert "must-not-appear-in-output" not in completed.stdout
     assert "dry run complete" in completed.stdout
 

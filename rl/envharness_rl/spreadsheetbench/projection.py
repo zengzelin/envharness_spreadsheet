@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 
@@ -13,6 +14,12 @@ _END_TAG = "</tool_call>"
 _THINK_START_TAG = "<think>"
 _THINK_END_TAG = "</think>"
 _FENCED_JSON_RE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
+_NATIVE_READ_TOOLS = frozenset({"list_sheets", "inspect_range", "find_cells"})
+
+
+def _native_read_enabled() -> bool:
+    value = os.environ.get("SPREADSHEETBENCH_TOOL_SET", "python")
+    return value.strip().lower().replace("-", "_") == "native_read"
 
 
 def _invalid_action(error: str = "Tool call parse error: invalid action") -> Action:
@@ -153,11 +160,40 @@ def _project_one_with_diagnostics(
         diagnostics["native_valid"] = int(status == "native_tool_call")
         diagnostics["recovered"] = int(status.endswith("_recovered"))
         return Action(name=name, kwargs={}), 1, diagnostics
+    if name in _NATIVE_READ_TOOLS:
+        if not _native_read_enabled():
+            diagnostics["status"] = "tool_disabled"
+            diagnostics["error"] = (
+                "Tool call parse error: structured read tools require "
+                "SPREADSHEETBENCH_TOOL_SET=native_read."
+            )
+            return _invalid_action(diagnostics["error"]), 0, diagnostics
+        if name == "list_sheets" and arguments:
+            diagnostics["status"] = "invalid_arguments"
+            diagnostics["error"] = (
+                "Tool call parse error: list_sheets takes no arguments."
+            )
+            return _invalid_action(diagnostics["error"]), 0, diagnostics
+        required_key = "range" if name == "inspect_range" else "query"
+        if name != "list_sheets":
+            required_value = arguments.get(required_key)
+            if not isinstance(required_value, str) or not required_value.strip():
+                diagnostics["status"] = f"missing_{required_key}"
+                diagnostics["error"] = (
+                    f"Tool call parse error: {name} requires a non-empty "
+                    f"string '{required_key}' argument."
+                )
+                return _invalid_action(diagnostics["error"]), 0, diagnostics
+        diagnostics["valid"] = 1
+        diagnostics["invalid"] = 0
+        diagnostics["native_valid"] = int(status == "native_tool_call")
+        diagnostics["recovered"] = int(status.endswith("_recovered"))
+        return Action(name=name, kwargs=arguments), 1, diagnostics
     if name != "run_python":
         diagnostics["status"] = "wrong_tool_name"
         diagnostics["error"] = (
-            "Tool call parse error: unknown tool name. Use 'run_python', "
-            "'validate_workbook', or 'submit'."
+            "Tool call parse error: unknown tool name. Use an enabled "
+            "SpreadsheetBench tool."
         )
         return _invalid_action(diagnostics["error"]), 0, diagnostics
 

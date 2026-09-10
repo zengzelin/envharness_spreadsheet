@@ -37,11 +37,14 @@ The agent + induction prompts live at experiments/spreadsheetbench/prompts.py
 subprocess episode worker) does not pull litellm.
 """
 from .bridge import SpreadsheetBenchEnv, SpreadsheetBenchEnvState
-from .tools import RunPython, Submit
+from .tools import FindCells, InspectRange, ListSheets, RunPython, Submit
 
 __all__ = [
     "SpreadsheetBenchEnv",
     "SpreadsheetBenchEnvState",
     "RunPython",
+    "ListSheets",
+    "InspectRange",
+    "FindCells",
     "Submit",
 ]
