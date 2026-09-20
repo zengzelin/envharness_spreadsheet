@@ -48,6 +48,26 @@ validation environment actors, executes `run_python`, submits all train
 workbooks, and checks grouped rewards. Training launchers must follow the same
 pattern and pass `+ray_init.address=auto` to verl-agent.
 
+Before a full Spreadsheet-RL run, validate the loader at the same 128-actor
+shape used by `TRAIN_BS=16 GROUP_N=8`. This smoke connects to the existing Ray
+cluster and performs reset/close only; it does not load the policy model:
+
+```bash
+source runs/ray/ray_address.env
+export SPREADSHEET_RL_DATA_ROOT="$PWD/experiments/spreadsheetbench/data/Spreadsheet-RL"
+export SPREADSHEET_RL_TRAIN_FILE=train_hermes.parquet
+export SPREADSHEETBENCH_ACTOR_TIMEOUT_SECONDS=180
+PYTHONPATH=.:rl:third_party/verl-agent \
+  python rl/scripts/smoke_spreadsheetbench_loader_scale.py
+```
+
+Success requires 128 completed resets, 16 unique tasks, and eight identical
+task IDs in each rollout group. Reduce `SPREADSHEETBENCH_SCALE_ENV_NUM` or
+`SPREADSHEETBENCH_SCALE_GROUP_N` only for local diagnosis, not for the final
+scale acceptance check. The script sends absolute repository import paths to
+Ray workers through `runtime_env`, so a directly connected multi-node run does
+not depend on raylet inheriting the driver's temporary `PYTHONPATH`.
+
 After the external-Ray smoke succeeds, launch the one-epoch GRPO smoke:
 
 ```bash
@@ -85,15 +105,47 @@ credential in the shell rather than storing it in the repository:
 
 ```bash
 export WANDB_API_KEY='...'
+export WANDB_BASE_URL='https://your-wandb-server.example'
 bash rl/scripts/submit_spreadsheetbench_grpo.sh
 ```
 
-The default W&B endpoint is `https://wandb.lubanml.woa.com`; use
-`WANDB_MODE=offline` when the service is unavailable. Each run stores W&B and
-TensorBoard files under `wandb/` and `tensorboard/`, decoded verl generations
-under `rollouts/verl/`, and complete train/validation environment trajectories
-under `rollouts/env/{train,val}/`. `run_manifest.json` records the source commit,
+Leave `WANDB_BASE_URL` unset to use the W&B SDK default endpoint, or set it in
+the shell when using a self-hosted service. Use `WANDB_MODE=offline` when the
+service is unavailable. Each run stores W&B and TensorBoard files under
+`wandb/` and `tensorboard/`, decoded verl generations under `rollouts/verl/`,
+and complete train/validation environment trajectories under
+`rollouts/env/{train,val}/`. `run_manifest.json` records the source commit,
 resolved settings, and Hydra command without credentials.
+
+SpreadsheetBench rollout phases are logged as
+`[spreadsheet-rollout] START|HEARTBEAT|END|ERROR`, including whether the phase
+is train or validation, the turn number, active trajectory count, and elapsed
+time. `rollout_call` is a process-local sequence number, so consecutive
+validation and training collections can be distinguished. Ray environment
+calls additionally log `[spreadsheet-ray]` boundaries.
+This separates stalls in `env_reset`, model `generate_sequences`, and
+`env_step`; an actor timeout reports the indexes, Ray actor IDs, task IDs, and
+actions that did not return. Each actor also logs `[spreadsheet-worker]`
+boundaries around its environment step and grading. The bridge logs
+`[spreadsheet-bridge]` boundaries for `run_python`, native read/write tools,
+LibreOffice output/golden recalculation, and workbook comparison.
+
+`run_python` and LibreOffice execute in isolated process groups. On timeout the
+whole process group is killed and reaped, preventing a child process from
+holding an output pipe, workbook, or LibreOffice profile after its parent has
+timed out.
+
+```bash
+# Defaults shown; override before submitting when a workload needs more time.
+export SPREADSHEETBENCH_ACTOR_TIMEOUT_SECONDS=600
+export SPREADSHEETBENCH_PHASE_HEARTBEAT_SECONDS=60
+```
+
+The actor timeout bounds each parallel environment `reset`, `step`, and
+`close`. It does not terminate a stalled distributed model generation; the
+periodic `generate_sequences` heartbeat identifies that case for inspection in
+the Ray/NCCL worker logs. Both values are recorded in `launch.log` and
+`run_manifest.json`.
 
 ## Getting verl-agent (clone + patch)
 
@@ -172,6 +224,7 @@ reports per-task-type success rates; each step logs `actor/pg_loss`,
 | `scripts/mpi_ray_up.sh` / `scripts/mpi_ray_node.sh` | start and readiness-check the external Ray cluster |
 | `scripts/submit_spreadsheetbench_ray_smoke.sh` | submit the full adapter smoke through Ray Jobs |
 | `scripts/smoke_spreadsheetbench_ray.py` | external-Ray reset/run/submit/OJ integration driver |
+| `scripts/smoke_spreadsheetbench_loader_scale.py` | 128-actor Spreadsheet-RL reset/close scale check without a model |
 | `scripts/submit_spreadsheetbench_grpo.sh` | submit SpreadsheetBench GRPO to the ready Ray cluster |
 | `scripts/run_spreadsheetbench_grpo.sh` | build and execute the verl-agent GRPO command |
 | `scripts/prepare_spreadsheetbench_verl_data.py` | generate offline text parquet placeholders for verl-agent |

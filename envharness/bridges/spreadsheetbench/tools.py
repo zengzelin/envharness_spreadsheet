@@ -117,6 +117,63 @@ class FindCells(Tool):
         raise NotImplementedError("SpreadsheetBenchEnv.step executes find_cells")
 
 
+class WriteRange(Tool):
+    name = "write_range"
+    description = (
+        "Write static values to a finite range in the current output workbook. "
+        "A single-cell range anchors row or matrix data, and scalar data fills "
+        "the target range. Formula strings are rejected; null entries skip cells."
+    )
+
+    @classmethod
+    def get_info(cls) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": cls.name,
+                "description": cls.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "range": {"type": "string"},
+                        "data": {
+                            "type": ["array", "string", "number", "boolean"]
+                        },
+                        "sheet_name": {"type": "string"},
+                    },
+                    "required": ["range", "data"],
+                },
+            },
+        }
+
+    @classmethod
+    def invoke(
+        cls,
+        env_state: Any,
+        range: str,
+        data: list | str | int | float | bool | None,
+        sheet_name: str = "",
+    ) -> Any:
+        raise NotImplementedError("SpreadsheetBenchEnv.step executes write_range")
+
+
+class ClearRange(Tool):
+    name = "clear_range"
+    description = (
+        "Clear values and formulas from a finite range in the current output "
+        "workbook without deleting or shifting cells."
+    )
+
+    @classmethod
+    def invoke(
+        cls,
+        env_state: Any,
+        range: str,
+        sheet_name: str = "",
+    ) -> Any:
+        raise NotImplementedError("SpreadsheetBenchEnv.step executes clear_range")
+
+
 class ValidateWorkbook(Tool):
     name = "validate_workbook"
     description = (

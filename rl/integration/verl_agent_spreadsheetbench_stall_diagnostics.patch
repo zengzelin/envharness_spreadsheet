@@ -1,0 +1,159 @@
+diff --git a/agent_system/multi_turn_rollout/rollout_loop.py b/agent_system/multi_turn_rollout/rollout_loop.py
+--- a/agent_system/multi_turn_rollout/rollout_loop.py
++++ b/agent_system/multi_turn_rollout/rollout_loop.py
+@@ -13,6 +13,11 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from contextlib import contextmanager
++import os
++import threading
++import time
++
+ import torch
+ import numpy as np
+ from verl import DataProto
+@@ -26,5 +31,49 @@ from agent_system.environments import EnvironmentManagerBase
+ from typing import List, Dict
+ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+ 
++
++def _phase_message(event, name, started, details):
++    elapsed = time.monotonic() - started
++    detail_text = " ".join(f"{key}={value}" for key, value in details.items())
++    print(
++        f"[spreadsheet-rollout] {event} phase={name} "
++        f"elapsed_s={elapsed:.1f} {detail_text}".rstrip(),
++        flush=True,
++    )
++
++
++@contextmanager
++def _diagnostic_phase(name, *, enabled, heartbeat_s, **details):
++    if not enabled:
++        yield
++        return
++
++    started = time.monotonic()
++    stopped = threading.Event()
++    _phase_message("START", name, started, details)
++
++    def emit_heartbeats():
++        while not stopped.wait(heartbeat_s):
++            _phase_message("HEARTBEAT", name, started, details)
++
++    heartbeat = threading.Thread(
++        target=emit_heartbeats,
++        name=f"spreadsheet-rollout-{name}",
++        daemon=True,
++    )
++    heartbeat.start()
++    try:
++        yield
++    except BaseException as exc:
++        details = dict(details)
++        details["error"] = f"{type(exc).__name__}: {exc}"
++        _phase_message("ERROR", name, started, details)
++        raise
++    else:
++        _phase_message("END", name, started, details)
++    finally:
++        stopped.set()
++
++
+ class TrajectoryCollector:
+     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
+@@ -39,6 +88,26 @@ class TrajectoryCollector:
+         self.config = config
+         self.tokenizer = tokenizer
+         self.processor = processor
++        env_name = str(config.env.env_name).strip().lower()
++        self._spreadsheet_diagnostics = env_name.startswith(
++            "envharness_rl/spreadsheetbench"
++        )
++        self._rollout_invocation = 0
++        self._phase_heartbeat_s = float(os.environ.get(
++            "SPREADSHEETBENCH_PHASE_HEARTBEAT_SECONDS", "60"
++        ))
++        if self._phase_heartbeat_s <= 0:
++            raise ValueError(
++                "SPREADSHEETBENCH_PHASE_HEARTBEAT_SECONDS must be positive"
++            )
++
++    def _diagnostic_phase(self, name, **details):
++        return _diagnostic_phase(
++            name,
++            enabled=self._spreadsheet_diagnostics,
++            heartbeat_s=self._phase_heartbeat_s,
++            **details,
++        )
+ 
+     def preprocess_single_sample(
+         self,
+@@ -287,4 +355,5 @@ class TrajectoryCollector:
+             gen_batch: DataProto, 
+             actor_rollout_wg, 
+             envs: EnvironmentManagerBase,
++            is_train: bool = True,
+             ) -> DataProto:
+@@ -306,5 +376,11 @@ class TrajectoryCollector:
+         batch_size = len(gen_batch.batch)
+ 
+         # Initial observations from the environment
+-        obs, infos = envs.reset(kwargs=gen_batch.non_tensor_batch.pop('env_kwargs', None))
++        with self._diagnostic_phase(
++            "env_reset", is_train=is_train,
++            rollout_call=self._rollout_invocation, batch_size=batch_size
++        ):
++            obs, infos = envs.reset(
++                kwargs=gen_batch.non_tensor_batch.pop('env_kwargs', None)
++            )
+ 
+@@ -351,5 +427,15 @@ class TrajectoryCollector:
+ 
+             # pad to be divisible by dp_size
+             batch_input_padded, pad_size = pad_dataproto_to_divisor(batch_input, actor_rollout_wg.world_size)
+-            batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
++            with self._diagnostic_phase(
++                "generate_sequences",
++                is_train=is_train,
++                rollout_call=self._rollout_invocation,
++                turn=_step + 1,
++                active=int(active_masks.sum()),
++                padded_batch_size=len(batch_input_padded.batch),
++            ):
++                batch_output_padded = actor_rollout_wg.generate_sequences(
++                    batch_input_padded
++                )
+             # # unpad
+@@ -362,4 +448,11 @@ class TrajectoryCollector:
+             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
+             
+-            next_obs, rewards, dones, infos = envs.step(text_actions)
++            with self._diagnostic_phase(
++                "env_step",
++                is_train=is_train,
++                rollout_call=self._rollout_invocation,
++                turn=_step + 1,
++                active=int(active_masks.sum()),
++            ):
++                next_obs, rewards, dones, infos = envs.step(text_actions)
+ 
+@@ -455,4 +544,5 @@ class TrajectoryCollector:
+                 gen_batch=gen_batch,
+                 actor_rollout_wg=actor_rollout_wg,
+                 envs=envs,
++                is_train=True,
+             )
+@@ -501,4 +596,5 @@ class TrajectoryCollector:
+         if is_train:
+             gen_batch = gen_batch.repeat(repeat_times=self.config.env.rollout.n, interleave=True)
++        self._rollout_invocation += 1
+             
+         # Initial observations from the environment
+@@ -519,4 +609,5 @@ class TrajectoryCollector:
+                 gen_batch=gen_batch,
+                 actor_rollout_wg=actor_rollout_wg,
+                 envs=envs,
++                is_train=is_train,
+             )

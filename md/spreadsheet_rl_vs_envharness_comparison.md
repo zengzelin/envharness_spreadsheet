@@ -1,12 +1,15 @@
 # Spreadsheet-RL 与当前 EnvHarness 方案对比及适配建议
 
-> 整理日期：2026-09-10  
+> 首次整理：2026-09-10；最后更新：2026-09-20
 > 对比代码：Spreadsheet-RL `389be8c`；EnvHarness `180e258`  
 > 当前固定基座模型：`Qwen3-4B-Thinking-2507`
 
 ## 1. 结论先行
 
-我们之前确实讨论过 Spreadsheet-RL 与当前实现的差异，但当时主要完成了**数据层适配**，没有迁移 Spreadsheet-RL 的 native verl agent loop、原生表格工具、SandboxFusion 和 Windows Excel reward service。
+截至 2026-09-20，已完成**数据层适配、部分原生工具迁移、大规模 loader
+优化、评分/进程稳定性修复和训练可观测性建设**。尚未迁移 Spreadsheet-RL 的
+native verl agent loop、单轮多工具调度、完整表格工具、SandboxFusion 和 Windows
+Excel reward service。
 
 当前方案不是“不能使用 Spreadsheet-RL 数据”。相反，EnvHarness 已经能够读取它的 parquet split，并正确映射：
 
@@ -17,7 +20,11 @@
 - `train_hermes.parquet`：训练集；
 - `test_verified_hermes.parquet`：严格独立的验证集。
 
-当前主要差距位于**环境和工具层**：Spreadsheet-RL 给模型提供结构化、低风险、低 token 成本的表格原生工具；EnvHarness 主要让模型生成完整 Python 代码。后者直接导致目前观察到的 Python syntax/runtime error、长输出、重复检查和低成功率。
+当前主要差距仍位于**环境和工具层**，但 EnvHarness 已不再是只有
+`run_python`：已迁移三个只读工具和两个基础写工具，并保留 Python
+兜底。实验表明这些工具、宽松 parser 和历史压缩已改善动作可解析性和
+Python 错误率，但尚未证明能提高最终 workbook success rate。当前瓶颈已从
+“环境不能闭环”转为“写操作覆盖不足、轨迹过长、reward 与最终成功不完全对齐”。
 
 因此，建议继续维护 EnvHarness 这一条主线，但分阶段移植 Spreadsheet-RL 的工具设计。优先移植读取工具和常用写入工具，保留 `run_python` 作为兜底。现阶段不建议直接替换成 Spreadsheet-RL 全套训练栈，也不建议先部署 Windows Excel reward 服务。
 
@@ -156,11 +163,16 @@ Spreadsheet-RL 是论文对应的完整训练栈，包含：
 
 ### 5.2 EnvHarness 当前工具
 
-当前只有三种动作：
+当前工具由 `SPREADSHEETBENCH_TOOL_SET` 分三级开启：
 
-- `run_python(code)`：用 fresh subprocess 运行自包含 Python；
-- `validate_workbook()`：检查结果文件和目标 range 是否存在；
-- `submit()`：结束 episode 并评分。
+- `python`：`run_python`、`validate_workbook`、`submit`；
+- `native_read`：在 `python` 基础上增加 `list_sheets`、`inspect_range`、
+  `find_cells`；
+- `native_basic`：再增加 `write_range` 和 `clear_range`。
+
+只读工具已支持范围、返回字符数和 workbook 大小限制。写工具已使用统一文件锁、
+临时文件校验和原子替换，避免失败写入损坏工作簿。`run_python` 仍是公式、格式、
+排序和结构操作的兜底路径。
 
 优点：能力上限高，开发量小，复杂任务可直接写任意 openpyxl/pandas 逻辑。
 
@@ -172,7 +184,9 @@ Spreadsheet-RL 是论文对应的完整训练栈，包含：
 - 一个小参数错误会使整段操作失败；
 - 难以把“工具选择错误”和“Python 实现错误”分开分析。
 
-当前增加的 compact history、错误分类、Python error penalty 和 `validate_workbook` 能改善可观测性，但不能从根本上替代结构化工具。
+已完成的 compact history、错误分类、Python error penalty、`validate_workbook`
+和基础结构化工具能改善可观测性与部分动作稳定性，但尚未覆盖公式、格式、
+行列和 sheet 管理，也未迁移单轮多工具调度。
 
 ## 6. 工作区、执行环境和安全性
 
@@ -338,6 +352,15 @@ Spreadsheet-RL 的 Qwen3-4B 默认配置：
 - 单机/多机外部 Ray 启动；
 - checkpoint、W&B、TensorBoard 和 run manifest；
 - Python syntax/runtime 分类及诊断 penalty。
+- `list_sheets` / `inspect_range` / `find_cells` 只读工具；
+- `write_range` / `clear_range` 基础写工具，包含文件锁和原子提交；
+- native tool 调用率、成功率、错误率和分工具训练/验证指标；
+- Spreadsheet-RL loader 按 seed 先选 parquet row、再只物化单个任务；
+- train worker 轮换任务、validation worker 固定任务的可比较采样；
+- workbook score、execution penalty、env total 和 invalid-action penalty 分解指标；
+- Ray actor/reset/step/close 超时、心跳、actor ID/task ID 和阶段耗时诊断；
+- `run_python` / LibreOffice 独立进程组超时回收；
+- Base 与 checkpoint 在同一 399 条 Verified 任务上的 paired evaluation。
 
 ### 10.2 尚未完成
 
@@ -345,13 +368,14 @@ Spreadsheet-RL 的 Qwen3-4B 默认配置：
 - token-aware Hermes parser 和原生 response mask；
 - 单轮多个 tool call；
 - 读工具并行、写工具串行；
-- Spreadsheet-RL 全套表格原生工具；
+- Spreadsheet-RL 剩余原生工具：公式、格式、行列、sheet 管理和中间重算；
 - SandboxFusion；
 - Windows Excel reward/recalculate 服务；
 - async rate-limited reward queue；
 - 原版 FSDP2、dynamic batching 和 fused kernel 性能栈；
 - audit UI；
 - Qwen3-Coder parser。当前固定使用 Qwen3 Thinking，因此最后一项不是近期需求。
+- 验证集总规模与 actor 并发数解耦；当前 `VAL_BS=64` 同时限制在线验证任务数。
 
 ## 11. 可借鉴项、收益和适配难度
 
@@ -489,8 +513,32 @@ FSDP2、dynamic batching、fused kernel、SandboxFusion 和多机吞吐应作为
 - projection、prompt、环境指标、trajectory 和启动配置追踪；
 - `SPREADSHEETBENCH_TOOL_SET=python` 保留原 baseline 行为。
 
-这一版是原工具语义的受控子集，尚未支持多 range、regex、单轮多个
-tool call 或任何写工具。集群测试和 smoke 通过后，再开始 A0/A1 对比。
+路线 A2 的第一批受控写工具也已实现，使用
+`SPREADSHEETBENCH_TOOL_SET=native_basic` 开启 A1 的全部工具以及：
+
+- `write_range`：写入静态 scalar、row、column 或二维矩阵；单元格数组中的
+  `null` 表示跳过该单元格；拒绝公式字符串；
+- `clear_range`：只清除有限范围的值和公式，不移动行列；
+- 写操作共用 workbook lock，并通过同目录临时文件校验后原子替换；
+- 单次 mutation 最多 50,000 个单元格，单个字符串最多 8,192 字符，
+  workbook 最大 100 MB；
+- `run_python` 保留，负责公式、格式、排序、插入删除行列等复杂操作。
+
+同时补充了训练和验证观测指标：
+
+- `env/read_tool_call_ratio`、`env/read_tool_success_rate`、
+  `env/read_tool_error_rate`；
+- `env/write_tool_call_ratio`、`env/write_tool_success_rate`、
+  `env/write_tool_error_rate`；
+- `tool/{tool_name}_ratio`，覆盖 `run_python`、三个读工具、两个写工具、
+  `validate_workbook` 和 `submit`；
+- validation 使用对应的 `val/env/...` 和 `val/tool/...` 名称；
+- 离线可运行 `rl/scripts/summarize_spreadsheetbench_rollouts.py` 汇总 env
+  trajectory 中的调用、成功、错误和最终 success rate。
+
+当前仍未支持多 range、regex、公式写入或单轮多个 tool call。A2 应先在
+集群跑单测和 worker smoke，再用与 A1 完全一致的模型、数据、seed、batch、
+长度和训练步数做对照；已有运行中的 Ray job 不会自动加载提交后的新代码。
 
 下一步不应继续只调 learning rate、response length 或 max steps。当前 badcase 已经说明，模型经常在“生成和修复 Python”上浪费 rollout 预算。建议：
 
@@ -502,11 +550,178 @@ tool call 或任何写工具。集群测试和 smoke 通过后，再开始 A0/A1
 6. 若结构化工具有效但 external manager 成为明显性能/协议瓶颈，再进入 native verl loop PoC；
 7. 最终再做 Windows Excel reward 对齐测试，而不是立即把训练依赖到 Windows 服务。
 
-## 15. 最终判断
+## 15. 阶段判断
 
 - **数据能否用**：能，且 train/val split 和 `output.xlsx -> target.xlsx` 映射已经适配。
 - **当前 codebase 是否需要放弃**：不需要。它仍然适合环境闭环、badcase 诊断和增量工具实验。
-- **Spreadsheet-RL 最值得借鉴什么**：结构化表格工具、读写并发规则、工作簿锁与原子提交、工具输出限长。
+- **Spreadsheet-RL 最值得借鉴什么**：结构化表格工具、单轮多工具调度、工作簿锁与原子提交、工具输出限长。其中只读工具、基础写工具、文件锁和原子提交已迁移。
 - **是否立即迁移 native verl**：不建议。先用当前架构证明工具层收益，再做独立 PoC。
 - **是否立即部署 SandboxFusion/Windows Excel**：不建议作为当前 success rate 优化的第一步；前者主要解决隔离，后者主要解决评分语义。
 - **适配难度**：数据层低且已完成；只读工具中等；完整写工具中高；native verl loop 高；完整复现原版基础设施很高。
+
+## 16. 2026-09-14 状态补充
+
+### 数据部署状态
+
+`gemininjceph5` 当前仓库的
+`experiments/spreadsheetbench/data/Spreadsheet-RL` 已于 2026-09-14 从
+`geminisgceph1` 的完整副本复制并解压。loader 和启动脚本现在可以直接使用该数据线。
+相邻的 `../Spreadsheet-RL` 仍只是代码仓库；正式数据由 Hugging Face dataset 发布，
+不在 GitHub 仓库中。
+
+目标数据包含 5,925 条 ExcelForum、2,722 条 SpreadsheetBench、297 条
+SpreadsheetBench-2、399 条 SpreadsheetBench-Verified 和 1,662 条 Domain 任务。
+归档完整性以及关键 parquet/zip 文件大小已经校验。具体路径和评测命令见
+`md/independent_evaluation_plan.md`。
+
+### 最新工程修复
+
+在已有 native read/write、compact history 和 evaluator 异常隔离基础上，又完成：
+
+- `run_python` 和 LibreOffice 使用独立进程组，超时后杀死并回收整个进程组；
+- Ray reset/step/close 增加全局超时、actor ID、task ID 和 action 诊断；
+- rollout 的 reset、generate、env step 增加 START/HEARTBEAT/END/ERROR；
+- bridge 为 Python、native tool、recalc、compare 和 validate 增加阶段耗时；
+- `validate_workbook` 对大 answer range 从 read-only 随机单元格访问改为
+  `iter_rows()` 单次顺序扫描；任务 `455-35` 的 `A1:J10411` 范围由超过 600 秒降到约
+  1.3 秒的本地扫描时间；
+- range parser 同时支持单格 `A1`、矩形 `A1:J10411` 和整列 `A:J`。
+
+### 最新实验
+
+`grpo_spreadsheetbench_diagnostic_20260912_194504` 使用两节点、16 GPU、
+Qwen3-4B-Thinking-2507、`native_basic`、`MAX_STEPS=15` 和 50 个训练 step。截至 step 34
+没有再次发生 evaluator/actor timeout，说明上述稳定性修复起作用。
+
+但训练效果尚未形成稳定提升：初始和 step 30 validation success rate 都为 `0.281`，
+step 10 达到过 `0.344`；训练 success rate 在 step 33 为 `0.453`，step 34 又降到
+`0.078`，同时 `actor/kl_loss=7.532`、response clip ratio 为 `0.111`。当前应先建立
+严格独立、全量、paired 的 checkpoint 评测，再决定是否继续调学习率或扩大训练。
+
+注意：当前 checkpoint 在 Verified-400 上训练，所以
+`test_verified_hermes.parquet` 不能未经重叠审计就称为 held-out。当前 checkpoint 应优先
+用 `test_domain_hermes.parquet` 或 `test_2_hermes.parquet` 评测；未来使用
+`train_hermes.parquet` 训练时，再以 `test_verified_hermes.parquet` 作为主 held-out。
+
+## 17. 2026-09-18：Spreadsheet-RL 全量训练的 loader 阻塞
+
+全量训练实验 `grpo_spreadsheetbench_full_20260918_004429` 暴露了新的规模问题：
+32 个 validation actor 可以完成 reset，但训练阶段的 128 个 actor 在 600 秒内
+`ready=0/128`。故障发生在首批 train rollout 的 reset 阶段，尚未进入模型生成、
+reward 计算或 PPO 更新。
+
+根因是当前 envharness 的 Spreadsheet-RL loader 在每个 Ray actor 首次 reset 时都会
+完整读取 5,925 行 parquet，并逐任务访问 `instruction.json`、`output.xlsx` 和
+`target.xlsx`。进程内 `lru_cache` 无法跨 actor 复用，128 actor 会把全量任务目录扫描
+放大为约 75.8 万次小文件访问。Spreadsheet-RL 原生实现由 verl 数据层逐样本传递
+`extra_info` 和 `ground_truth`，不存在 actor 内反复构建全量任务表的问题。
+
+已完成修改方案设计，见
+`md/spreadsheet_rl_loader_optimization_plan.md`。第一阶段采用最小兼容方案：缓存 parquet
+原始行、先根据 seed 选 row、再只物化被选中的一个 `SBTask`；全量 loader 仅保留给
+离线枚举和兼容调用。同时补充 reset 分阶段日志与 128 actor 独立 loader 压测。若该方案
+仍无法在 180 秒内完成 128 actor reset，再升级为 driver 预加载并通过 Ray object store
+广播 manifest。
+
+当前状态：该阻塞已解除。loader 已按 row cache + lazy materialization 修改，
+128 actor scale smoke、5-step GRPO 和后续 20-step 训练均已能越过 reset 阶段。
+`grpo_spreadsheetbench_diagnostic_20260919_215017` 进一步证明该 loader 能支撑单机
+8 卡、16 个 task group / 128 条 rollout 的持续训练。
+
+### Loader 实施更新
+
+2026-09-18 已按计划完成第一阶段代码修改：训练 reset 现在先从 parquet row cache 中
+选择目标行，再只物化一个任务；全量 loader 保留给离线枚举。worker/bridge reset 的
+阶段日志和 128 actor 无模型压测脚本也已加入。训练集群后续完成了单测、
+scale smoke、5-step 和 20-step GRPO 验收；原先 `ready=0/128` 的 reset 卡死未再复现。
+
+## 18. 2026-09-20：迁移台账与有效性结论
+
+### 18.1 已完成的适配
+
+| 模块 | 完成内容 | 当前状态 |
+| --- | --- | --- |
+| 数据 | Spreadsheet-RL parquet schema、`ground_truth` / `extra_info`、`output.xlsx` / `target.xlsx`、train/val split | 已完成 |
+| 大规模 loader | parquet row cache，先选 row 再 lazy materialize 单任务，安全 task ID | 已完成 |
+| verl-agent 注册 | `env.env_name=envharness_rl/spreadsheetbench`，GRPO、checkpoint、W&B、TensorBoard、run manifest | 已完成 |
+| Hermes 协议 | 标准 tool call，`<think>` / fenced JSON / bare JSON 宽松恢复，错误反馈 | 已完成 |
+| 历史管理 | compact history，分别限制 action 和 observation，保留 projected action | 已完成 |
+| 只读工具 | `list_sheets`、`inspect_range`、`find_cells` | 已完成 |
+| 基础写工具 | `write_range`、`clear_range`，文件锁、范围校验、原子替换 | 已完成 |
+| Python 兜底 | subprocess、超时、进程组回收、syntax/runtime/timeout 分类 | 已完成 |
+| evaluator | LibreOffice 重算、OJ compare、golden cache、单样本异常隔离 | 已完成 |
+| Ray 稳定性 | reset/step/close 超时，actor/task/action 定位，rollout 阶段心跳 | 已完成 |
+| 轨迹与指标 | env/verl 双轨迹，parser、tool、Python error、reward 分解指标 | 已完成 |
+| 验证可比性 | train task 轮换，fast-val task 固定，确定性 validation | 已完成 |
+| 独立评测 | Base/checkpoint 使用相同 399 条 Verified 任务做 paired evaluation | 已完成 |
+
+### 18.2 哪些修改已证明起作用
+
+**工程闭环和稳定性：已证明。**
+
+- Spreadsheet-RL 5,925 条训练 split 已能启动 128 rollout actor；旧 loader 的
+  `ready=0/128` reset 超时不再复现。
+- 5-step、20-step 和当前 50-step 配置均已越过 reset、rollout、reward、PPO
+  update 和 checkpoint 环节。
+- `grpo_spreadsheetbench_diagnostic_20260919_215017` 已完成 step 13，并进入后续
+  rollout；截至记录时没有再出现 evaluator/actor 卡死。
+- 该 run 产生了 448 条 validation env trajectory：64 个固定 task 各出现 7 次，
+  对应 step 0/2/4/6/8/10/12。这证明“固定 fast-val”实际生效。
+- reward 分解和 native tool 指标已出现在 train/validation 日志中，能区分
+  workbook score、execution penalty、invalid-action penalty 和分工具成功率。
+
+**动作可解析性和执行质量：部分改善。**
+
+- 完整 399 条 paired evaluation 中，step 5 相比 Base 的 native parser 有效率从
+  `0.7457` 升到 `0.9440`，Python 错误率从 `0.1960` 降到 `0.1143`。
+- 当前低学习率 run 的 fast-val 中，parser invalid ratio 从 step 0 的 `0.094`
+  降到 step 12 的 `0.073`；只读工具成功率基本为 `1.0`。
+- compact history 后，该 run 已完成 step 的 prompt clip ratio 大多为 `0`至 `0.031`，
+  response clip ratio 大多为 `0.002`至 `0.026`，明显低于早期 4096 response 配置。
+
+### 18.3 哪些修改还没有证明提升效果
+
+**最终任务成功率：尚未提升。**
+
+- 完整 399 条评测中，Base 为 `122/399 = 0.3058`，step 5 为
+  `113/399 = 0.2832`。parser 和 Python 错误改善没有转化为 workbook success 提升。
+- 当前低学习率 run 的固定 64 条 fast-val 从 step 0 的 `0.312` 波动到
+  step 12 的 `0.359`，中间值为 `0.312`至 `0.344`。尚未对 step 12 跑完整
+  399 条，因此不能宣称训练效果已改善。
+- `write_range` 只接受静态值，模型经常将公式传给它并收到
+  `write_range accepts static values only`。当前 run 的 train write success rate 在不同
+  step 间约为 `0.06`至 `0.86`，波动很大。
+- 模型仍然主要使用 `run_python`；当前 run 中该工具占比约 `0.66`至 `0.85`。
+  这说明基础 native tools 还没有替代高风险的大段 Python 代码。
+- episode length 仍长期接近 `MAX_STEPS=10`，很多轨迹没有提前 submit。细粒度工具
+  在当前“一轮一动作”调度下也会占用 turn 预算。
+
+### 18.4 与 Spreadsheet-RL 原版 validation 的剩余差异
+
+Spreadsheet-RL 原版默认使用 `test_hermes.parquet` 2,722 条验证任务，
+`val_batch_size=1400` 只是 dataloader 的分批大小；trainer 会遍历完整验证集。若改用
+`test_verified_hermes.parquet`，则会在一个 batch 中评测完整 400/本地可用
+399 条。原版配置是 step 0 validation，之后每 15 step 评测。
+
+当前 EnvHarness 中 `VAL_BS` 同时决定验证任务数和 Ray env actor 数。因此
+`VAL_BS=64` 是固定 64 条 fast-val，不是完整 399 条。完整 399 条目前通过
+独立 val-only job 运行。下一项明确的架构修改是解耦：
+
+```text
+validation_size = 399
+validation_concurrency = 32 或 64
+```
+
+实现后才能在不同时创建 399 个 actor 的情况下，像 Spreadsheet-RL 一样分批遍历
+完整验证集。
+
+### 18.5 当前优先级
+
+1. 保留固定 64 条 fast-val 做频繁健康检查，对候选 checkpoint 跑完整 399 条。
+2. 解耦 validation size 和 actor concurrency，把完整验评分批收入统一训练流程。
+3. 先补 `fill_formula`，并明确 `write_range` 的静态值边界；再补格式、行列和
+   sheet 管理工具。
+4. 迁移单轮多 tool-call 调度，允许只读工具并行、写工具按序执行，降低
+   episode 长度和 rollout 时间。
+5. 候选 checkpoint 的选择以完整验证集 `success_rate` 为主，parser 和 shaping
+   reward 只用于诊断，不再单独作为效果结论。

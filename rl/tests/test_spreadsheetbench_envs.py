@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+
 from envharness.core.types import (
     Action,
     EnvResetResponse,
@@ -9,6 +13,7 @@ from envharness.core.types import (
 )
 from envharness_rl.spreadsheetbench.envs import (
     EnvharnessSpreadsheetWorker,
+    _ray_get_with_diagnostics,
     _require_initialized_ray,
     _worker_seeds,
 )
@@ -99,6 +104,40 @@ def test_worker_grades_submit_and_returns_verifier_score() -> None:
     assert final_info["task_id"] == "13-1"
     assert final_info["answer_position"] == "A1:B2"
     assert fake.evaluate_calls == 1
+
+
+def test_worker_logs_action_and_grade_with_task_context(capsys) -> None:
+    worker = EnvharnessSpreadsheetWorker(
+        seed=0,
+        data_path="/dataset",
+        max_steps=1,
+        worker_index=88,
+        env_factory=FakeSpreadsheetEnv,
+    )
+    worker.reset()
+
+    worker.step(Action(name="submit", kwargs={}))
+
+    output = capsys.readouterr().out
+    assert "worker_index=88 task_id=13-1 action=submit episode_step=1 stage=env_step START" in output
+    assert "worker_index=88 task_id=13-1 action=submit episode_step=1 stage=grade START" in output
+    assert "worker_index=88 task_id=13-1 action=submit episode_step=1 stage=grade END" in output
+
+
+def test_worker_logs_reset_seed_and_boundaries(capsys) -> None:
+    worker = EnvharnessSpreadsheetWorker(
+        seed=17,
+        data_path="/dataset",
+        max_steps=1,
+        worker_index=9,
+        env_factory=FakeSpreadsheetEnv,
+    )
+
+    worker.reset()
+
+    output = capsys.readouterr().out
+    assert "worker_index=9 task_id=- action=reset episode_step=0 stage=reset seed=17 START" in output
+    assert "worker_index=9 task_id=13-1 action=reset episode_step=0 stage=reset seed=17 END" in output
 
 
 def test_worker_grades_current_workbook_at_max_steps() -> None:
@@ -222,6 +261,49 @@ def test_worker_advances_to_the_next_nonoverlapping_task_batch() -> None:
     assert fake.reset_seed == 23
 
 
+def test_validation_worker_reuses_the_same_task_seed() -> None:
+    fake = FakeSpreadsheetEnv()
+    worker = EnvharnessSpreadsheetWorker(
+        seed=1020,
+        seed_stride=32,
+        advance_seed=False,
+        data_path="/dataset",
+        max_steps=1,
+        env_factory=lambda: fake,
+    )
+
+    worker.reset()
+    assert fake.reset_seed == 1020
+    worker.reset()
+    assert fake.reset_seed == 1020
+
+
+def test_worker_reports_reward_components_at_episode_end() -> None:
+    fake = PenalizedSpreadsheetEnv()
+    worker = EnvharnessSpreadsheetWorker(
+        seed=0,
+        data_path="/dataset",
+        max_steps=2,
+        env_factory=lambda: fake,
+    )
+    worker.reset()
+
+    _, first_reward, first_done, _ = worker.step(
+        Action(name="run_python", kwargs={"code": "broken"})
+    )
+    _, final_reward, final_done, info = worker.step(
+        Action(name="run_python", kwargs={"code": "broken again"})
+    )
+
+    assert first_reward == -0.1
+    assert first_done is False
+    assert final_reward == 0.65
+    assert final_done is True
+    assert info["reward/workbook_score"] == 0.75
+    assert info["reward/execution_penalty"] == pytest.approx(-0.2)
+    assert info["reward/env_total"] == pytest.approx(0.55)
+
+
 def test_worker_seeds_keep_each_grpo_group_on_the_same_task() -> None:
     assert _worker_seeds(seed=20, env_num=3, group_n=2) == [20, 20, 21, 21, 22, 22]
 
@@ -257,3 +339,81 @@ def test_vector_env_accepts_an_existing_ray_connection() -> None:
     _require_initialized_ray(ray_module)
 
     assert ray_module.init_calls == 0
+
+
+class FakeActorId:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def hex(self) -> str:
+        return self.value
+
+
+class FakeActorHandle:
+    def __init__(self, actor_id: str) -> None:
+        self._actor_id = FakeActorId(actor_id)
+
+
+class FakeRayGetTimeoutError(Exception):
+    pass
+
+
+class TimingOutRay:
+    exceptions = SimpleNamespace(GetTimeoutError=FakeRayGetTimeoutError)
+
+    def get(self, refs, timeout=None):
+        assert timeout == 12.5
+        raise FakeRayGetTimeoutError("deadline exceeded")
+
+    def wait(self, refs, num_returns, timeout):
+        assert num_returns == len(refs)
+        assert timeout == 0
+        return refs[:1], refs[1:]
+
+
+def test_ray_get_timeout_reports_pending_actor_indexes_and_ids(capsys) -> None:
+    refs = [object(), object(), object()]
+    workers = [
+        FakeActorHandle("actor-0"),
+        FakeActorHandle("actor-1"),
+        FakeActorHandle("actor-2"),
+    ]
+
+    with pytest.raises(TimeoutError) as captured:
+        _ray_get_with_diagnostics(
+            TimingOutRay(), refs, workers,
+            operation="step", timeout_s=12.5,
+            task_ids=["task-0", "task-1", "task-2"],
+            actions=["submit", "run_python", "write_range"],
+        )
+
+    message = str(captured.value)
+    assert "operation=step" in message
+    assert "ready=1/3" in message
+    assert "1:actor-1" in message
+    assert "2:actor-2" in message
+    assert "task_id=task-1 action=run_python" in message
+    assert "task_id=task-2 action=write_range" in message
+    output = capsys.readouterr().out
+    assert "[spreadsheet-ray] START operation=step" in output
+    assert "[spreadsheet-ray] TIMEOUT operation=step" in output
+
+
+class SuccessfulRay:
+    exceptions = SimpleNamespace(GetTimeoutError=FakeRayGetTimeoutError)
+
+    def get(self, refs, timeout=None):
+        assert timeout == 30.0
+        return ["done"]
+
+
+def test_ray_get_logs_successful_operation_boundaries(capsys) -> None:
+    result = _ray_get_with_diagnostics(
+        SuccessfulRay(), [object()], [FakeActorHandle("actor-0")],
+        operation="reset", timeout_s=30.0,
+    )
+
+    assert result == ["done"]
+    output = capsys.readouterr().out
+    assert "[spreadsheet-ray] START operation=reset actors=1 timeout_s=30.0" in output
+    assert "[spreadsheet-ray] END operation=reset" in output

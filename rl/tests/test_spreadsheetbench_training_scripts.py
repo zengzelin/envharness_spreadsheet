@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import subprocess
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -16,6 +18,74 @@ def _load_prepare_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_training_pipeline_exports_native_tool_metrics() -> None:
+    rollout_source = (
+        ROOT / "third_party/verl-agent/agent_system/multi_turn_rollout/rollout_loop.py"
+    ).read_text()
+    trainer_source = (
+        ROOT / "third_party/verl-agent/verl/trainer/ppo/ray_trainer.py"
+    ).read_text()
+
+    for batch_key, metric_name in {
+        "env_read_tool_call": "env/read_tool_call_ratio",
+        "tool_list_sheets": "tool/list_sheets_ratio",
+        "tool_write_range": "tool/write_range_ratio",
+        "tool_submit": "tool/submit_ratio",
+    }.items():
+        assert batch_key in rollout_source
+        assert batch_key in trainer_source
+        assert metric_name in trainer_source
+
+    # Success/error rates are aggregated generically for both read and write
+    # tools, so their concrete batch keys are intentionally not duplicated.
+    assert "env_write_tool_success" in rollout_source
+    assert "outcome_key = f'env_{category}_tool_{outcome}'" in trainer_source
+    assert "metrics[f'env/{category}_tool_{outcome}_rate']" in trainer_source
+    assert "metric_dict[f'val/env/{category}_tool_{outcome}_rate']" in trainer_source
+
+    for batch_key, metric_name in {
+        "reward_workbook_score": "reward/workbook_score_mean",
+        "reward_execution_penalty": "reward/execution_penalty_mean",
+        "reward_env_total": "reward/env_total_mean",
+        "reward/invalid_action_penalty_mean": "reward/invalid_action_penalty_mean",
+    }.items():
+        assert batch_key in trainer_source
+        assert metric_name in trainer_source
+
+
+def test_training_pipeline_logs_spreadsheet_rollout_phase_boundaries() -> None:
+    rollout_source = (
+        ROOT / "third_party/verl-agent/agent_system/multi_turn_rollout/rollout_loop.py"
+    ).read_text()
+
+    for phase in ("env_reset", "generate_sequences", "env_step"):
+        assert f'"{phase}"' in rollout_source
+    assert "SPREADSHEETBENCH_PHASE_HEARTBEAT_SECONDS" in rollout_source
+    assert "rollout_call=self._rollout_invocation" in rollout_source
+
+
+def test_loader_scale_smoke_exercises_128_actor_reset_without_model() -> None:
+    source = (
+        ROOT / "rl/scripts/smoke_spreadsheetbench_loader_scale.py"
+    ).read_text()
+
+    assert 'SPREADSHEETBENCH_SCALE_ENV_NUM", "16"' in source
+    assert 'SPREADSHEETBENCH_SCALE_GROUP_N", "8"' in source
+    assert "EnvharnessSpreadsheetEnvs(" in source
+    assert "envs.reset()" in source
+    assert 'runtime_env={"env_vars": {"PYTHONPATH": worker_pythonpath}}' in source
+    assert 'repo_root / "rl"' in source
+    assert 'repo_root / "third_party/verl-agent"' in source
+    assert '"data_path": data_path' in source
+    # Cleanup errors must only replace the result when reset itself succeeded.
+    # If reset already failed, the script logs cleanup failure and preserves
+    # the original exception.
+    assert "if primary_error is None:" in source
+    assert "cleanup failed after primary error" in source
+    assert "group task mismatch" in source
+    assert "LOADER SCALE SMOKE OK" in source
 
 
 def test_placeholder_rows_are_offline_text_agent_examples() -> None:
@@ -75,10 +145,14 @@ def test_training_dry_run_targets_external_ray_and_spreadsheetbench(
     assert "trainer.logger=" in completed.stdout
     assert "trainer.rollout_data_dir=" in completed.stdout
     assert "rollouts/verl" in completed.stdout
+    assert "actor_timeout_s=600" in completed.stdout
+    assert "phase_heartbeat_s=60" in completed.stdout
     assert "dry run complete" in completed.stdout
 
 
-def test_training_dry_run_tracks_native_read_tool_set(tmp_path: Path) -> None:
+def test_training_dry_run_exposes_optimization_and_penalty_knobs(
+    tmp_path: Path,
+) -> None:
     dataset = tmp_path / "dataset"
     dataset.mkdir()
     (dataset / "dataset.json").write_text("[]\n")
@@ -87,7 +161,72 @@ def test_training_dry_run_tracks_native_read_tool_set(tmp_path: Path) -> None:
         "DRY_RUN": "1",
         "RAY_ADDRESS": "auto",
         "SPREADSHEETBENCH_DATA": str(dataset),
-        "SPREADSHEETBENCH_TOOL_SET": "native_read",
+        "RUN_ROOT": str(tmp_path / "runs"),
+        "PY": "/usr/bin/python",
+        "ACTOR_LR": "3e-7",
+        "USE_INVALID_ACTION_PENALTY": "False",
+        "INVALID_ACTION_PENALTY_COEF": "0.025",
+    })
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "rl/scripts/run_spreadsheetbench_grpo.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "actor_rollout_ref.actor.optim.lr=3e-7" in completed.stdout
+    assert "actor_rollout_ref.actor.use_invalid_action_penalty=False" in completed.stdout
+    assert "actor_rollout_ref.actor.invalid_action_penalty_coef=0.025" in completed.stdout
+    assert "actor_lr=3e-7" in completed.stdout
+    assert "invalid_action_penalty=False coef=0.025" in completed.stdout
+
+
+def test_training_rejects_epoch_budget_shorter_than_requested_steps(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "dataset.json").write_text("[]\n")
+    env = dict(os.environ)
+    env.update({
+        "DRY_RUN": "1",
+        "MODE": "diagnostic",
+        "RAY_ADDRESS": "auto",
+        "SPREADSHEETBENCH_DATA": str(dataset),
+        "RUN_ROOT": str(tmp_path / "runs"),
+        "PY": "/usr/bin/python",
+        "EPOCHS": "20",
+        "TOTAL_TRAINING_STEPS": "80",
+    })
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "rl/scripts/run_spreadsheetbench_grpo.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 2
+    assert "EPOCHS=20 cannot cover TOTAL_TRAINING_STEPS=80" in completed.stderr
+
+
+@pytest.mark.parametrize("tool_set", ["native_read", "native_basic"])
+def test_training_dry_run_tracks_native_tool_set(
+    tmp_path: Path, tool_set: str,
+) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "dataset.json").write_text("[]\n")
+    env = dict(os.environ)
+    env.update({
+        "DRY_RUN": "1",
+        "RAY_ADDRESS": "auto",
+        "SPREADSHEETBENCH_DATA": str(dataset),
+        "SPREADSHEETBENCH_TOOL_SET": tool_set,
         "RUN_ROOT": str(tmp_path / "runs"),
         "PY": "/usr/bin/python",
     })
@@ -101,7 +240,7 @@ def test_training_dry_run_tracks_native_read_tool_set(tmp_path: Path) -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert "tool_set=native_read" in completed.stdout
+    assert f"tool_set={tool_set}" in completed.stdout
 
 
 def test_training_dry_run_accepts_spreadsheet_rl_parquet_splits(
@@ -228,6 +367,7 @@ def test_submit_dry_run_uses_saved_ray_addresses(tmp_path: Path) -> None:
         "DRY_RUN": "1",
         "RAY_STATE_FILE": str(state_file),
         "SPREADSHEETBENCH_DATA": str(dataset),
+        "WANDB_BASE_URL": "https://wandb.example.test",
         "WANDB_API_KEY": "must-not-appear-in-output",
     })
 
@@ -244,14 +384,49 @@ def test_submit_dry_run_uses_saved_ray_addresses(tmp_path: Path) -> None:
     assert "submitting through http://10.0.0.1:8265" in completed.stdout
     assert "[spreadsheet-train-submit] job_log=" in completed.stdout
     assert '"RAY_ADDRESS": "auto"' in completed.stdout
-    assert '"WANDB_BASE_URL": "https://wandb.lubanml.woa.com"' in completed.stdout
+    assert '"WANDB_BASE_URL": "https://wandb.example.test"' in completed.stdout
     assert '"WANDB_API_KEY": "***"' in completed.stdout
     assert '"WANDB_DIR":' in completed.stdout
     assert '"TENSORBOARD_DIR":' in completed.stdout
     assert '"SPREADSHEETBENCH_TRAJECTORY_DIR":' in completed.stdout
     assert '"SPREADSHEETBENCH_TOOL_SET": "python"' in completed.stdout
+    assert '"SPREADSHEETBENCH_ACTOR_TIMEOUT_SECONDS": "600"' in completed.stdout
+    assert '"SPREADSHEETBENCH_PHASE_HEARTBEAT_SECONDS": "60"' in completed.stdout
     assert "must-not-appear-in-output" not in completed.stdout
     assert "dry run complete" in completed.stdout
+
+
+def test_submit_dry_run_does_not_inject_wandb_credentials(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "dataset.json").write_text("[]\n")
+    state_file = tmp_path / "ray_address.env"
+    state_file.write_text(
+        "export RAY_ADDRESS=10.0.0.1:6379\n"
+        "export RAY_DASHBOARD_ADDRESS=http://10.0.0.1:8265\n"
+        "export NNODES=1\n"
+        "export GPUS_PER_NODE=8\n"
+    )
+    env = dict(os.environ)
+    env.pop("WANDB_BASE_URL", None)
+    env.pop("WANDB_API_KEY", None)
+    env.update({
+        "DRY_RUN": "1",
+        "RAY_STATE_FILE": str(state_file),
+        "SPREADSHEETBENCH_DATA": str(dataset),
+    })
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "rl/scripts/submit_spreadsheetbench_grpo.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert '"WANDB_BASE_URL"' not in completed.stdout
+    assert '"WANDB_API_KEY"' not in completed.stdout
 
 
 def test_submit_dry_run_forwards_spreadsheet_rl_splits_to_ray(

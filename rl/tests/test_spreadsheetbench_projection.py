@@ -96,6 +96,41 @@ def test_projection_rejects_native_read_tools_in_python_tool_set(
     assert "native_read" in actions[0].kwargs["error"]
 
 
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("write_range", {"range": "A1:B1", "data": [1, 2]}),
+        ("clear_range", {"range": "A1:B2"}),
+    ],
+)
+def test_projection_accepts_native_basic_write_tools(
+    monkeypatch, name: str, arguments: dict,
+) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_basic")
+
+    actions, valids = envharness_spreadsheetbench_projection([
+        _tool_call(name, arguments)
+    ])
+
+    assert valids == [1]
+    assert actions[0].name == name
+    assert actions[0].kwargs == arguments
+
+
+def test_projection_rejects_native_write_tools_in_native_read_mode(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_read")
+
+    actions, valids = envharness_spreadsheetbench_projection([
+        _tool_call("clear_range", {"range": "A1"})
+    ])
+
+    assert valids == [0]
+    assert actions[0].name == "invalid"
+    assert "native_basic" in actions[0].kwargs["error"]
+
+
 def test_projection_parses_tool_call_after_final_think_close() -> None:
     code = "print('after thinking')"
     model_output = (

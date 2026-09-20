@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from envharness_rl.spreadsheetbench.manager import (
     SpreadsheetBenchEnvironmentManager,
 )
@@ -284,3 +286,67 @@ def test_manager_records_read_tool_diagnostics(monkeypatch) -> None:
     assert infos[0]["env/read_tool_call"] == 1
     assert infos[0]["env/read_tool_success"] == 1
     assert infos[0]["env/read_tool_error"] == 0
+    assert infos[0]["tool/inspect_range"] == 1
+    assert infos[0]["tool/list_sheets"] == 0
+
+
+def test_manager_records_per_tool_and_write_diagnostics(monkeypatch) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_basic")
+
+    class WriteToolVectorEnvs(FakeVectorEnvs):
+        def step(self, actions):
+            self.actions = actions
+            return ["write result"], None, [0.0], [False], [{
+                "task_id": "task-1",
+                "won": False,
+                "tool_name": "write_range",
+                "tool_category": "write",
+                "tool_ok": True,
+                "tool_error": "",
+            }]
+
+    config = SimpleNamespace(env=SimpleNamespace(history_length=2, max_steps=10))
+    manager = SpreadsheetBenchEnvironmentManager(
+        WriteToolVectorEnvs(), envharness_spreadsheetbench_projection, config
+    )
+    manager.reset(kwargs={})
+
+    observations, _, _, infos = manager.step([
+        '<tool_call>{"name":"write_range","arguments":'
+        '{"range":"A1","data":"done"}}</tool_call>'
+    ])
+
+    assert infos[0]["env/write_tool_call"] == 1
+    assert infos[0]["env/write_tool_success"] == 1
+    assert infos[0]["env/write_tool_error"] == 0
+    assert infos[0]["tool/write_range"] == 1
+    assert infos[0]["tool/run_python"] == 0
+    assert "episode_step: 1" in observations["text"][0]
+    assert "steps_remaining: 9" in observations["text"][0]
+
+
+def test_manager_exposes_terminal_reward_components() -> None:
+    config = SimpleNamespace(env=SimpleNamespace(history_length=2, max_steps=2))
+    manager = SpreadsheetBenchEnvironmentManager(
+        FakeVectorEnvs(), envharness_spreadsheetbench_projection, config
+    )
+    success = manager.success_evaluator(
+        total_batch_list=[[
+            {"active_masks": True},
+            {"active_masks": True},
+        ]],
+        total_infos=[[
+            {"won": False},
+            {
+                "won": True,
+                "reward/workbook_score": 0.75,
+                "reward/execution_penalty": -0.2,
+                "reward/env_total": 0.55,
+            },
+        ]],
+    )
+
+    assert success["success_rate"].tolist() == [1.0]
+    assert success["reward_workbook_score"].tolist() == [0.75]
+    assert success["reward_execution_penalty"].tolist() == pytest.approx([-0.2])
+    assert success["reward_env_total"].tolist() == pytest.approx([0.55])

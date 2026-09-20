@@ -17,9 +17,13 @@ from typing import Any
 
 
 NATIVE_READ_TOOLS = frozenset({"list_sheets", "inspect_range", "find_cells"})
+NATIVE_WRITE_TOOLS = frozenset({"write_range", "clear_range"})
 TOOL_SET_PYTHON = "python"
 TOOL_SET_NATIVE_READ = "native_read"
-VALID_TOOL_SETS = frozenset({TOOL_SET_PYTHON, TOOL_SET_NATIVE_READ})
+TOOL_SET_NATIVE_BASIC = "native_basic"
+VALID_TOOL_SETS = frozenset({
+    TOOL_SET_PYTHON, TOOL_SET_NATIVE_READ, TOOL_SET_NATIVE_BASIC
+})
 
 MAX_INSPECT_CELLS = 400
 MAX_SUMMARY_CELLS = 100_000

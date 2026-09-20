@@ -47,6 +47,7 @@ Action contract (multi-turn ReAct):
     With tool_set=native_read, three structured read-only tools are also
     available: list_sheets(), inspect_range(), and find_cells(). They always
     read the current output workbook and cannot access arbitrary paths.
+    tool_set=native_basic additionally enables write_range() and clear_range().
     If the agent never submits, the episode runs to max_steps and we grade
     whatever is at output_path (it is pre-seeded as a copy of the input).
 
@@ -80,7 +81,7 @@ Reset options (passed through `options` in reset()):
                                    (default -0.05).
     syntax_error_penalty: float -- reward for Syntax/Indentation/TabError
                                    (default -0.1).
-    tool_set: str        -- python (default) or native_read.
+    tool_set: str        -- python (default), native_read, or native_basic.
 """
 from __future__ import annotations
 
@@ -90,9 +91,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Iterator
 
 from envharness.core.actionable_env import ActionableEnv
 from envharness.core.registry import register_env
@@ -102,19 +105,24 @@ from envharness.core.types import (
     TaskSummary,
 )
 from . import online_judge_eval
+from .process_utils import run_process_group
 from .dataset import (
     DATA_PATH_ENV, SBTask, load_dataset, load_spreadsheet_rl_dataset, select_task,
 )
 from .read_tools import (
     NATIVE_READ_TOOLS,
+    NATIVE_WRITE_TOOLS,
     ReadToolError,
+    TOOL_SET_NATIVE_BASIC,
     TOOL_SET_NATIVE_READ,
     error_payload,
     execute_read_tool,
     normalize_tool_set,
 )
+from .write_tools import execute_write_tool
 from .tools import (
-    FindCells, InspectRange, ListSheets, RunPython, Submit, ValidateWorkbook,
+    ClearRange, FindCells, InspectRange, ListSheets, RunPython, Submit,
+    ValidateWorkbook, WriteRange,
 )
 
 
@@ -163,7 +171,8 @@ class SpreadsheetBenchEnv(ActionableEnv):
     multi-turn run_python ReAct; LibreOffice Online-Judge grading."""
 
     tool_registry: ClassVar[list[type[Tool]]] = [
-        RunPython, ListSheets, InspectRange, FindCells, ValidateWorkbook, Submit
+        RunPython, ListSheets, InspectRange, FindCells, WriteRange, ClearRange,
+        ValidateWorkbook, Submit
     ]
 
     @classmethod
@@ -172,8 +181,10 @@ class SpreadsheetBenchEnv(ActionableEnv):
             os.environ.get("SPREADSHEETBENCH_TOOL_SET", "python")
         )
         selected = [RunPython, ValidateWorkbook, Submit]
-        if tool_set == TOOL_SET_NATIVE_READ:
+        if tool_set in {TOOL_SET_NATIVE_READ, TOOL_SET_NATIVE_BASIC}:
             selected[1:1] = [ListSheets, InspectRange, FindCells]
+        if tool_set == TOOL_SET_NATIVE_BASIC:
+            selected[4:4] = [WriteRange, ClearRange]
         return [tool.get_info() for tool in selected]
 
     def __init__(self) -> None:
@@ -200,6 +211,25 @@ class SpreadsheetBenchEnv(ActionableEnv):
         # Retained for save/load round-trips.
         self._last_reset_seed: int | None = None
         self._last_reset_options: dict[str, Any] = {}
+
+    @contextmanager
+    def _stage(self, name: str, *, action: str = "") -> Iterator[None]:
+        prefix = (
+            f"[spreadsheet-bridge] task_id={self.state.task_id} "
+            f"step={self.state.step_count} action={action or '-'} stage={name}"
+        )
+        started = time.monotonic()
+        print(f"{prefix} START", flush=True)
+        try:
+            yield
+        except BaseException as exc:
+            print(
+                f"{prefix} ERROR elapsed_s={time.monotonic() - started:.1f} "
+                f"error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            raise
+        print(f"{prefix} END elapsed_s={time.monotonic() - started:.1f}", flush=True)
 
     # -- core env interface -------------------------------------------------
 
@@ -240,27 +270,43 @@ class SpreadsheetBenchEnv(ActionableEnv):
         # project label, NOT an instance -- see data.select_task.
         instance_id = opts.get("instance_id") or None
         split_file = opts.get("split_file") or None
-        task, _idx = select_task(self._data_path, seed, instance_id,
-                                 multi=bool(opts.get("multi_test_case")),
-                                 split_file=split_file)
-        self._task = task
-
-        if not task.init_path or not os.path.isfile(task.init_path):
-            raise RuntimeError(
-                f"SpreadsheetBench task {task.id!r}: input spreadsheet not "
-                f"found (init_path={task.init_path!r})."
+        self.state = SpreadsheetBenchEnvState()
+        with self._stage("select_task", action="reset"):
+            task, _idx = select_task(
+                self._data_path,
+                seed,
+                instance_id,
+                multi=bool(opts.get("multi_test_case")),
+                split_file=split_file,
             )
+        self._task = task
+        self.state = SpreadsheetBenchEnvState(task_id=task.id)
 
-        # Fresh sandbox working dir; copy the input in, pre-seed the output as a
-        # copy so a no-op agent still leaves a gradeable file at output_path.
-        self._teardown_workdir()
-        safe_task_id = _safe_file_stem(task.id)
-        self._workdir = tempfile.mkdtemp(prefix=f"sb_{safe_task_id}_",
-                                         dir=self._sandbox_root)
-        input_path = os.path.join(self._workdir, f"{safe_task_id}_input.xlsx")
-        output_path = os.path.join(self._workdir, f"{safe_task_id}_output.xlsx")
-        shutil.copyfile(task.init_path, input_path)
-        shutil.copyfile(task.init_path, output_path)
+        with self._stage("prepare_sandbox", action="reset"):
+            if not task.init_path or not os.path.isfile(task.init_path):
+                raise RuntimeError(
+                    f"SpreadsheetBench task {task.id!r}: input spreadsheet not "
+                    f"found (init_path={task.init_path!r})."
+                )
+
+            # Fresh sandbox working dir; copy the input in, pre-seed the output
+            # so a no-op agent still leaves a gradeable workbook.
+            self._teardown_workdir()
+            safe_task_id = _safe_file_stem(task.id)
+            self._workdir = tempfile.mkdtemp(
+                prefix=f"sb_{safe_task_id}_", dir=self._sandbox_root
+            )
+            input_path = os.path.join(
+                self._workdir, f"{safe_task_id}_input.xlsx"
+            )
+            output_path = os.path.join(
+                self._workdir, f"{safe_task_id}_output.xlsx"
+            )
+            shutil.copyfile(task.init_path, input_path)
+            shutil.copyfile(task.init_path, output_path)
+
+        with self._stage("build_preview", action="reset"):
+            spreadsheet_preview = self._build_preview(input_path)
 
         self._terminated = False
         self._eval_cache = None
@@ -272,7 +318,7 @@ class SpreadsheetBenchEnv(ActionableEnv):
             answer_sheet=task.answer_sheet,
             input_path=input_path,
             output_path=output_path,
-            spreadsheet_preview=self._build_preview(input_path),
+            spreadsheet_preview=spreadsheet_preview,
             step_count=0,
         )
         return EnvResetResponse(
@@ -308,7 +354,8 @@ class SpreadsheetBenchEnv(ActionableEnv):
             )
 
         if action.name == ValidateWorkbook.name:
-            validation_output, validation_ok = self._validate_output()
+            with self._stage("validate_workbook", action=action.name):
+                validation_output, validation_ok = self._validate_output()
             return EnvResponse(
                 observation=self._observe(run_output=validation_output),
                 reward=0.0, terminated=False, truncated=False,
@@ -318,14 +365,24 @@ class SpreadsheetBenchEnv(ActionableEnv):
                 },
             )
 
-        if action.name in NATIVE_READ_TOOLS:
-            if self._tool_set != TOOL_SET_NATIVE_READ:
+        if action.name in NATIVE_READ_TOOLS | NATIVE_WRITE_TOOLS:
+            category = "read" if action.name in NATIVE_READ_TOOLS else "write"
+            enabled = (
+                self._tool_set in {TOOL_SET_NATIVE_READ, TOOL_SET_NATIVE_BASIC}
+                if category == "read"
+                else self._tool_set == TOOL_SET_NATIVE_BASIC
+            )
+            if not enabled:
+                required_set = (
+                    TOOL_SET_NATIVE_READ if category == "read"
+                    else TOOL_SET_NATIVE_BASIC
+                )
                 return EnvResponse(
                     observation=Observation(
                         text=(
                             f"[tool disabled: {action.name}] Set "
-                            "SPREADSHEETBENCH_TOOL_SET=native_read to enable "
-                            "structured read tools."
+                            f"SPREADSHEETBENCH_TOOL_SET={required_set} to "
+                            f"enable structured {category} tools."
                         ),
                         data={"error": "tool_disabled", "tool": action.name},
                     ),
@@ -335,9 +392,12 @@ class SpreadsheetBenchEnv(ActionableEnv):
                     info={"error": "tool_disabled", "won": None},
                 )
             try:
-                payload, tool_output = execute_read_tool(
-                    action.name, self.state.output_path, dict(action.kwargs)
+                executor = (
+                    execute_read_tool if category == "read" else execute_write_tool
                 )
+                with self._stage(f"native_{category}", action=action.name):
+                    payload, tool_output = executor(
+                        action.name, self.state.output_path, dict(action.kwargs))
                 tool_ok = True
                 tool_error = ""
             except ReadToolError as exc:
@@ -359,6 +419,7 @@ class SpreadsheetBenchEnv(ActionableEnv):
                 truncated=False,
                 info={
                     "tool_name": action.name,
+                    "tool_category": category,
                     "tool_ok": tool_ok,
                     "tool_error": tool_error,
                     "tool_result": payload,
@@ -392,7 +453,8 @@ class SpreadsheetBenchEnv(ActionableEnv):
             )
 
         self.state.step_count += 1
-        stdout, returncode, error_type = self._run_python(code)
+        with self._stage("run_python", action=action.name):
+            stdout, returncode, error_type = self._run_python(code)
         self.state.last_code = code
         self.state.last_output = stdout
         self.state.last_returncode = returncode
@@ -578,7 +640,7 @@ exec(compile(source, agent_script, "exec"), namespace)
         try:
             with os.fdopen(fd, "w") as f:
                 f.write(code)
-            proc = subprocess.run(
+            proc = run_process_group(
                 [
                     self._python_exe,
                     "-c",
@@ -657,8 +719,10 @@ exec(compile(source, agent_script, "exec"), namespace)
                     continue
                 sheet = workbook[sheet_name]
                 try:
-                    cells = online_judge_eval._generate_cell_names(
-                        cell_range, max_row=max(sheet.max_row, 1)
+                    (min_col, min_row), (max_col, max_row) = (
+                        online_judge_eval._parse_cell_range(
+                            cell_range, max_row=max(sheet.max_row, 1)
+                        )
                     )
                 except (TypeError, ValueError) as exc:
                     errors.append(
@@ -667,14 +731,24 @@ exec(compile(source, agent_script, "exec"), namespace)
                     continue
                 nonempty = 0
                 formulas = 0
-                for cell_name in cells:
-                    value = sheet[cell_name].value
-                    nonempty += int(value is not None and value != "")
-                    formulas += int(
-                        isinstance(value, str) and value.startswith("=")
-                    )
+                cell_count = (max_col - min_col + 1) * (max_row - min_row + 1)
+                # ReadOnlyWorksheet random access scans from the start of the
+                # XML stream for every cell. Iterate once so large answer
+                # ranges remain linear in the number of cells.
+                for row in sheet.iter_rows(
+                    min_row=min_row,
+                    max_row=max_row,
+                    min_col=min_col,
+                    max_col=max_col,
+                ):
+                    for cell in row:
+                        value = cell.value
+                        nonempty += int(value is not None and value != "")
+                        formulas += int(
+                            isinstance(value, str) and value.startswith("=")
+                        )
                 details.append(
-                    f"{sheet_name}!{cell_range}: cells={len(cells)}, "
+                    f"{sheet_name}!{cell_range}: cells={cell_count}, "
                     f"nonempty={nonempty}, formulas={formulas}"
                 )
         finally:
@@ -704,7 +778,10 @@ exec(compile(source, agent_script, "exec"), namespace)
         # it surfaces as rec["error"] (a visible eval_error, excluded from SR by
         # reasoning_bank_eval's summary + re-run by the dispatcher sweep; note reasoning_bank_eval.py's
         # own _run_condition does NOT resume) instead of a silent policy fail.
-        if not online_judge_eval.recalc_with_libreoffice(output_path, self._soffice_path):
+        with self._stage("agent_output_recalc", action="grade"):
+            recalc_ok = online_judge_eval.recalc_with_libreoffice(
+                output_path, self._soffice_path)
+        if not recalc_ok:
             raise RuntimeError(
                 "eval_error: LibreOffice recalc of agent output failed "
                 "(transient); not a policy failure")
@@ -712,9 +789,10 @@ exec(compile(source, agent_script, "exec"), namespace)
         golden = task.golden_path
         if self._recalc_golden:
             golden = self._cached_golden(task)
-        passed, msg = online_judge_eval.compare_workbooks(
-            golden, output_path, task.instruction_type, task.answer_position,
-        )
+        with self._stage("compare_workbooks", action="grade"):
+            passed, msg = online_judge_eval.compare_workbooks(
+                golden, output_path, task.instruction_type, task.answer_position,
+            )
         return EvaluationResult(
             success=bool(passed),
             score=1.0 if passed else 0.0,
@@ -741,7 +819,10 @@ exec(compile(source, agent_script, "exec"), namespace)
                 # run (formula cells read None). Refuse to cache on failure and
                 # raise so the episode surfaces as a visible eval_error (excluded
                 # from SR; re-run only under the dispatcher sweep, not reasoning_bank_eval.py).
-                if not online_judge_eval.recalc_with_libreoffice(tmp, self._soffice_path):
+                with self._stage("golden_recalc", action="grade"):
+                    recalc_ok = online_judge_eval.recalc_with_libreoffice(
+                        tmp, self._soffice_path)
+                if not recalc_ok:
                     raise RuntimeError(
                         "eval_error: LibreOffice recalc of golden failed "
                         "(transient); refusing to cache a bad golden")
@@ -784,11 +865,15 @@ exec(compile(source, agent_script, "exec"), namespace)
 
     def _valid_tool_summary(self) -> str:
         tools = ["run_python(code)", "validate_workbook()", "submit()"]
-        if self._tool_set == TOOL_SET_NATIVE_READ:
+        if self._tool_set in {TOOL_SET_NATIVE_READ, TOOL_SET_NATIVE_BASIC}:
             tools[1:1] = [
                 "list_sheets()",
                 "inspect_range(range, ...)",
                 "find_cells(query, ...)",
+            ]
+        if self._tool_set == TOOL_SET_NATIVE_BASIC:
+            tools[4:4] = [
+                "write_range(range, data, ...)", "clear_range(range, ...)"
             ]
         return ", ".join(tools)
 

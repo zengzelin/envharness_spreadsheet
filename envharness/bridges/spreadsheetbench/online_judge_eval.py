@@ -57,6 +57,8 @@ import tempfile
 
 import openpyxl
 
+from .process_utils import run_process_group
+
 
 # ---------------------------------------------------------------------------
 # Formula recalculation (LibreOffice headless)
@@ -98,7 +100,7 @@ def recalc_with_libreoffice(path: str, soffice_path: str | None = None,
         # (the classic headless-concurrency trap). Isolate by pid.
         profile = "file:///tmp/lo_profile_%d" % os.getpid()
         try:
-            r = subprocess.run(
+            r = run_process_group(
                 [soffice, "-env:UserInstallation=" + profile,
                  "--headless", "--calc",
                  "--convert-to", "xlsx:Calc MS Excel 2007 XML",
@@ -206,7 +208,13 @@ def _split_cell_ref(cell_ref: str) -> tuple[str, str]:
 
 
 def _parse_cell_range(range_str: str, max_row: int | None = None):
-    start_cell, end_cell = range_str.split(":")
+    parts = range_str.split(":")
+    if len(parts) == 1:
+        start_cell = end_cell = parts[0]
+    elif len(parts) == 2:
+        start_cell, end_cell = parts
+    else:
+        raise ValueError(f"invalid cell range: {range_str!r}")
     sc, sr = _split_cell_ref(start_cell)
     ec, er = _split_cell_ref(end_cell)
     if sc and sr and not ec and er:

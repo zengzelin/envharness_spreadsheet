@@ -1,6 +1,6 @@
 # SpreadsheetBench Rollout 错误样例报告
 
-更新日期：2026-09-10
+更新日期：2026-09-14
 
 分析实验：
 
@@ -10,6 +10,7 @@
 - `grpo_spreadsheetbench_diagnostic_20260906_111741`
 - `grpo_spreadsheetbench_diagnostic_20260906_114633`
 - `grpo_spreadsheetbench_diagnostic_20260909_144747`
+- `grpo_spreadsheetbench_diagnostic_20260912_194504`
 
 数据来源：
 
@@ -400,6 +401,21 @@ error 分开统计。
 6. 后续基础模型固定使用 `Qwen3-4B-Thinking-2507`，不再考虑 Qwen3.5-4B，避免同时
    改变模型和训练环境。
 
+### `20260912_194504` 补充结论
+
+该实验加入 `native_basic`、两节点 16 GPU、`MAX_STEPS=15`、阶段 heartbeat 和 actor
+超时诊断。此前 `validate_workbook` 在任务 `455-35` 的大范围校验中超过 600 秒；修复为
+顺序扫描后，截至 step 34 未再次发生 evaluator 或 Ray actor timeout。
+
+工程稳定性改善不等于训练效果收敛：初始 validation success rate 为 `0.281`，step 10
+为 `0.344`，step 30 又回到 `0.281`。训练 success rate 在 step 33 为 `0.453`，step 34
+降至 `0.078`；后者同时出现 `actor/kl_loss=7.532`、response clip ratio `0.111`。因此
+下一步应比较 base 与 checkpoint 的全量独立评测，而不是根据单步训练 reward 选择模型。
+
+当前训练使用 Verified-400，训练内 validation 也来自同一数据集合。即使 Spreadsheet-RL
+提供 `test_verified_hermes.parquet`，也必须先做 ID/hash 重叠审计，不能直接把它当作该
+checkpoint 的严格 held-out。独立评测设计见 `md/independent_evaluation_plan.md`。
+
 ## 下一步实验
 
 ### 1. 建立严格 held-out baseline
@@ -463,3 +479,25 @@ parser 或盲目延长训练。
 
 若 Python 错误明显下降但 success rate 没有提高，下一阶段应集中分析“执行成功但
 工作簿错误”的任务语义 badcase，而不是继续修改 parser 或 response 长度。
+
+## 2026-09-19 全量验证集补充结论
+
+Base model 与 Spreadsheet-RL `global_step_5` 已在完全相同的 399 条
+`test_verified_hermes.parquet` 任务上完成确定性评测：Base 成功 `122/399`，step 5 成功
+`113/399`。两者共同成功 92 条，仅 Base 成功 30 条，仅 step 5 成功 21 条。此前 32 条
+验证集上 step 5 的小幅领先没有在全量验证集复现。
+
+step 5 将 native parser 有效率从 `0.746` 提高到 `0.944`，Python 错误率从 `0.196`
+降低到 `0.114`，但写工具成功率从 `0.582` 降到 `0.460`，撞到 episode 上限的任务从
+347 条增加到 362 条。这说明当前主要 badcase 已从“动作无法解析或 Python 无法执行”
+转移为以下类型：
+
+1. 工具调用合法，但写入范围 shape 不匹配；
+2. 使用 `write_range` 写公式时被 static-value 限制拒绝；
+3. 多轮检查和修改后仍未调用 `submit`；
+4. Python 返回码为 0，但修改了错误 sheet/range 或 workbook 内容不完整；
+5. 工具调用变多、episode 变长，最终撞到 `MAX_STEPS`。
+
+后续 checkpoint 选择以固定验证集的 workbook success rate 为主，不再用包含执行惩罚的
+`val/text/test_score` 代替任务准确率。代码稳定化方案和 TODO 见
+`md/grpo_stabilization_plan.md`。

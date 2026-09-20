@@ -158,13 +158,15 @@ VAL_TEMPERATURE="${VAL_TEMPERATURE:-0.0}"
 VAL_DO_SAMPLE="${VAL_DO_SAMPLE:-False}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.001}"
 ENTROPY_COEFF="${ENTROPY_COEFF:-0}"
+ACTOR_LR="${ACTOR_LR:-1e-6}"
+USE_INVALID_ACTION_PENALTY="${USE_INVALID_ACTION_PENALTY:-True}"
+INVALID_ACTION_PENALTY_COEF="${INVALID_ACTION_PENALTY_COEF:-0.1}"
 RUN_ROOT="${RUN_ROOT:-${ROOT}/runs}"
 VERL_DATA_DIR="${VERL_DATA_DIR:-${RUN_ROOT}/data/spreadsheetbench_agent/text}"
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
 RUN_DIR="${RUN_DIR:-${RUN_ROOT}/grpo_spreadsheetbench_${MODE}_${RUN_TS}}"
 EXP_NAME="${EXP_NAME:-grpo_spreadsheetbench_${MODE}_${RUN_TS}}"
 WANDB_PROJECT="${WANDB_PROJECT:-envharness_rl_spreadsheetbench}"
-WANDB_BASE_URL="${WANDB_BASE_URL:-https://wandb.lubanml.woa.com}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_NAME="${WANDB_NAME:-${EXP_NAME}}"
 LOG_DIR="${LOG_DIR:-${RUN_DIR}}"
@@ -182,11 +184,13 @@ SPREADSHEETBENCH_HISTORY_OBS_CHARS="${SPREADSHEETBENCH_HISTORY_OBS_CHARS:-2000}"
 SPREADSHEETBENCH_PYTHON_ERROR_PENALTY="${SPREADSHEETBENCH_PYTHON_ERROR_PENALTY:--0.05}"
 SPREADSHEETBENCH_SYNTAX_ERROR_PENALTY="${SPREADSHEETBENCH_SYNTAX_ERROR_PENALTY:--0.1}"
 SPREADSHEETBENCH_TOOL_SET="${SPREADSHEETBENCH_TOOL_SET:-python}"
+SPREADSHEETBENCH_ACTOR_TIMEOUT_SECONDS="${SPREADSHEETBENCH_ACTOR_TIMEOUT_SECONDS:-600}"
+SPREADSHEETBENCH_PHASE_HEARTBEAT_SECONDS="${SPREADSHEETBENCH_PHASE_HEARTBEAT_SECONDS:-60}"
 SPREADSHEETBENCH_TOOL_SET="${SPREADSHEETBENCH_TOOL_SET//-/_}"
 case "${SPREADSHEETBENCH_TOOL_SET}" in
-  python|native_read) ;;
+  python|native_read|native_basic) ;;
   *)
-    echo "SPREADSHEETBENCH_TOOL_SET must be python or native_read, got ${SPREADSHEETBENCH_TOOL_SET}" >&2
+    echo "SPREADSHEETBENCH_TOOL_SET must be python, native_read, or native_basic, got ${SPREADSHEETBENCH_TOOL_SET}" >&2
     exit 2
     ;;
 esac
@@ -205,6 +209,26 @@ if [[ -n "${TOTAL_TRAINING_STEPS}" && ! "${TOTAL_TRAINING_STEPS}" =~ ^[1-9][0-9]
   echo "TOTAL_TRAINING_STEPS must be a positive integer, got ${TOTAL_TRAINING_STEPS}" >&2
   exit 2
 fi
+if [[ -n "${TOTAL_TRAINING_STEPS}" ]] && (( EPOCHS < TOTAL_TRAINING_STEPS )); then
+  echo "EPOCHS=${EPOCHS} cannot cover TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS}; this pipeline creates one train batch per epoch" >&2
+  exit 2
+fi
+case "${USE_INVALID_ACTION_PENALTY,,}" in
+  true|false) ;;
+  *)
+    echo "USE_INVALID_ACTION_PENALTY must be True or False, got ${USE_INVALID_ACTION_PENALTY}" >&2
+    exit 2
+    ;;
+esac
+for timeout_name in \
+  SPREADSHEETBENCH_ACTOR_TIMEOUT_SECONDS \
+  SPREADSHEETBENCH_PHASE_HEARTBEAT_SECONDS; do
+  timeout_value="${!timeout_name}"
+  if [[ ! "${timeout_value}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${timeout_name} must be a positive integer, got ${timeout_value}" >&2
+    exit 2
+  fi
+done
 TOTAL_GPUS=$((NNODES * N_GPUS_PER_NODE))
 if (( TRAIN_BS % TOTAL_GPUS != 0 )); then
   echo "TRAIN_BS must be divisible by total GPUs: ${TRAIN_BS} % ${TOTAL_GPUS} != 0" >&2
@@ -240,6 +264,8 @@ export SPREADSHEETBENCH_HISTORY_OBS_CHARS
 export SPREADSHEETBENCH_PYTHON_ERROR_PENALTY
 export SPREADSHEETBENCH_SYNTAX_ERROR_PENALTY
 export SPREADSHEETBENCH_TOOL_SET
+export SPREADSHEETBENCH_ACTOR_TIMEOUT_SECONDS
+export SPREADSHEETBENCH_PHASE_HEARTBEAT_SECONDS
 export ENVHARNESS_ROOT="${ROOT}"
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
 export VLLM_USE_V1="${VLLM_USE_V1:-1}"
@@ -247,11 +273,12 @@ export ENVHARNESS_DISABLE_THINKING
 export PYTHONPATH="${ROOT}:${RL_ROOT}:${VERL_AGENT}${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
-export WANDB_BASE_URL WANDB_MODE WANDB_DIR WANDB_NAME TENSORBOARD_DIR
+export WANDB_MODE WANDB_DIR WANDB_NAME TENSORBOARD_DIR
 export MODE MODEL NNODES N_GPUS_PER_NODE TP TRAIN_BS VAL_BS GROUP_N
 export PPO_MINI_BS EPOCHS MAX_STEPS HISTORY_LENGTH MAX_PROMPT_LENGTH
 export MAX_RESPONSE_LENGTH APPLY_CHAT_TEMPLATE_ENABLE_THINKING ROLLOUT_DATA_DIR TRAINER_LOGGER WANDB_PROJECT
 export RUN_DIR RUN_TS EXP_NAME TOTAL_TRAINING_STEPS
+export ACTOR_LR USE_INVALID_ACTION_PENALTY INVALID_ACTION_PENALTY_COEF
 
 if [[ "${DRY_RUN:-0}" != "1" ]]; then
   if [[ "${MODEL}" == /* && ! -f "${MODEL}/config.json" ]]; then
@@ -288,7 +315,7 @@ CMD=(
   data.truncation=left
   data.return_raw_chat=True
   "actor_rollout_ref.model.path=${MODEL}"
-  actor_rollout_ref.actor.optim.lr=1e-6
+  "actor_rollout_ref.actor.optim.lr=${ACTOR_LR}"
   actor_rollout_ref.model.use_remove_padding=True
   "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BS}"
   "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${PPO_MICRO_BS_PER_GPU}"
@@ -313,8 +340,8 @@ CMD=(
   "actor_rollout_ref.rollout.val_kwargs.do_sample=${VAL_DO_SAMPLE}"
   "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BS_PER_GPU}"
   actor_rollout_ref.ref.fsdp_config.param_offload=True
-  actor_rollout_ref.actor.use_invalid_action_penalty=True
-  actor_rollout_ref.actor.invalid_action_penalty_coef=0.1
+  "actor_rollout_ref.actor.use_invalid_action_penalty=${USE_INVALID_ACTION_PENALTY}"
+  "actor_rollout_ref.actor.invalid_action_penalty_coef=${INVALID_ACTION_PENALTY_COEF}"
   algorithm.use_kl_in_reward=False
   env.env_name=envharness_rl/spreadsheetbench
   env.seed=0
@@ -379,6 +406,8 @@ keys = [
     "MODE", "MODEL", "NNODES", "N_GPUS_PER_NODE", "TP", "TRAIN_BS",
     "VAL_BS", "GROUP_N", "PPO_MINI_BS", "EPOCHS", "TOTAL_TRAINING_STEPS",
     "MAX_STEPS", "TEST_FREQ", "SAVE_FREQ", "VAL_BEFORE",
+    "ACTOR_LR", "KL_LOSS_COEF", "ENTROPY_COEFF",
+    "USE_INVALID_ACTION_PENALTY", "INVALID_ACTION_PENALTY_COEF",
     "HISTORY_LENGTH", "MAX_PROMPT_LENGTH", "MAX_RESPONSE_LENGTH",
     "SPREADSHEETBENCH_DATA", "SPREADSHEETBENCH_DATA_FORMAT",
     "SPREADSHEET_RL_DATA_ROOT", "SPREADSHEET_RL_TRAIN_FILE",
@@ -388,6 +417,8 @@ keys = [
     "SPREADSHEETBENCH_PYTHON_ERROR_PENALTY",
     "SPREADSHEETBENCH_SYNTAX_ERROR_PENALTY",
     "SPREADSHEETBENCH_TOOL_SET",
+    "SPREADSHEETBENCH_ACTOR_TIMEOUT_SECONDS",
+    "SPREADSHEETBENCH_PHASE_HEARTBEAT_SECONDS",
     "WANDB_BASE_URL", "WANDB_MODE", "WANDB_DIR", "WANDB_NAME",
     "TENSORBOARD_DIR", "ROLLOUT_DATA_DIR", "TRAINER_LOGGER", "RUN_DIR",
     "RUN_TS", "EXP_NAME", "WANDB_PROJECT", "RAY_ADDRESS",
@@ -416,6 +447,8 @@ fi
   echo "[spreadsheet-train] ray=${RAY_ADDRESS} nodes=${NNODES} gpus_per_node=${N_GPUS_PER_NODE} tp=${TP}"
   echo "[spreadsheet-train] train_bs=${TRAIN_BS} group_n=${GROUP_N} epochs=${EPOCHS} total_training_steps=${TOTAL_TRAINING_STEPS:-auto} max_steps=${MAX_STEPS}"
   echo "[spreadsheet-train] eval_freq=${TEST_FREQ} save_freq=${SAVE_FREQ} val_before_train=${VAL_BEFORE}"
+  echo "[spreadsheet-train] actor_lr=${ACTOR_LR} kl_loss_coef=${KL_LOSS_COEF} entropy_coeff=${ENTROPY_COEFF}"
+  echo "[spreadsheet-train] invalid_action_penalty=${USE_INVALID_ACTION_PENALTY} coef=${INVALID_ACTION_PENALTY_COEF}"
   echo "[spreadsheet-train] data_format=${SPREADSHEETBENCH_DATA_FORMAT} data=${SPREADSHEETBENCH_DATA}"
   if [[ "${SPREADSHEETBENCH_DATA_FORMAT}" == "spreadsheet_rl" || "${SPREADSHEETBENCH_DATA_FORMAT}" == "spreadsheet-rl" || "${SPREADSHEETBENCH_DATA_FORMAT}" == "spreadsheetrl" ]]; then
     echo "[spreadsheet-train] train_split=${SPREADSHEET_RL_TRAIN_FILE} val_split=${SPREADSHEET_RL_VAL_FILE}"
@@ -425,6 +458,7 @@ fi
   echo "[spreadsheet-train] history_mode=${SPREADSHEETBENCH_HISTORY_MODE} history_action_chars=${SPREADSHEETBENCH_HISTORY_ACTION_CHARS} history_obs_chars=${SPREADSHEETBENCH_HISTORY_OBS_CHARS}"
   echo "[spreadsheet-train] python_error_penalty=${SPREADSHEETBENCH_PYTHON_ERROR_PENALTY} syntax_error_penalty=${SPREADSHEETBENCH_SYNTAX_ERROR_PENALTY}"
   echo "[spreadsheet-train] tool_set=${SPREADSHEETBENCH_TOOL_SET}"
+  echo "[spreadsheet-train] actor_timeout_s=${SPREADSHEETBENCH_ACTOR_TIMEOUT_SECONDS} phase_heartbeat_s=${SPREADSHEETBENCH_PHASE_HEARTBEAT_SECONDS}"
   echo "[spreadsheet-train] rollouts=${ROLLOUT_DATA_DIR} trajectories=${SPREADSHEETBENCH_TRAJECTORY_DIR}"
   printf '[spreadsheet-train] command='
   printf '%q ' "${CMD[@]}"

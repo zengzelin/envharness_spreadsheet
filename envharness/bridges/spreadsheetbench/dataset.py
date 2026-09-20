@@ -52,10 +52,11 @@ import glob
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Mapping
 
 # Env var the Bridge falls back to when reset_options omits `data_path`.
 DATA_PATH_ENV = "SPREADSHEETBENCH_DATA"
@@ -163,6 +164,218 @@ def _resolve_split_path(data_path: str, split_file: str) -> str:
 
 
 @lru_cache(maxsize=8)
+def _load_spreadsheet_rl_rows(
+    data_path: str, split_file: str
+) -> tuple[dict[str, Any], ...]:
+    """Read one Spreadsheet-RL parquet split without touching task folders."""
+    data_path = os.path.abspath(os.path.expanduser(data_path))
+    parquet_path = _resolve_split_path(data_path, split_file)
+    if not os.path.isfile(parquet_path):
+        raise FileNotFoundError(
+            f"Spreadsheet-RL split file not found at {parquet_path!r}."
+        )
+    started = time.monotonic()
+    rows = tuple(_read_spreadsheet_rl_parquet_rows(parquet_path))
+    if not rows:
+        raise RuntimeError(
+            f"Spreadsheet-RL split {parquet_path!r} contains no tasks."
+        )
+    print(
+        f"[spreadsheet-dataset] split={parquet_path} rows={len(rows)} "
+        f"load_elapsed_s={time.monotonic() - started:.1f}",
+        flush=True,
+    )
+    return rows
+
+
+def _spreadsheet_rl_task_from_row(
+    data_path: str,
+    row: Mapping[str, Any],
+    row_index: int,
+) -> SBTask:
+    """Materialize one parquet row into an SBTask and touch only its folder."""
+    reward_model = _coerce_mapping(row.get("reward_model"))
+    extra_info = _coerce_mapping(row.get("extra_info"))
+    try:
+        thread_dir = _normalize_thread_dir(reward_model.get("ground_truth"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid Spreadsheet-RL row index={row_index}: {exc}"
+        ) from exc
+
+    folder = os.path.join(data_path, thread_dir)
+    instruction_path = os.path.join(folder, "instruction.json")
+    metadata: dict[str, Any] = {}
+    if os.path.isfile(instruction_path):
+        try:
+            with open(instruction_path, encoding="utf-8") as handle:
+                loaded = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "Failed to read Spreadsheet-RL instruction metadata: "
+                f"row_index={row_index} path={instruction_path!r}: {exc}"
+            ) from exc
+        if not isinstance(loaded, dict):
+            raise ValueError(
+                "Spreadsheet-RL instruction metadata must be an object: "
+                f"row_index={row_index} path={instruction_path!r}"
+            )
+        metadata = loaded
+
+    task_id = (
+        extra_info.get("id")
+        or metadata.get("id")
+        or PurePosixPath(thread_dir).name
+        or f"row-{row_index}"
+    )
+    init_path = os.path.join(folder, "output.xlsx")
+    golden_path = os.path.join(folder, "target.xlsx")
+    missing = (
+        not os.path.isdir(folder)
+        or not os.path.isfile(instruction_path)
+        or not os.path.isfile(init_path)
+        or not os.path.isfile(golden_path)
+    )
+    return SBTask(
+        id=str(task_id),
+        instruction=str(metadata.get("instruction", "")),
+        instruction_type=str(
+            metadata.get("instruction_type")
+            or metadata.get("type")
+            or extra_info.get("type")
+            or ""
+        ),
+        answer_position=_norm_pos(
+            metadata.get("answer_position")
+            or extra_info.get("answer_position")
+            or ""
+        ),
+        answer_sheet=str(
+            metadata.get("answer_sheet")
+            or extra_info.get("answer_sheet")
+            or ""
+        ),
+        data_position=str(
+            metadata.get("data_position")
+            or extra_info.get("data_position")
+            or ""
+        ),
+        excluded=False,
+        missing=missing,
+        folder=folder,
+        init_path=init_path if os.path.isfile(init_path) else "",
+        golden_path=golden_path if os.path.isfile(golden_path) else "",
+    )
+
+
+def _unique_spreadsheet_rl_match(
+    indexes: list[int], *, instance_id: str, source: str, split_file: str
+) -> int | None:
+    if len(indexes) > 1:
+        raise ValueError(
+            f"Spreadsheet-RL instance_id={instance_id!r} is ambiguous in "
+            f"split {split_file!r}: matched rows {indexes} by {source}."
+        )
+    return indexes[0] if indexes else None
+
+
+def _spreadsheet_rl_instance_index(
+    data_path: str,
+    rows: tuple[dict[str, Any], ...],
+    split_file: str,
+    instance_id: str,
+) -> int:
+    """Resolve an explicit id, preferring parquet-only matches."""
+    requested = str(instance_id)
+    extra_matches = [
+        index
+        for index, row in enumerate(rows)
+        if str(_coerce_mapping(row.get("extra_info")).get("id") or "")
+        == requested
+    ]
+    match = _unique_spreadsheet_rl_match(
+        extra_matches,
+        instance_id=requested,
+        source="extra_info.id",
+        split_file=split_file,
+    )
+    if match is not None:
+        return match
+
+    path_matches: list[int] = []
+    for index, row in enumerate(rows):
+        reward_model = _coerce_mapping(row.get("reward_model"))
+        try:
+            thread_dir = _normalize_thread_dir(reward_model.get("ground_truth"))
+        except ValueError:
+            continue
+        if requested in (thread_dir, PurePosixPath(thread_dir).name):
+            path_matches.append(index)
+    match = _unique_spreadsheet_rl_match(
+        path_matches,
+        instance_id=requested,
+        source="reward_model.ground_truth",
+        split_file=split_file,
+    )
+    if match is not None:
+        return match
+
+    metadata_matches: list[int] = []
+    for index, row in enumerate(rows):
+        reward_model = _coerce_mapping(row.get("reward_model"))
+        try:
+            thread_dir = _normalize_thread_dir(reward_model.get("ground_truth"))
+        except ValueError:
+            continue
+        instruction_path = os.path.join(data_path, thread_dir, "instruction.json")
+        try:
+            with open(instruction_path, encoding="utf-8") as handle:
+                metadata = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(metadata, dict) and str(metadata.get("id") or "") == requested:
+            metadata_matches.append(index)
+    match = _unique_spreadsheet_rl_match(
+        metadata_matches,
+        instance_id=requested,
+        source="instruction.json id",
+        split_file=split_file,
+    )
+    if match is not None:
+        return match
+    raise ValueError(
+        f"Spreadsheet-RL instance_id={requested!r} not found among "
+        f"{len(rows)} rows in split {split_file!r}."
+    )
+
+
+def select_spreadsheet_rl_task(
+    data_path: str,
+    split_file: str,
+    seed: int | None,
+    instance_id: str | None = None,
+) -> tuple[SBTask, int]:
+    """Select a parquet row first, then materialize only that task."""
+    normalized_root = os.path.abspath(os.path.expanduser(data_path))
+    normalized_split = _resolve_split_path(normalized_root, split_file)
+    rows = _load_spreadsheet_rl_rows(normalized_root, normalized_split)
+    if instance_id:
+        index = _spreadsheet_rl_instance_index(
+            normalized_root, rows, normalized_split, str(instance_id)
+        )
+    else:
+        index = (int(seed) if seed is not None else 0) % len(rows)
+    task = _spreadsheet_rl_task_from_row(normalized_root, rows[index], index)
+    print(
+        f"[spreadsheet-dataset] split={normalized_split} row_index={index} "
+        f"task_id={task.id}",
+        flush=True,
+    )
+    _check_not_missing(task, index)
+    return task, index
+
+
+@lru_cache(maxsize=8)
 def load_dataset(data_path: str) -> tuple[SBTask, ...]:
     """Load and resolve every task under `data_path`.
 
@@ -264,68 +477,11 @@ def load_spreadsheet_rl_dataset(data_path: str, split_file: str) -> tuple[SBTask
     """
     data_path = os.path.abspath(os.path.expanduser(data_path))
     parquet_path = _resolve_split_path(data_path, split_file)
-    if not os.path.isfile(parquet_path):
-        raise FileNotFoundError(
-            f"Spreadsheet-RL split file not found at {parquet_path!r}."
-        )
-
-    tasks: list[SBTask] = []
-    for row_idx, row in enumerate(_read_spreadsheet_rl_parquet_rows(parquet_path)):
-        reward_model = _coerce_mapping(row.get("reward_model"))
-        extra_info = _coerce_mapping(row.get("extra_info"))
-        thread_dir = _normalize_thread_dir(reward_model.get("ground_truth"))
-        folder = os.path.join(data_path, thread_dir)
-        instruction_path = os.path.join(folder, "instruction.json")
-        metadata: dict[str, Any] = {}
-        if os.path.isfile(instruction_path):
-            with open(instruction_path, encoding="utf-8") as handle:
-                metadata = json.load(handle)
-
-        task_id = (
-            extra_info.get("id")
-            or metadata.get("id")
-            or PurePosixPath(thread_dir).name
-            or f"row-{row_idx}"
-        )
-        init_path = os.path.join(folder, "output.xlsx")
-        golden_path = os.path.join(folder, "target.xlsx")
-        missing = (
-            not os.path.isdir(folder)
-            or not os.path.isfile(instruction_path)
-            or not os.path.isfile(init_path)
-            or not os.path.isfile(golden_path)
-        )
-        tasks.append(SBTask(
-            id=str(task_id),
-            instruction=str(metadata.get("instruction", "")),
-            instruction_type=str(
-                metadata.get("instruction_type")
-                or metadata.get("type")
-                or extra_info.get("type")
-                or ""
-            ),
-            answer_position=_norm_pos(
-                metadata.get("answer_position")
-                or extra_info.get("answer_position")
-                or ""
-            ),
-            answer_sheet=str(
-                metadata.get("answer_sheet")
-                or extra_info.get("answer_sheet")
-                or ""
-            ),
-            data_position=str(
-                metadata.get("data_position")
-                or extra_info.get("data_position")
-                or ""
-            ),
-            excluded=False,
-            missing=missing,
-            folder=folder,
-            init_path=init_path if os.path.isfile(init_path) else "",
-            golden_path=golden_path if os.path.isfile(golden_path) else "",
-        ))
-    return tuple(tasks)
+    rows = _load_spreadsheet_rl_rows(data_path, parquet_path)
+    return tuple(
+        _spreadsheet_rl_task_from_row(data_path, row, row_idx)
+        for row_idx, row in enumerate(rows)
+    )
 
 
 def base_id(instance_id: str) -> str:
@@ -350,9 +506,10 @@ def select_task(data_path: str, seed: int | None,
     explicit hook used by the eval driver, which drives the env directly.
     """
     if split_file:
-        tasks = load_spreadsheet_rl_dataset(data_path, split_file)
-    else:
-        tasks = load_dataset_multi(data_path) if multi else load_dataset(data_path)
+        return select_spreadsheet_rl_task(
+            data_path, split_file, seed, instance_id=instance_id
+        )
+    tasks = load_dataset_multi(data_path) if multi else load_dataset(data_path)
     if not tasks:
         raise RuntimeError(f"No SpreadsheetBench tasks loaded from {data_path!r}.")
     if instance_id:

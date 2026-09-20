@@ -8,6 +8,8 @@ import re
 from typing import Any
 import uuid
 
+import numpy as np
+
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from envharness_rl.spreadsheetbench.projection import (
     envharness_spreadsheetbench_projection_diagnostics,
@@ -45,7 +47,8 @@ _NATIVE_READ_TOOL_INSTRUCTIONS = """
 Structured read tools are enabled. They read the current output workbook, so
 they include edits from earlier turns. Do not pass a file path.
 
-List worksheets before assuming their names or dimensions:
+Use list_sheets when the initial preview does not establish names or dimensions.
+Do not repeat an identical successful read call:
 <tool_call>{"name":"list_sheets","arguments":{}}</tool_call>
 
 Inspect one finite A1 range. mode is cells or summary:
@@ -56,14 +59,32 @@ is values, formulas, or both; return_mode is first or all:
 <tool_call>{"name":"find_cells","arguments":{"query":"Total","search_in":"values","return_mode":"all","max_results":20}}</tool_call>
 
 Prefer these tools over run_python for workbook discovery. They are read-only;
-use run_python for edits, then validate_workbook and submit as usual."""
+use run_python for edits, then validate_workbook and submit as usual. Move from
+inspection to editing as soon as the required layout is known."""
+
+_NATIVE_BASIC_TOOL_INSTRUCTIONS = """
+
+Structured basic write tools are enabled. They update the current output
+workbook atomically and return a short result.
+
+Write static values. Formula strings are rejected; null entries skip cells:
+<tool_call>{"name":"write_range","arguments":{"sheet_name":"Sheet1","range":"A1:B2","data":[[1,2],[3,4]]}}</tool_call>
+
+Clear values or formulas without shifting cells:
+<tool_call>{"name":"clear_range","arguments":{"sheet_name":"Sheet1","range":"A1:B20"}}</tool_call>
+
+Use run_python for formulas, formatting, sorting, structural edits, or other
+operations not covered by these tools."""
 
 
 def _tool_instructions() -> str:
     tool_set = os.environ.get("SPREADSHEETBENCH_TOOL_SET", "python")
     normalized = tool_set.strip().lower().replace("-", "_")
-    if normalized == "native_read":
-        return _PYTHON_TOOL_INSTRUCTIONS + _NATIVE_READ_TOOL_INSTRUCTIONS
+    if normalized in {"native_read", "native_basic"}:
+        instructions = _PYTHON_TOOL_INSTRUCTIONS + _NATIVE_READ_TOOL_INSTRUCTIONS
+        if normalized == "native_basic":
+            instructions += _NATIVE_BASIC_TOOL_INSTRUCTIONS
+        return instructions
     return _PYTHON_TOOL_INSTRUCTIONS
 
 
@@ -107,6 +128,7 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             os.environ.get("SPREADSHEETBENCH_HISTORY_OBS_CHARS", "2000")
         )
         self._tool_instructions = _tool_instructions()
+        self._max_steps = int(getattr(config.env, "max_steps", 10))
 
     @staticmethod
     def _jsonable(value: Any) -> Any:
@@ -177,8 +199,23 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
         syntax_error = int(bool(env_info.get("syntax_error", False)))
         error_type = str(env_info.get("python_error_type") or "")
         tool_name = str(env_info.get("tool_name") or "")
+        parsed_tool_name = str(parser_diagnostic.get("tool_name") or "")
+        action_name = tool_name or parsed_tool_name
+        tool_category = str(env_info.get("tool_category") or "")
         tool_error = str(env_info.get("tool_error") or "")
-        return {
+        read_call = bool(
+            tool_name and (
+                tool_category == "read"
+                or tool_name in {"list_sheets", "inspect_range", "find_cells"}
+            )
+        )
+        write_call = bool(
+            tool_name and (
+                tool_category == "write"
+                or tool_name in {"write_range", "clear_range"}
+            )
+        )
+        result = {
             "parser/status": parser_diagnostic.get("status", "unknown"),
             "parser/native_valid": int(
                 parser_diagnostic.get("native_valid", 0)
@@ -205,13 +242,26 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             ),
             "env/python_timeout": int(error_type == "TimeoutExpired"),
             "env/python_error_type": error_type,
-            "env/read_tool_call": int(bool(tool_name)),
+            "env/read_tool_call": int(read_call),
             "env/read_tool_success": int(
-                bool(tool_name) and bool(env_info.get("tool_ok", False))
+                read_call and bool(env_info.get("tool_ok", False))
             ),
-            "env/read_tool_error": int(bool(tool_error)),
-            "env/read_tool_error_type": tool_error,
+            "env/read_tool_error": int(read_call and bool(tool_error)),
+            "env/read_tool_error_type": tool_error if read_call else "",
+            "env/write_tool_call": int(write_call),
+            "env/write_tool_success": int(
+                write_call and bool(env_info.get("tool_ok", False))
+            ),
+            "env/write_tool_error": int(write_call and bool(tool_error)),
+            "env/write_tool_error_type": tool_error if write_call else "",
+            "env/tool_error_type": tool_error,
         }
+        for name in (
+            "run_python", "list_sheets", "inspect_range", "find_cells",
+            "write_range", "clear_range", "validate_workbook", "submit",
+        ):
+            result[f"tool/{name}"] = int(action_name == name)
+        return result
 
     def _format_history_action(
         self,
@@ -338,6 +388,37 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
                 history_text = "\n\nRecent interaction history:\n" + "\n\n".join(turns)
             prompts.append(
                 f"{self._tool_instructions}{history_text}\n\n"
+                f"episode_step: {len(self._trajectory_steps[index])}\n"
+                f"steps_remaining: {max(self._max_steps - len(self._trajectory_steps[index]), 0)}\n\n"
                 f"Current environment observation:\n{current_observation}"
             )
         return prompts
+
+    def success_evaluator(self, *args, **kwargs):
+        metrics = super().success_evaluator(*args, **kwargs)
+        total_infos = kwargs["total_infos"]
+        total_batch_list = kwargs["total_batch_list"]
+        components = {
+            "reward_workbook_score": [],
+            "reward_execution_penalty": [],
+            "reward_env_total": [],
+        }
+        info_keys = {
+            "reward_workbook_score": "reward/workbook_score",
+            "reward_execution_penalty": "reward/execution_penalty",
+            "reward_env_total": "reward/env_total",
+        }
+        for batch_items, infos in zip(total_batch_list, total_infos):
+            final_info = next(
+                info
+                for item, info in reversed(list(zip(batch_items, infos)))
+                if item["active_masks"]
+            )
+            for metric_key, info_key in info_keys.items():
+                fallback = final_info.get("score", 0.0) if metric_key == "reward_workbook_score" else 0.0
+                components[metric_key].append(float(final_info.get(info_key, fallback)))
+        metrics.update({
+            key: np.asarray(values, dtype=np.float32)
+            for key, values in components.items()
+        })
+        return metrics

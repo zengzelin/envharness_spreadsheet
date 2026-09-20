@@ -15,11 +15,20 @@ _THINK_START_TAG = "<think>"
 _THINK_END_TAG = "</think>"
 _FENCED_JSON_RE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
 _NATIVE_READ_TOOLS = frozenset({"list_sheets", "inspect_range", "find_cells"})
+_NATIVE_WRITE_TOOLS = frozenset({"write_range", "clear_range"})
+
+
+def _tool_set() -> str:
+    value = os.environ.get("SPREADSHEETBENCH_TOOL_SET", "python")
+    return value.strip().lower().replace("-", "_")
 
 
 def _native_read_enabled() -> bool:
-    value = os.environ.get("SPREADSHEETBENCH_TOOL_SET", "python")
-    return value.strip().lower().replace("-", "_") == "native_read"
+    return _tool_set() in {"native_read", "native_basic"}
+
+
+def _native_write_enabled() -> bool:
+    return _tool_set() == "native_basic"
 
 
 def _invalid_action(error: str = "Tool call parse error: invalid action") -> Action:
@@ -184,6 +193,37 @@ def _project_one_with_diagnostics(
                     f"string '{required_key}' argument."
                 )
                 return _invalid_action(diagnostics["error"]), 0, diagnostics
+        diagnostics["valid"] = 1
+        diagnostics["invalid"] = 0
+        diagnostics["native_valid"] = int(status == "native_tool_call")
+        diagnostics["recovered"] = int(status.endswith("_recovered"))
+        return Action(name=name, kwargs=arguments), 1, diagnostics
+    if name in _NATIVE_WRITE_TOOLS:
+        if not _native_write_enabled():
+            diagnostics["status"] = "tool_disabled"
+            diagnostics["error"] = (
+                "Tool call parse error: structured write tools require "
+                "SPREADSHEETBENCH_TOOL_SET=native_basic."
+            )
+            return _invalid_action(diagnostics["error"]), 0, diagnostics
+        required = {"write_range": {"range", "data"}, "clear_range": {"range"}}
+        missing = [key for key in required[name] if key not in arguments]
+        if missing:
+            diagnostics["status"] = "missing_arguments"
+            diagnostics["error"] = (
+                f"Tool call parse error: {name} requires "
+                + ", ".join(sorted(missing))
+                + "."
+            )
+            return _invalid_action(diagnostics["error"]), 0, diagnostics
+        range_value = arguments.get("range")
+        if not isinstance(range_value, str) or not range_value.strip():
+            diagnostics["status"] = "missing_range"
+            diagnostics["error"] = (
+                f"Tool call parse error: {name} requires a non-empty string "
+                "'range' argument."
+            )
+            return _invalid_action(diagnostics["error"]), 0, diagnostics
         diagnostics["valid"] = 1
         diagnostics["invalid"] = 0
         diagnostics["native_valid"] = int(status == "native_tool_call")
