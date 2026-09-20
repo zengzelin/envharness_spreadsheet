@@ -95,6 +95,21 @@ and saves at the final step:
 MODE=full bash rl/scripts/submit_spreadsheetbench_grpo.sh
 ```
 
+`VAL_SIZE` controls how many validation rows are generated and
+`VAL_CONCURRENCY` controls the reusable Ray actor pool. For example, the full
+399-task verified split can be evaluated in batches of at most 64 actors:
+
+```bash
+SPREADSHEETBENCH_TOOL_SET=native_basic \
+VAL_SIZE=399 VAL_CONCURRENCY=64 \
+MODE=full bash rl/scripts/submit_spreadsheetbench_grpo.sh
+```
+
+With `native_basic`, the model can call `write_range`, `clear_range`, and
+`fill_formula` in addition to the structured read tools. One model turn may
+contain up to four ordered `<tool_call>` blocks; they execute sequentially and
+consume one episode step. `submit` must be the final call in its batch.
+
 The launcher writes `launch.log`, `train.log`, and checkpoints under
 `runs/grpo_spreadsheetbench_<mode>_<timestamp>/`; the corresponding
 `*_latest` symlink points at the newest run. The parquet inputs are generated

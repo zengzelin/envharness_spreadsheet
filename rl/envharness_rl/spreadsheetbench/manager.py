@@ -11,9 +11,7 @@ import uuid
 import numpy as np
 
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
-from envharness_rl.spreadsheetbench.projection import (
-    envharness_spreadsheetbench_projection_diagnostics,
-)
+from envharness_rl.spreadsheetbench.projection import project_action_batch
 
 
 _PYTHON_TOOL_INSTRUCTIONS = """You are solving a SpreadsheetBench task by editing the workbook with Python.
@@ -22,7 +20,9 @@ load_workbook_for_edit(), and save_workbook(wb). load_workbook_for_edit() opens
 the current output workbook, which is initially a copy of the input and retains
 edits from earlier turns. Prefer openpyxl for workbook-preserving edits. Before
 assuming a sheet or table layout, inspect workbook.sheetnames and dimensions.
-Return exactly one JSON tool call per turn, wrapped in <tool_call> tags. If you
+Return one to four ordered JSON tool calls per turn, each wrapped in
+<tool_call> tags. Calls execute sequentially in one episode turn. Put submit
+last. If you
 write a <think>...</think> reasoning block, put the tool call only after the
 final </think>. Do not wrap the tool call in Markdown fences.
 
@@ -73,7 +73,10 @@ Write static values. Formula strings are rejected; null entries skip cells:
 Clear values or formulas without shifting cells:
 <tool_call>{"name":"clear_range","arguments":{"sheet_name":"Sheet1","range":"A1:B20"}}</tool_call>
 
-Use run_python for formulas, formatting, sorting, structural edits, or other
+Fill formulas from one template. Relative and mixed references are translated:
+<tool_call>{"name":"fill_formula","arguments":{"sheet_name":"Sheet1","start_cell":"C2","end_row":100,"formula_template":"=A2+B2"}}</tool_call>
+
+Use run_python for formatting, sorting, structural edits, or other
 operations not covered by these tools."""
 
 
@@ -195,26 +198,82 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
         parser_diagnostic: dict[str, Any],
         env_info: dict[str, Any],
     ) -> dict[str, Any]:
-        python_error = int(bool(env_info.get("python_error", False)))
-        syntax_error = int(bool(env_info.get("syntax_error", False)))
+        tool_results = env_info.get("tool_results") or []
+        sub_infos = [
+            item.get("info") or {}
+            for item in tool_results if isinstance(item, dict)
+        ]
+        python_error = int(bool(
+            env_info.get("python_error", False)
+            or any(info.get("python_error", False) for info in sub_infos)
+        ))
+        syntax_error = int(bool(
+            env_info.get("syntax_error", False)
+            or any(info.get("syntax_error", False) for info in sub_infos)
+        ))
         error_type = str(env_info.get("python_error_type") or "")
+        if not error_type:
+            error_type = next((
+                str(info.get("python_error_type") or "")
+                for info in sub_infos if info.get("python_error_type")
+            ), "")
+        tool_names = [
+            str(item.get("action_name") or "")
+            for item in tool_results if isinstance(item, dict)
+        ]
         tool_name = str(env_info.get("tool_name") or "")
         parsed_tool_name = str(parser_diagnostic.get("tool_name") or "")
         action_name = tool_name or parsed_tool_name
         tool_category = str(env_info.get("tool_category") or "")
         tool_error = str(env_info.get("tool_error") or "")
+        read_names = {"list_sheets", "inspect_range", "find_cells"}
+        write_names = {"write_range", "clear_range", "fill_formula"}
+        read_results = [
+            item for item in tool_results
+            if isinstance(item, dict) and (
+                item.get("action_name") in read_names
+                or (item.get("info") or {}).get("tool_category") == "read"
+            )
+        ]
+        write_results = [
+            item for item in tool_results
+            if isinstance(item, dict) and (
+                item.get("action_name") in write_names
+                or (item.get("info") or {}).get("tool_category") == "write"
+            )
+        ]
         read_call = bool(
-            tool_name and (
+            read_results or tool_name and (
                 tool_category == "read"
-                or tool_name in {"list_sheets", "inspect_range", "find_cells"}
+                or tool_name in read_names
             )
         )
         write_call = bool(
-            tool_name and (
+            write_results or tool_name and (
                 tool_category == "write"
-                or tool_name in {"write_range", "clear_range"}
+                or tool_name in write_names
             )
         )
+        read_success = (
+            all(bool(item.get("ok")) for item in read_results)
+            if read_results else bool(env_info.get("tool_ok", False))
+        )
+        write_success = (
+            all(bool(item.get("ok")) for item in write_results)
+            if write_results else bool(env_info.get("tool_ok", False))
+        )
+        read_error = any(not bool(item.get("ok")) for item in read_results)
+        write_error = any(not bool(item.get("ok")) for item in write_results)
+        read_error_type = next((
+            str((item.get("info") or {}).get("tool_error") or "")
+            for item in read_results
+            if (item.get("info") or {}).get("tool_error")
+        ), tool_error if read_call else "")
+        write_error_type = next((
+            str((item.get("info") or {}).get("tool_error") or "")
+            for item in write_results
+            if (item.get("info") or {}).get("tool_error")
+        ), tool_error if write_call else "")
         result = {
             "parser/status": parser_diagnostic.get("status", "unknown"),
             "parser/native_valid": int(
@@ -244,36 +303,55 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             "env/python_error_type": error_type,
             "env/read_tool_call": int(read_call),
             "env/read_tool_success": int(
-                read_call and bool(env_info.get("tool_ok", False))
+                read_call and read_success
             ),
-            "env/read_tool_error": int(read_call and bool(tool_error)),
-            "env/read_tool_error_type": tool_error if read_call else "",
+            "env/read_tool_error": int(
+                read_call and (read_error or bool(tool_error))
+            ),
+            "env/read_tool_error_type": read_error_type,
             "env/write_tool_call": int(write_call),
             "env/write_tool_success": int(
-                write_call and bool(env_info.get("tool_ok", False))
+                write_call and write_success
             ),
-            "env/write_tool_error": int(write_call and bool(tool_error)),
-            "env/write_tool_error_type": tool_error if write_call else "",
-            "env/tool_error_type": tool_error,
+            "env/write_tool_error": int(
+                write_call and (write_error or bool(tool_error))
+            ),
+            "env/write_tool_error_type": write_error_type,
+            "env/tool_error_type": write_error_type or read_error_type or tool_error,
+            "episode/tool_calls_per_turn": int(
+                env_info.get("tool_call_count", 1 if action_name else 0)
+            ),
+            "episode/multi_call": int(bool(env_info.get("multi_call", False))),
+            "env/multi_call_partial_failure": int(bool(
+                env_info.get("multi_call_partial_failure", False)
+            )),
         }
         for name in (
             "run_python", "list_sheets", "inspect_range", "find_cells",
-            "write_range", "clear_range", "validate_workbook", "submit",
+            "write_range", "clear_range", "fill_formula",
+            "validate_workbook", "submit",
         ):
-            result[f"tool/{name}"] = int(action_name == name)
+            result[f"tool/{name}"] = int(
+                action_name == name or name in tool_names
+            )
         return result
 
     def _format_history_action(
         self,
         raw_action: str,
-        projected_action: dict[str, Any] | None = None,
+        projected_action: dict[str, Any] | list[dict[str, Any]] | None = None,
         diagnostics: dict[str, Any] | None = None,
     ) -> str:
         if self._history_mode != "compact":
             return raw_action
         projected_action = projected_action or {}
         diagnostics = diagnostics or {}
-        name = projected_action.get("name", "unknown")
+        if isinstance(projected_action, list):
+            name = ",".join(
+                str(item.get("name", "unknown")) for item in projected_action
+            )
+        else:
+            name = projected_action.get("name", "unknown")
         status = diagnostics.get("parser/status", "unknown")
         output_chars = diagnostics.get("output/char_len", len(raw_action))
         parser_error = diagnostics.get("parser/error") or ""
@@ -289,9 +367,46 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             )
         return "\n".join(parts)
 
+    @staticmethod
+    def _task_seeds_from_kwargs(kwargs: Any) -> list[int] | None:
+        if kwargs is None:
+            return None
+        if hasattr(kwargs, "tolist"):
+            kwargs = kwargs.tolist()
+        if isinstance(kwargs, dict):
+            indexes = kwargs.get("task_index")
+            if indexes is None:
+                return None
+            if hasattr(indexes, "tolist"):
+                indexes = indexes.tolist()
+            if not isinstance(indexes, (list, tuple)):
+                indexes = [indexes]
+            return [int(index) for index in indexes]
+        if not isinstance(kwargs, (list, tuple)):
+            raise ValueError(
+                "validation env_kwargs must be a sequence of mappings"
+            )
+        task_seeds: list[int] = []
+        for index, item in enumerate(kwargs):
+            if hasattr(item, "item") and not isinstance(item, dict):
+                try:
+                    item = item.item()
+                except (TypeError, ValueError):
+                    pass
+            if not isinstance(item, dict) or "task_index" not in item:
+                raise ValueError(
+                    f"validation env_kwargs[{index}] lacks task_index"
+                )
+            task_seeds.append(int(item["task_index"]))
+        return task_seeds
+
     def reset(self, kwargs):
-        del kwargs
-        text_obs, image_obs, infos = self.envs.reset()
+        task_seeds = (
+            self._task_seeds_from_kwargs(kwargs)
+            if self._split == "val"
+            else None
+        )
+        text_obs, image_obs, infos = self.envs.reset(task_seeds=task_seeds)
         self._history = [[] for _ in text_obs]
         self._last_observations = list(text_obs)
         self._initial_observations = list(text_obs)
@@ -307,21 +422,66 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
         return observations, infos
 
     def step(self, text_actions: list[str]):
-        actions, valids = self.projection_f(text_actions)
-        parser_diagnostics = envharness_spreadsheetbench_projection_diagnostics(
-            text_actions
-        )
-        text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
+        action_batches = []
+        parser_diagnostic_batches = []
+        for model_output in text_actions:
+            actions, diagnostics = project_action_batch(model_output)
+            action_batches.append(actions)
+            parser_diagnostic_batches.append(diagnostics)
+        valids = [
+            int(all(item.get("valid", 0) for item in diagnostics))
+            for diagnostics in parser_diagnostic_batches
+        ]
+        parser_diagnostics = []
+        for diagnostics in parser_diagnostic_batches:
+            aggregate = dict(diagnostics[0])
+            aggregate.update({
+                "status": (
+                    diagnostics[0].get("status", "unknown")
+                    if len(diagnostics) == 1
+                    else "native_tool_batch"
+                    if all(item.get("valid", 0) for item in diagnostics)
+                    else "invalid_tool_batch"
+                ),
+                "valid": int(all(item.get("valid", 0) for item in diagnostics)),
+                "invalid": int(any(item.get("invalid", 1) for item in diagnostics)),
+                "native_valid": int(all(
+                    item.get("native_valid", 0) for item in diagnostics
+                )),
+                "recovered": int(any(item.get("recovered", 0) for item in diagnostics)),
+                "tool_name": ",".join(
+                    str(item.get("tool_name") or "") for item in diagnostics
+                ),
+                "error": "; ".join(
+                    str(item.get("error"))
+                    for item in diagnostics if item.get("error")
+                ),
+                "calls": diagnostics,
+            })
+            parser_diagnostics.append(aggregate)
+        if hasattr(self.envs, "step_many"):
+            text_obs, image_obs, rewards, dones, infos = self.envs.step_many(
+                action_batches
+            )
+        else:
+            if any(len(batch) != 1 for batch in action_batches):
+                raise RuntimeError("environment does not support multi-call actions")
+            text_obs, image_obs, rewards, dones, infos = self.envs.step(
+                [batch[0] for batch in action_batches]
+            )
 
         for index, info in enumerate(infos):
             info["is_action_valid"] = to_numpy(valids[index])
-            info["tool_calling"] = int(bool(valids[index]))
+            info["tool_calling"] = sum(
+                int(item.get("valid", 0))
+                for item in parser_diagnostic_batches[index]
+            )
             diagnostics = self._step_diagnostics(
                 parser_diagnostics[index], info
             )
             info.update(diagnostics)
             if not bool(valids[index]):
-                parser_error = actions[index].kwargs.get(
+                parser_error = parser_diagnostics[index].get(
                     "error", "Tool call parse error: invalid action."
                 )
                 info["parser_error"] = parser_error
@@ -329,11 +489,14 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
 
         for index, raw_action in enumerate(text_actions):
             action_valid = bool(valids[index])
-            projected_action = actions[index]
-            projected_payload = {
-                "name": projected_action.name,
-                "kwargs": self._jsonable(projected_action.kwargs),
-            }
+            projected_payloads = [{
+                "name": action.name,
+                "kwargs": self._jsonable(action.kwargs),
+            } for action in action_batches[index]]
+            projected_payload: dict[str, Any] | list[dict[str, Any]] = (
+                projected_payloads[0]
+                if len(projected_payloads) == 1 else projected_payloads
+            )
             diagnostics = self._step_diagnostics(
                 parser_diagnostics[index], infos[index]
             )
@@ -342,6 +505,7 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
                 "observation": self._last_observations[index],
                 "model_output": raw_action,
                 "projected_action": projected_payload,
+                "projected_actions": projected_payloads,
                 "action_valid": action_valid,
                 "diagnostics": diagnostics,
                 "next_observation": text_obs[index],

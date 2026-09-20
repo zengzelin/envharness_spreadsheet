@@ -47,7 +47,8 @@ Action contract (multi-turn ReAct):
     With tool_set=native_read, three structured read-only tools are also
     available: list_sheets(), inspect_range(), and find_cells(). They always
     read the current output workbook and cannot access arbitrary paths.
-    tool_set=native_basic additionally enables write_range() and clear_range().
+    tool_set=native_basic additionally enables write_range(), clear_range(),
+    and fill_formula().
     If the agent never submits, the episode runs to max_steps and we grade
     whatever is at output_path (it is pre-seeded as a copy of the input).
 
@@ -121,7 +122,7 @@ from .read_tools import (
 )
 from .write_tools import execute_write_tool
 from .tools import (
-    ClearRange, FindCells, InspectRange, ListSheets, RunPython, Submit,
+    ClearRange, FillFormula, FindCells, InspectRange, ListSheets, RunPython, Submit,
     ValidateWorkbook, WriteRange,
 )
 
@@ -172,6 +173,7 @@ class SpreadsheetBenchEnv(ActionableEnv):
 
     tool_registry: ClassVar[list[type[Tool]]] = [
         RunPython, ListSheets, InspectRange, FindCells, WriteRange, ClearRange,
+        FillFormula,
         ValidateWorkbook, Submit
     ]
 
@@ -184,7 +186,7 @@ class SpreadsheetBenchEnv(ActionableEnv):
         if tool_set in {TOOL_SET_NATIVE_READ, TOOL_SET_NATIVE_BASIC}:
             selected[1:1] = [ListSheets, InspectRange, FindCells]
         if tool_set == TOOL_SET_NATIVE_BASIC:
-            selected[4:4] = [WriteRange, ClearRange]
+            selected[4:4] = [WriteRange, ClearRange, FillFormula]
         return [tool.get_info() for tool in selected]
 
     def __init__(self) -> None:
@@ -873,7 +875,8 @@ exec(compile(source, agent_script, "exec"), namespace)
             ]
         if self._tool_set == TOOL_SET_NATIVE_BASIC:
             tools[4:4] = [
-                "write_range(range, data, ...)", "clear_range(range, ...)"
+                "write_range(range, data, ...)", "clear_range(range, ...)",
+                "fill_formula(start_cell, formula_template, ...)"
             ]
         return ", ".join(tools)
 

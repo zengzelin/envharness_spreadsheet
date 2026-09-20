@@ -105,6 +105,11 @@ case "${MODE}" in
     ;;
 esac
 
+# VAL_BS remains a backward-compatible alias. New runs should set the total
+# validation set size independently from the reusable Ray actor pool size.
+VAL_SIZE="${VAL_SIZE:-${VAL_BS}}"
+VAL_CONCURRENCY="${VAL_CONCURRENCY:-${VAL_BS}}"
+
 HISTORY_LENGTH="${HISTORY_LENGTH:-2}"
 if [[ "${MODE}" == "full" || "${MODE}" == "diagnostic" ]]; then
   DEFAULT_MODEL="/mnt/geminisgceph1/geminicephfs/mmsearch-luban-universal/luban/common/models/Qwen3-4B-Thinking-2507"
@@ -198,7 +203,8 @@ TRAINER_LOGGER="${TRAINER_LOGGER:-['console','wandb','tensorboard']}"
 LOG_VAL_GENERATIONS="${LOG_VAL_GENERATIONS:-2}"
 
 for integer_name in \
-  TRAIN_BS VAL_BS GROUP_N PPO_MINI_BS EPOCHS N_GPUS_PER_NODE TP MAX_STEPS; do
+  TRAIN_BS VAL_BS VAL_SIZE VAL_CONCURRENCY GROUP_N PPO_MINI_BS EPOCHS \
+  N_GPUS_PER_NODE TP MAX_STEPS; do
   integer_value="${!integer_name}"
   if [[ ! "${integer_value}" =~ ^[1-9][0-9]*$ ]]; then
     echo "${integer_name} must be a positive integer, got ${integer_value}" >&2
@@ -274,7 +280,8 @@ export PYTHONPATH="${ROOT}:${RL_ROOT}:${VERL_AGENT}${PYTHONPATH:+:${PYTHONPATH}}
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
 export WANDB_MODE WANDB_DIR WANDB_NAME TENSORBOARD_DIR
-export MODE MODEL NNODES N_GPUS_PER_NODE TP TRAIN_BS VAL_BS GROUP_N
+export MODE MODEL NNODES N_GPUS_PER_NODE TP TRAIN_BS VAL_BS VAL_SIZE
+export VAL_CONCURRENCY GROUP_N
 export PPO_MINI_BS EPOCHS MAX_STEPS HISTORY_LENGTH MAX_PROMPT_LENGTH
 export MAX_RESPONSE_LENGTH APPLY_CHAT_TEMPLATE_ENABLE_THINKING ROLLOUT_DATA_DIR TRAINER_LOGGER WANDB_PROJECT
 export RUN_DIR RUN_TS EXP_NAME TOTAL_TRAINING_STEPS
@@ -298,7 +305,7 @@ if [[ "${DRY_RUN:-0}" != "1" ]]; then
   "${PY}" "${SCRIPT_DIR}/prepare_spreadsheetbench_verl_data.py" \
     --output-dir "${VERL_DATA_DIR}" \
     --train-size "${TRAIN_BS}" \
-    --val-size "${VAL_BS}"
+    --val-size "${VAL_SIZE}"
 fi
 
 CMD=(
@@ -307,7 +314,7 @@ CMD=(
   "data.train_files=${VERL_DATA_DIR}/train.parquet"
   "data.val_files=${VERL_DATA_DIR}/test.parquet"
   "data.train_batch_size=${TRAIN_BS}"
-  "data.val_batch_size=${VAL_BS}"
+  "data.val_batch_size=${VAL_CONCURRENCY}"
   "data.max_prompt_length=${MAX_PROMPT_LENGTH}"
   "data.max_response_length=${MAX_RESPONSE_LENGTH}"
   "+data.apply_chat_template_kwargs.enable_thinking=${APPLY_CHAT_TEMPLATE_ENABLE_THINKING}"
@@ -338,6 +345,7 @@ CMD=(
   actor_rollout_ref.rollout.free_cache_engine=False
   "actor_rollout_ref.rollout.val_kwargs.temperature=${VAL_TEMPERATURE}"
   "actor_rollout_ref.rollout.val_kwargs.do_sample=${VAL_DO_SAMPLE}"
+  "actor_rollout_ref.rollout.val_kwargs.n=1"
   "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BS_PER_GPU}"
   actor_rollout_ref.ref.fsdp_config.param_offload=True
   "actor_rollout_ref.actor.use_invalid_action_penalty=${USE_INVALID_ACTION_PENALTY}"
@@ -404,7 +412,8 @@ import sys
 
 keys = [
     "MODE", "MODEL", "NNODES", "N_GPUS_PER_NODE", "TP", "TRAIN_BS",
-    "VAL_BS", "GROUP_N", "PPO_MINI_BS", "EPOCHS", "TOTAL_TRAINING_STEPS",
+    "VAL_BS", "VAL_SIZE", "VAL_CONCURRENCY", "GROUP_N", "PPO_MINI_BS",
+    "EPOCHS", "TOTAL_TRAINING_STEPS",
     "MAX_STEPS", "TEST_FREQ", "SAVE_FREQ", "VAL_BEFORE",
     "ACTOR_LR", "KL_LOSS_COEF", "ENTROPY_COEFF",
     "USE_INVALID_ACTION_PENALTY", "INVALID_ACTION_PENALTY_COEF",
@@ -446,6 +455,7 @@ fi
   echo "[spreadsheet-train] mode=${MODE} model=${MODEL}"
   echo "[spreadsheet-train] ray=${RAY_ADDRESS} nodes=${NNODES} gpus_per_node=${N_GPUS_PER_NODE} tp=${TP}"
   echo "[spreadsheet-train] train_bs=${TRAIN_BS} group_n=${GROUP_N} epochs=${EPOCHS} total_training_steps=${TOTAL_TRAINING_STEPS:-auto} max_steps=${MAX_STEPS}"
+  echo "[spreadsheet-train] val_size=${VAL_SIZE} val_concurrency=${VAL_CONCURRENCY}"
   echo "[spreadsheet-train] eval_freq=${TEST_FREQ} save_freq=${SAVE_FREQ} val_before_train=${VAL_BEFORE}"
   echo "[spreadsheet-train] actor_lr=${ACTOR_LR} kl_loss_coef=${KL_LOSS_COEF} entropy_coeff=${ENTROPY_COEFF}"
   echo "[spreadsheet-train] invalid_action_penalty=${USE_INVALID_ACTION_PENALTY} coef=${INVALID_ACTION_PENALTY_COEF}"

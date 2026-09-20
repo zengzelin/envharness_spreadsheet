@@ -12,6 +12,7 @@ from envharness.core.types import (
     Observation,
 )
 from envharness_rl.spreadsheetbench.envs import (
+    EnvharnessSpreadsheetEnvs,
     EnvharnessSpreadsheetWorker,
     _ray_get_with_diagnostics,
     _require_initialized_ray,
@@ -274,6 +275,23 @@ def test_validation_worker_reuses_the_same_task_seed() -> None:
 
     worker.reset()
     assert fake.reset_seed == 1020
+
+
+def test_worker_explicit_task_seed_overrides_but_does_not_advance_sequence() -> None:
+    fake = FakeSpreadsheetEnv()
+    worker = EnvharnessSpreadsheetWorker(
+        seed=1020,
+        seed_stride=32,
+        advance_seed=False,
+        data_path="/dataset",
+        max_steps=1,
+        env_factory=lambda: fake,
+    )
+
+    worker.reset(task_seed=384)
+    assert fake.reset_seed == 384
+    worker.reset()
+    assert fake.reset_seed == 1020
     worker.reset()
     assert fake.reset_seed == 1020
 
@@ -302,6 +320,56 @@ def test_worker_reports_reward_components_at_episode_end() -> None:
     assert info["reward/workbook_score"] == 0.75
     assert info["reward/execution_penalty"] == pytest.approx(-0.2)
     assert info["reward/env_total"] == pytest.approx(0.55)
+
+
+def test_worker_executes_multiple_actions_in_one_episode_turn() -> None:
+    fake = FakeSpreadsheetEnv()
+    worker = EnvharnessSpreadsheetWorker(
+        seed=0,
+        data_path="/dataset",
+        max_steps=2,
+        env_factory=lambda: fake,
+    )
+    worker.reset()
+
+    text, reward, done, info = worker.step_many([
+        Action(name="list_sheets", kwargs={}),
+        Action(name="inspect_range", kwargs={"range": "A1"}),
+    ])
+
+    assert [action.name for action in fake.actions] == [
+        "list_sheets", "inspect_range"
+    ]
+    assert worker._episode_steps == 1
+    assert reward == 0.0
+    assert done is False
+    assert info["tool_call_count"] == 2
+    assert info["tool_success_count"] == 2
+    assert info["tool_failure_count"] == 0
+    assert info["multi_call"] is True
+    assert "call 1 list_sheets" in text
+    assert "call 2 inspect_range" in text
+
+
+def test_worker_stops_batch_after_terminated_action() -> None:
+    fake = FakeSpreadsheetEnv()
+    worker = EnvharnessSpreadsheetWorker(
+        seed=0,
+        data_path="/dataset",
+        max_steps=3,
+        env_factory=lambda: fake,
+    )
+    worker.reset()
+
+    _, _, done, info = worker.step_many([
+        Action(name="submit", kwargs={}),
+        Action(name="list_sheets", kwargs={}),
+    ])
+
+    assert done is True
+    assert [action.name for action in fake.actions] == ["submit"]
+    assert info["tool_call_count"] == 2
+    assert info["tool_executed_count"] == 1
 
 
 def test_worker_seeds_keep_each_grpo_group_on_the_same_task() -> None:
@@ -339,6 +407,61 @@ def test_vector_env_accepts_an_existing_ray_connection() -> None:
     _require_initialized_ray(ray_module)
 
     assert ray_module.init_calls == 0
+
+
+class ImmediateRemoteCall:
+    def __init__(self, function) -> None:
+        self.function = function
+
+    def remote(self, *args):
+        return self.function(*args)
+
+
+class ImmediateWorker:
+    def __init__(self, index: int) -> None:
+        self.index = index
+        self.reset_seeds = []
+        self.batches = []
+        self.reset = ImmediateRemoteCall(self._reset)
+        self.step_many = ImmediateRemoteCall(self._step_many)
+
+    def _reset(self, seed=None):
+        self.reset_seeds.append(seed)
+        return f"task-{seed}", {"task_id": f"task-{seed}"}
+
+    def _step_many(self, actions):
+        self.batches.append(actions)
+        return "done", 0.0, False, {"task_id": f"worker-{self.index}"}
+
+
+class ImmediateRay:
+    exceptions = SimpleNamespace(GetTimeoutError=TimeoutError)
+
+    def get(self, refs, timeout=None):
+        return refs
+
+
+def test_vector_env_activates_only_workers_in_last_validation_batch() -> None:
+    envs = object.__new__(EnvharnessSpreadsheetEnvs)
+    envs._ray = ImmediateRay()
+    envs._actor_timeout_s = 30.0
+    envs.workers = [ImmediateWorker(index) for index in range(64)]
+    envs._active_workers = list(envs.workers)
+    envs._task_ids = []
+
+    text_obs, _, infos = envs.reset(task_seeds=list(range(384, 399)))
+    result = envs.step_many([
+        [Action(name="list_sheets", kwargs={})] for _ in range(15)
+    ])
+
+    assert len(envs._active_workers) == 15
+    assert len(text_obs) == 15
+    assert [info["task_id"] for info in infos] == [
+        f"task-{index}" for index in range(384, 399)
+    ]
+    assert all(len(worker.batches) == 1 for worker in envs.workers[:15])
+    assert all(not worker.batches for worker in envs.workers[15:])
+    assert len(result[0]) == 15
 
 
 class FakeActorId:

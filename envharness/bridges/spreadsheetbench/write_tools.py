@@ -25,6 +25,7 @@ from envharness.bridges.spreadsheetbench.read_tools import (
 
 
 MAX_WRITE_CELLS = 50_000
+MAX_FILL_CELLS = 300_000
 MAX_CELL_CHARS = 8_192
 LOCK_TIMEOUT_SECONDS = 30.0
 
@@ -261,6 +262,109 @@ def _clear_range(path: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], 
     return payload, _render_payload(payload, "samples")
 
 
+def _fill_formula(path: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    _require_no_unknown(
+        arguments,
+        {"start_cell", "formula_template", "sheet_name", "end_row", "end_col"},
+    )
+    if "start_cell" not in arguments or "formula_template" not in arguments:
+        raise ReadToolError(
+            "missing_arguments", "fill_formula requires start_cell and formula_template"
+        )
+    sheet_name, start_text = _split_range(
+        arguments["start_cell"], arguments.get("sheet_name")
+    )
+    min_col, min_row, max_col, max_row = _range_bounds(start_text)
+    if min_col != max_col or min_row != max_row:
+        raise ReadToolError("invalid_start_cell", "start_cell must be one A1 cell")
+
+    formula = arguments["formula_template"]
+    if not isinstance(formula, str) or not formula.startswith("="):
+        raise ReadToolError(
+            "invalid_formula", "formula_template must be an Excel formula starting with '='"
+        )
+    if len(formula) > MAX_CELL_CHARS:
+        raise ReadToolError(
+            "formula_too_large",
+            f"formula_template may not exceed {MAX_CELL_CHARS} characters",
+        )
+
+    end_row = arguments.get("end_row", min_row)
+    if isinstance(end_row, bool) or not isinstance(end_row, int) or end_row < min_row:
+        raise ReadToolError(
+            "invalid_end_row", "end_row must be an integer at or below start_cell"
+        )
+    end_col_value = arguments.get("end_col")
+    if end_col_value is None or end_col_value == "":
+        end_col = min_col
+    else:
+        if not isinstance(end_col_value, str):
+            raise ReadToolError("invalid_end_col", "end_col must be a column label")
+        try:
+            from openpyxl.utils.cell import column_index_from_string
+
+            end_col = column_index_from_string(end_col_value.strip().replace("$", ""))
+        except Exception as exc:  # noqa: BLE001
+            raise ReadToolError("invalid_end_col", "end_col must be a column label") from exc
+        if end_col < min_col:
+            raise ReadToolError(
+                "invalid_end_col", "end_col must be at or to the right of start_cell"
+            )
+
+    cell_count = (end_row - min_row + 1) * (end_col - min_col + 1)
+    if cell_count > MAX_FILL_CELLS:
+        raise ReadToolError(
+            "range_too_large",
+            f"formula fill has {cell_count} cells; maximum is {MAX_FILL_CELLS}",
+        )
+
+    with _workbook_lock(path):
+        workbook = _open_for_edit(path)
+        try:
+            worksheet = _resolve_write_sheet(workbook, sheet_name, create=False)
+            from openpyxl.cell.cell import MergedCell
+            from openpyxl.formula.translate import Translator
+
+            origin = worksheet.cell(min_row, min_col).coordinate
+            changed = 0
+            samples: list[dict[str, Any]] = []
+            for row in range(min_row, end_row + 1):
+                for col in range(min_col, end_col + 1):
+                    cell = worksheet.cell(row, col)
+                    if isinstance(cell, MergedCell):
+                        continue
+                    translated = Translator(formula, origin=origin).translate_formula(
+                        cell.coordinate
+                    )
+                    cell.value = translated
+                    changed += 1
+                    if len(samples) < 10:
+                        samples.append({
+                            "address": cell.coordinate,
+                            "formula": translated,
+                        })
+            _atomic_save(workbook, path)
+            resolved_sheet = worksheet.title
+        finally:
+            workbook.close()
+
+    from openpyxl.utils.cell import get_column_letter
+
+    resolved_range = (
+        f"{get_column_letter(min_col)}{min_row}:"
+        f"{get_column_letter(end_col)}{end_row}"
+    )
+    payload = {
+        "status": "success",
+        "sheet": resolved_sheet,
+        "range": resolved_range,
+        "requested_cells": cell_count,
+        "changed_cells": changed,
+        "samples": samples,
+    }
+    return payload, _render_payload(payload, "samples")
+
+
 def execute_write_tool(
     name: str, path: str, arguments: dict[str, Any]
 ) -> tuple[dict[str, Any], str]:
@@ -271,6 +375,8 @@ def execute_write_tool(
             return _write_range(path, arguments)
         if name == "clear_range":
             return _clear_range(path, arguments)
+        if name == "fill_formula":
+            return _fill_formula(path, arguments)
         raise ReadToolError("unknown_tool", f"unknown write tool: {name}")
     except ReadToolError:
         raise

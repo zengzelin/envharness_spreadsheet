@@ -17,6 +17,7 @@ def build_rows(split: str, size: int) -> list[dict[str, Any]]:
             "prompt": [{"role": "user", "content": ""}],
             "ability": "agent",
             "extra_info": {"split": split, "index": index},
+            "env_kwargs": {"split": split, "task_index": index},
         }
         for index in range(size)
     ]

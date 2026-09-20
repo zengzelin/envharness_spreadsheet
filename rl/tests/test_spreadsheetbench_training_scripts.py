@@ -32,11 +32,18 @@ def test_training_pipeline_exports_native_tool_metrics() -> None:
         "env_read_tool_call": "env/read_tool_call_ratio",
         "tool_list_sheets": "tool/list_sheets_ratio",
         "tool_write_range": "tool/write_range_ratio",
+        "tool_fill_formula": "tool/fill_formula_ratio",
         "tool_submit": "tool/submit_ratio",
+        "episode_tool_calls_per_turn": "episode/tool_calls_per_turn",
+        "episode_multi_call": "episode/multi_call_ratio",
+        "env_multi_call_partial_failure": "env/multi_call_partial_failure_rate",
     }.items():
         assert batch_key in rollout_source
         assert batch_key in trainer_source
         assert metric_name in trainer_source
+
+    assert "success_rate_weights" in trainer_source
+    assert "np.average(v, weights=success_rate_weights[k])" in trainer_source
 
     # Success/error rates are aggregated generically for both read and write
     # tools, so their concrete batch keys are intentionally not duplicated.
@@ -99,12 +106,14 @@ def test_placeholder_rows_are_offline_text_agent_examples() -> None:
             "prompt": [{"role": "user", "content": ""}],
             "ability": "agent",
             "extra_info": {"split": "train", "index": 0},
+            "env_kwargs": {"split": "train", "task_index": 0},
         },
         {
             "data_source": "text",
             "prompt": [{"role": "user", "content": ""}],
             "ability": "agent",
             "extra_info": {"split": "train", "index": 1},
+            "env_kwargs": {"split": "train", "task_index": 1},
         },
     ]
 
@@ -182,6 +191,37 @@ def test_training_dry_run_exposes_optimization_and_penalty_knobs(
     assert "actor_rollout_ref.actor.invalid_action_penalty_coef=0.025" in completed.stdout
     assert "actor_lr=3e-7" in completed.stdout
     assert "invalid_action_penalty=False coef=0.025" in completed.stdout
+
+
+def test_training_dry_run_decouples_validation_size_and_concurrency(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "dataset.json").write_text("[]\n")
+    env = dict(os.environ)
+    env.update({
+        "DRY_RUN": "1",
+        "RAY_ADDRESS": "auto",
+        "SPREADSHEETBENCH_DATA": str(dataset),
+        "RUN_ROOT": str(tmp_path / "runs"),
+        "PY": "/usr/bin/python",
+        "VAL_SIZE": "399",
+        "VAL_CONCURRENCY": "64",
+    })
+
+    completed = subprocess.run(
+        ["bash", str(ROOT / "rl/scripts/run_spreadsheetbench_grpo.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "data.val_batch_size=64" in completed.stdout
+    assert "actor_rollout_ref.rollout.val_kwargs.n=1" in completed.stdout
+    assert "val_size=399 val_concurrency=64" in completed.stdout
 
 
 def test_training_rejects_epoch_budget_shorter_than_requested_steps(

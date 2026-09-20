@@ -168,7 +168,7 @@ Spreadsheet-RL 是论文对应的完整训练栈，包含：
 - `python`：`run_python`、`validate_workbook`、`submit`；
 - `native_read`：在 `python` 基础上增加 `list_sheets`、`inspect_range`、
   `find_cells`；
-- `native_basic`：再增加 `write_range` 和 `clear_range`。
+- `native_basic`：再增加 `write_range`、`clear_range` 和 `fill_formula`。
 
 只读工具已支持范围、返回字符数和 workbook 大小限制。写工具已使用统一文件锁、
 临时文件校验和原子替换，避免失败写入损坏工作簿。`run_python` 仍是公式、格式、
@@ -654,6 +654,9 @@ scale smoke、5-step 和 20-step GRPO 验收；原先 `ready=0/128` 的 reset �
 | 轨迹与指标 | env/verl 双轨迹，parser、tool、Python error、reward 分解指标 | 已完成 |
 | 验证可比性 | train task 轮换，fast-val task 固定，确定性 validation | 已完成 |
 | 独立评测 | Base/checkpoint 使用相同 399 条 Verified 任务做 paired evaluation | 已完成 |
+| 完整验证分批 | `VAL_SIZE` / `VAL_CONCURRENCY` 解耦，按 parquet task index 激活变长 worker batch | 代码完成，待集群验收 |
+| 公式工具 | `fill_formula` 公式平移、锁、临时文件校验和原子替换 | 代码完成，待集群验收 |
+| 单轮 multi-call | 最多四个调用、顺序执行、单 turn 计数、逐调用诊断与指标 | 代码完成，待集群验收 |
 
 ### 18.2 哪些修改已证明起作用
 
@@ -703,25 +706,57 @@ Spreadsheet-RL 原版默认使用 `test_hermes.parquet` 2,722 条验证任务，
 `test_verified_hermes.parquet`，则会在一个 batch 中评测完整 400/本地可用
 399 条。原版配置是 step 0 validation，之后每 15 step 评测。
 
-当前 EnvHarness 中 `VAL_BS` 同时决定验证任务数和 Ray env actor 数。因此
-`VAL_BS=64` 是固定 64 条 fast-val，不是完整 399 条。完整 399 条目前通过
-独立 val-only job 运行。下一项明确的架构修改是解耦：
+修改前 EnvHarness 中 `VAL_BS` 同时决定验证任务数和 Ray env actor 数，因此
+`VAL_BS=64` 只是固定 64 条 fast-val。当前代码已解耦为：
 
 ```text
 validation_size = 399
 validation_concurrency = 32 或 64
 ```
 
-实现后才能在不同时创建 399 个 actor 的情况下，像 Spreadsheet-RL 一样分批遍历
-完整验证集。
+新 job 可在不同时创建 399 个 actor 的情况下分批遍历完整验证集；399/64 的集群
+验收尚未执行。
 
 ### 18.5 当前优先级
 
 1. 保留固定 64 条 fast-val 做频繁健康检查，对候选 checkpoint 跑完整 399 条。
-2. 解耦 validation size 和 actor concurrency，把完整验评分批收入统一训练流程。
-3. 先补 `fill_formula`，并明确 `write_range` 的静态值边界；再补格式、行列和
-   sheet 管理工具。
-4. 迁移单轮多 tool-call 调度，允许只读工具并行、写工具按序执行，降低
-   episode 长度和 rollout 时间。
+2. 对已实现的 validation 分批、`fill_formula` 和串行 multi-call 跑完整验收。
+3. 验收通过后再补格式、行列和 sheet 管理工具。
+4. 串行 multi-call 稳定后再评估连续只读调用并行，写工具始终按序执行。
 5. 候选 checkpoint 的选择以完整验证集 `success_rate` 为主，parser 和 shaping
    reward 只用于诊断，不再单独作为效果结论。
+
+## 19. 已确认的下一阶段实施顺序
+
+2026-09-20 已确认按以下顺序推进：
+
+1. 完整验证集大小与 Ray actor 并发数解耦；
+2. 迁移 `fill_formula`；
+3. 迁移单轮 multi-call；
+4. 按 badcase 频次迁移格式、行列和 sheet 管理等剩余工具。
+
+详细文件、接口、TDD 步骤、smoke 命令、A/B 实验和 Stop/Go 门槛见
+`md/spreadsheet_rl_next_migration_implementation_plan.md`。当前运行中的实验保持不变，
+新代码只用于后续新建 Ray job。
+
+## 20. 2026-09-20 实施进展
+
+本轮已在代码层完成前三项迁移：
+
+1. placeholder parquet 逐行携带 `env_kwargs.task_index`；validation manager
+   按 batch 中的索引 reset，Ray worker pool 支持最后一个不足并发上限的 batch。
+2. 启动参数新增 `VAL_SIZE` 和 `VAL_CONCURRENCY`。前者决定验证集行数，后者
+   决定 validation actor pool 大小；未设置时都继承旧 `VAL_BS`，保持旧命令兼容。
+3. `native_basic` 新增 `fill_formula`，通过 openpyxl `Translator` 平移相对、混合
+   和绝对引用，并复用 workbook lock、临时文件重开校验和原子替换。
+4. projection 支持每轮最多四个有序 `<tool_call>`；`submit` 只能位于末尾。
+   worker 在一个 episode turn 内顺序执行 batch，记录逐调用结果，终止或写失败后
+   停止后续调用。
+5. 新增 `episode/tool_calls_per_turn`、`episode/multi_call_ratio`、
+   `env/multi_call_partial_failure_rate` 和 `tool/fill_formula_ratio`，并同步到
+   train/val trainer 指标和离线 rollout summary。
+
+当前编辑节点只有 Python 3.6，无法导入项目使用的 Python 3.10+ 类型语法，也没有
+pytest/openpyxl。因此这里只完成了 shell 语法、diff 和静态代码检查；必须在训练镜像
+运行完整 `rl/tests`、formula worker smoke、399/64 validation smoke 和 5-step GRPO
+后，才能把本节状态从“代码完成”升级为“运行验收完成”。

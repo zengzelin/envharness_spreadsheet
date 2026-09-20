@@ -15,7 +15,10 @@ _THINK_START_TAG = "<think>"
 _THINK_END_TAG = "</think>"
 _FENCED_JSON_RE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
 _NATIVE_READ_TOOLS = frozenset({"list_sheets", "inspect_range", "find_cells"})
-_NATIVE_WRITE_TOOLS = frozenset({"write_range", "clear_range"})
+_NATIVE_WRITE_TOOLS = frozenset({"write_range", "clear_range", "fill_formula"})
+_CELL_RE = re.compile(
+    r"^(?:(?:'[^']+'|[^!]+)!)?\$?([A-Za-z]{1,3})\$?([1-9]\d*)$"
+)
 
 
 def _tool_set() -> str:
@@ -29,6 +32,36 @@ def _native_read_enabled() -> bool:
 
 def _native_write_enabled() -> bool:
     return _tool_set() == "native_basic"
+
+
+def _column_index(label: str) -> int:
+    value = 0
+    for character in label.upper():
+        value = value * 26 + ord(character) - ord("A") + 1
+    return value
+
+
+def _fill_formula_error(arguments: dict[str, Any]) -> str | None:
+    start_cell = arguments.get("start_cell")
+    formula = arguments.get("formula_template")
+    if not isinstance(start_cell, str) or not start_cell.strip():
+        return "fill_formula requires a non-empty string 'start_cell' argument."
+    match = _CELL_RE.fullmatch(start_cell.strip())
+    if match is None:
+        return "fill_formula start_cell must be one A1 cell."
+    if not isinstance(formula, str) or not formula.startswith("="):
+        return "fill_formula formula_template must start with '='."
+    start_col, start_row_text = match.groups()
+    start_row = int(start_row_text)
+    end_row = arguments.get("end_row", start_row)
+    if isinstance(end_row, bool) or not isinstance(end_row, int) or end_row < start_row:
+        return "fill_formula end_row must be at or below start_cell."
+    end_col = arguments.get("end_col", start_col)
+    if not isinstance(end_col, str) or not end_col.strip().replace("$", "").isalpha():
+        return "fill_formula end_col must be a column label."
+    if _column_index(end_col.strip().replace("$", "")) < _column_index(start_col):
+        return "fill_formula end_col must be at or to the right of start_cell."
+    return None
 
 
 def _invalid_action(error: str = "Tool call parse error: invalid action") -> Action:
@@ -206,7 +239,11 @@ def _project_one_with_diagnostics(
                 "SPREADSHEETBENCH_TOOL_SET=native_basic."
             )
             return _invalid_action(diagnostics["error"]), 0, diagnostics
-        required = {"write_range": {"range", "data"}, "clear_range": {"range"}}
+        required = {
+            "write_range": {"range", "data"},
+            "clear_range": {"range"},
+            "fill_formula": {"start_cell", "formula_template"},
+        }
         missing = [key for key in required[name] if key not in arguments]
         if missing:
             diagnostics["status"] = "missing_arguments"
@@ -216,8 +253,16 @@ def _project_one_with_diagnostics(
                 + "."
             )
             return _invalid_action(diagnostics["error"]), 0, diagnostics
+        if name == "fill_formula":
+            fill_error = _fill_formula_error(arguments)
+            if fill_error is not None:
+                diagnostics["status"] = "invalid_arguments"
+                diagnostics["error"] = f"Tool call parse error: {fill_error}"
+                return _invalid_action(diagnostics["error"]), 0, diagnostics
         range_value = arguments.get("range")
-        if not isinstance(range_value, str) or not range_value.strip():
+        if name != "fill_formula" and (
+            not isinstance(range_value, str) or not range_value.strip()
+        ):
             diagnostics["status"] = "missing_range"
             diagnostics["error"] = (
                 f"Tool call parse error: {name} requires a non-empty string "
@@ -255,6 +300,75 @@ def _project_one_with_diagnostics(
 def _project_one(model_output: str) -> tuple[Action, int]:
     action, valid, _ = _project_one_with_diagnostics(model_output)
     return action, valid
+
+
+def project_action_batch(
+    model_output: str, max_calls: int = 4,
+) -> tuple[list[Action], list[dict[str, Any]]]:
+    """Parse an ordered, bounded list of native tool calls from one turn."""
+    text = str(model_output or "")
+    parse_region, region_error = _parse_region(text)
+    if region_error is not None:
+        action, _, diagnostic = _project_one_with_diagnostics(text)
+        diagnostic["call_index"] = 0
+        return [action], [diagnostic]
+
+    blocks: list[str] = []
+    cursor = 0
+    while True:
+        start = parse_region.find(_START_TAG, cursor)
+        if start < 0:
+            break
+        end = parse_region.find(_END_TAG, start + len(_START_TAG))
+        if end < 0:
+            blocks.append(parse_region[start:])
+            break
+        end += len(_END_TAG)
+        blocks.append(parse_region[start:end])
+        cursor = end
+
+    if not blocks:
+        action, _, diagnostic = _project_one_with_diagnostics(text)
+        diagnostic["call_index"] = 0
+        return [action], [diagnostic]
+    if len(blocks) > max_calls:
+        message = (
+            f"Tool call parse error: {len(blocks)} calls exceed the "
+            f"per-turn maximum of {max_calls}."
+        )
+        diagnostic = _base_diagnostics(text)
+        diagnostic.update({
+            "status": "too_many_tool_calls",
+            "error": message,
+            "call_index": 0,
+        })
+        return [_invalid_action(message)], [diagnostic]
+
+    actions: list[Action] = []
+    diagnostics: list[dict[str, Any]] = []
+    for call_index, block in enumerate(blocks):
+        action, _, diagnostic = _project_one_with_diagnostics(block)
+        diagnostic["call_index"] = call_index
+        diagnostic["output_char_len"] = len(text)
+        diagnostic["has_think"] = int(
+            _THINK_START_TAG in text or _THINK_END_TAG in text
+        )
+        diagnostic["has_markdown_fence"] = int("```" in text)
+        actions.append(action)
+        diagnostics.append(diagnostic)
+
+    for call_index, action in enumerate(actions[:-1]):
+        if action.name != "submit":
+            continue
+        message = "Tool call parse error: submit must be the final call in a batch."
+        actions[call_index] = _invalid_action(message)
+        diagnostics[call_index].update({
+            "status": "submit_not_last",
+            "valid": 0,
+            "invalid": 1,
+            "error": message,
+        })
+    return actions, diagnostics
 
 
 def envharness_spreadsheetbench_projection(

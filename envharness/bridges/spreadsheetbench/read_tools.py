@@ -17,7 +17,7 @@ from typing import Any
 
 
 NATIVE_READ_TOOLS = frozenset({"list_sheets", "inspect_range", "find_cells"})
-NATIVE_WRITE_TOOLS = frozenset({"write_range", "clear_range"})
+NATIVE_WRITE_TOOLS = frozenset({"write_range", "clear_range", "fill_formula"})
 TOOL_SET_PYTHON = "python"
 TOOL_SET_NATIVE_READ = "native_read"
 TOOL_SET_NATIVE_BASIC = "native_basic"

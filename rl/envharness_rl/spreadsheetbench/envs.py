@@ -9,7 +9,11 @@ import time
 from typing import Any, Iterator
 
 from envharness.bridges.spreadsheetbench.bridge import SpreadsheetBenchEnv
+from envharness.bridges.spreadsheetbench.read_tools import NATIVE_WRITE_TOOLS
 from envharness.core.types import Action, EvaluationResult
+
+
+MAX_MULTI_CALL_OBSERVATION_CHARS = 12_000
 
 
 def _worker_seeds(seed: int, env_num: int, group_n: int) -> list[int]:
@@ -178,14 +182,14 @@ class EnvharnessSpreadsheetWorker:
             flush=True,
         )
 
-    def reset(self) -> tuple[str, dict[str, Any]]:
+    def reset(self, task_seed: int | None = None) -> tuple[str, dict[str, Any]]:
         options = dict(self._reset_options)
         options["data_path"] = self._data_path
-        reset_seed = self._next_seed
+        reset_seed = self._next_seed if task_seed is None else int(task_seed)
         self._task_id = ""
         with self._stage("reset", "reset", 0, detail=f"seed={reset_seed}"):
             response = self._env.reset(seed=reset_seed, options=options)
-            if self._advance_seed:
+            if task_seed is None and self._advance_seed:
                 self._next_seed += self._seed_stride
             self._episode_steps = 0
             self._done = False
@@ -225,23 +229,101 @@ class EnvharnessSpreadsheetWorker:
     def step(
         self, action: Action | dict[str, Any]
     ) -> tuple[str, float, bool, dict[str, Any]]:
-        projected = self._coerce_action(action)
-        episode_step = self._episode_steps + 1
-        with self._stage("env_step", projected.name, episode_step):
-            response = self._env.step(projected)
-        self._episode_steps += 1
+        return self.step_many([action])
 
-        info = dict(response.info or {})
+    def step_many(
+        self, actions: list[Action | dict[str, Any]]
+    ) -> tuple[str, float, bool, dict[str, Any]]:
+        if not actions:
+            raise ValueError("actions must not be empty")
+        projected_actions = [self._coerce_action(action) for action in actions]
+        observation_budget = max(
+            MAX_MULTI_CALL_OBSERVATION_CHARS // len(projected_actions), 1
+        )
+        episode_step = self._episode_steps + 1
+        reward = 0.0
+        responses = []
+        tool_results: list[dict[str, Any]] = []
+        terminated = False
+        truncated = False
+        for action_index, projected in enumerate(projected_actions):
+            print(
+                f"[spreadsheet-worker] worker_index={self._worker_index} "
+                f"task_id={self._task_id or '-'} action={projected.name} "
+                f"episode_step={episode_step} action_index={action_index}",
+                flush=True,
+            )
+            with self._stage("env_step", projected.name, episode_step):
+                response = self._env.step(projected)
+            responses.append(response)
+            sub_reward = float(response.reward or 0.0)
+            reward += sub_reward
+            sub_info = dict(response.info or {})
+            explicit_tool_failure = sub_info.get("tool_ok") is False
+            action_failed = bool(
+                projected.name == "invalid"
+                or explicit_tool_failure
+                or sub_info.get("python_error", False)
+                or sub_info.get("error")
+            )
+            observation_text = response.observation.text or ""
+            if len(observation_text) > observation_budget:
+                marker = "\n[tool observation truncated]\n"
+                usable = max(observation_budget - len(marker), 0)
+                head = usable * 2 // 3
+                tail = usable - head
+                observation_text = (
+                    observation_text[:head]
+                    + marker
+                    + (observation_text[-tail:] if tail else "")
+                )
+            tool_results.append({
+                "action_index": action_index,
+                "action_name": projected.name,
+                "observation": observation_text,
+                "reward": sub_reward,
+                "ok": not action_failed,
+                "info": sub_info,
+            })
+            terminated = bool(response.terminated)
+            truncated = bool(response.truncated)
+            if terminated or truncated:
+                break
+            if action_failed and (
+                projected.name == "invalid"
+                or projected.name in NATIVE_WRITE_TOOLS
+                or sub_info.get("tool_category") == "write"
+            ):
+                break
+
+        self._episode_steps += 1
+        last_response = responses[-1]
+        info = dict(last_response.info or {})
         info["task_id"] = self._task_id
         reached_limit = self._episode_steps >= self._max_steps
-        done = bool(response.terminated or response.truncated or reached_limit)
-        reward = float(response.reward or 0.0)
+        done = bool(terminated or truncated or reached_limit)
         self._execution_penalty += reward
+        success_count = sum(int(result["ok"]) for result in tool_results)
+        failure_count = len(tool_results) - success_count
+        info.update({
+            "tool_results": tool_results,
+            "tool_call_count": len(projected_actions),
+            "tool_executed_count": len(tool_results),
+            "tool_success_count": success_count,
+            "tool_failure_count": failure_count,
+            "multi_call": len(projected_actions) > 1,
+            "multi_call_partial_failure": bool(
+                len(projected_actions) > 1 and failure_count
+            ),
+        })
 
         if done:
-            if reached_limit and not response.terminated and not response.truncated:
+            if reached_limit and not terminated and not truncated:
                 info["time_limit_reached"] = True
-            with self._stage("grade", projected.name, episode_step):
+            action_label = ",".join(
+                result["action_name"] for result in tool_results
+            )
+            with self._stage("grade", action_label, episode_step):
                 terminal_reward, info = self._grade(info)
             reward += terminal_reward
             info["reward/workbook_score"] = terminal_reward
@@ -251,7 +333,17 @@ class EnvharnessSpreadsheetWorker:
         else:
             info["won"] = False
 
-        return response.observation.text or "", reward, done, info
+        observations = [
+            f"call {result['action_index'] + 1} {result['action_name']}:\n"
+            f"{result['observation']}"
+            for result in tool_results
+        ]
+        observation_text = (
+            tool_results[0]["observation"]
+            if len(tool_results) == 1
+            else "\n\n".join(observations)
+        )
+        return observation_text, reward, done, info
 
     def close(self) -> None:
         self._env.close()
@@ -308,11 +400,30 @@ class EnvharnessSpreadsheetEnvs:
             )
             for index, worker_seed in enumerate(seeds)
         ]
+        self._active_workers = list(self.workers)
 
-    def reset(self):
-        refs = [worker.reset.remote() for worker in self.workers]
+    def reset(self, task_seeds: list[int] | None = None):
+        if task_seeds is None:
+            self._active_workers = list(self.workers)
+            refs = [worker.reset.remote() for worker in self._active_workers]
+        else:
+            normalized_seeds = [int(seed) for seed in task_seeds]
+            if not normalized_seeds:
+                raise ValueError("task_seeds must not be empty")
+            if len(normalized_seeds) > len(self.workers):
+                raise ValueError(
+                    f"task_seeds={len(normalized_seeds)} exceeds worker pool "
+                    f"capacity={len(self.workers)}"
+                )
+            self._active_workers = self.workers[:len(normalized_seeds)]
+            refs = [
+                worker.reset.remote(task_seed)
+                for worker, task_seed in zip(
+                    self._active_workers, normalized_seeds
+                )
+            ]
         results = _ray_get_with_diagnostics(
-            self._ray, refs, self.workers,
+            self._ray, refs, self._active_workers,
             operation="reset", timeout_s=self._actor_timeout_s,
         )
         text_obs = [result[0] for result in results]
@@ -321,23 +432,32 @@ class EnvharnessSpreadsheetEnvs:
         return text_obs, None, infos
 
     def step(self, actions):
-        if len(actions) != self.num_processes:
+        return self.step_many([[action] for action in actions])
+
+    def step_many(self, action_batches):
+        if len(action_batches) != len(self._active_workers):
             raise ValueError(
-                f"actions={len(actions)} != num_processes={self.num_processes}"
+                f"action_batches={len(action_batches)} != active_processes="
+                f"{len(self._active_workers)}"
             )
+        if any(not batch for batch in action_batches):
+            raise ValueError("action batches must not be empty")
         refs = [
-            worker.step.remote(action)
-            for worker, action in zip(self.workers, actions)
+            worker.step_many.remote(action_batch)
+            for worker, action_batch in zip(self._active_workers, action_batches)
         ]
         results = _ray_get_with_diagnostics(
-            self._ray, refs, self.workers,
+            self._ray, refs, self._active_workers,
             operation="step", timeout_s=self._actor_timeout_s,
             task_ids=self._task_ids,
             actions=[
-                action.name if isinstance(action, Action)
-                else str(action.get("name", "invalid"))
-                if isinstance(action, dict) else "invalid"
-                for action in actions
+                ",".join(
+                    action.name if isinstance(action, Action)
+                    else str(action.get("name", "invalid"))
+                    if isinstance(action, dict) else "invalid"
+                    for action in action_batch
+                )
+                for action_batch in action_batches
             ],
         )
         text_obs = [result[0] for result in results]
@@ -359,6 +479,7 @@ class EnvharnessSpreadsheetEnvs:
             for worker in self.workers:
                 self._ray.kill(worker)
             self.workers = []
+            self._active_workers = []
 
 
 def build_envharness_spreadsheetbench_envs(

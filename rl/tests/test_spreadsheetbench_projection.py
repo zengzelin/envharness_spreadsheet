@@ -7,6 +7,7 @@ import pytest
 from envharness_rl.spreadsheetbench.projection import (
     envharness_spreadsheetbench_projection_diagnostics,
     envharness_spreadsheetbench_projection,
+    project_action_batch,
 )
 
 
@@ -60,6 +61,63 @@ def test_projection_accepts_submit_without_arguments() -> None:
     assert actions[0].kwargs == {}
 
 
+def test_project_action_batch_parses_multiple_native_calls(monkeypatch) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_basic")
+    model_output = "\n".join([
+        _tool_call("list_sheets", {}),
+        _tool_call("inspect_range", {"range": "A1:B3"}),
+        _tool_call("fill_formula", {
+            "start_cell": "C2", "end_row": 4, "formula_template": "=A2+B2",
+        }),
+        _tool_call("validate_workbook", {}),
+    ])
+
+    actions, diagnostics = project_action_batch(model_output)
+
+    assert [action.name for action in actions] == [
+        "list_sheets", "inspect_range", "fill_formula", "validate_workbook"
+    ]
+    assert [item["call_index"] for item in diagnostics] == [0, 1, 2, 3]
+    assert all(item["valid"] == 1 for item in diagnostics)
+
+
+def test_project_action_batch_rejects_more_than_four_calls() -> None:
+    model_output = "\n".join(_tool_call("submit", {}) for _ in range(5))
+
+    actions, diagnostics = project_action_batch(model_output)
+
+    assert [action.name for action in actions] == ["invalid"]
+    assert diagnostics[0]["status"] == "too_many_tool_calls"
+
+
+def test_project_action_batch_preserves_invalid_call_index(monkeypatch) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_read")
+    model_output = (
+        _tool_call("list_sheets", {})
+        + '\n<tool_call>{"name": bad json}</tool_call>\n'
+        + _tool_call("inspect_range", {"range": "A1"})
+    )
+
+    actions, diagnostics = project_action_batch(model_output)
+
+    assert [action.name for action in actions] == [
+        "list_sheets", "invalid", "inspect_range"
+    ]
+    assert diagnostics[1]["call_index"] == 1
+    assert diagnostics[1]["status"] == "invalid_json"
+
+
+def test_project_action_batch_requires_submit_to_be_last() -> None:
+    model_output = _tool_call("submit", {}) + "\n" + _tool_call(
+        "validate_workbook", {}
+    )
+
+    actions, diagnostics = project_action_batch(model_output)
+
+    assert actions[0].name == "invalid"
+    assert diagnostics[0]["status"] == "submit_not_last"
+
+
 @pytest.mark.parametrize(
     ("name", "arguments"),
     [
@@ -101,6 +159,11 @@ def test_projection_rejects_native_read_tools_in_python_tool_set(
     [
         ("write_range", {"range": "A1:B1", "data": [1, 2]}),
         ("clear_range", {"range": "A1:B2"}),
+        ("fill_formula", {
+            "start_cell": "J2",
+            "end_row": 41,
+            "formula_template": "=MOD(H2-G2,1)*24-I2/60",
+        }),
     ],
 )
 def test_projection_accepts_native_basic_write_tools(
@@ -115,6 +178,27 @@ def test_projection_accepts_native_basic_write_tools(
     assert valids == [1]
     assert actions[0].name == name
     assert actions[0].kwargs == arguments
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"start_cell": "A1"},
+        {"start_cell": "A1", "formula_template": "SUM(B1:B2)"},
+        {"start_cell": "A3", "end_row": 2, "formula_template": "=B3"},
+    ],
+)
+def test_projection_rejects_invalid_fill_formula_arguments(
+    monkeypatch, arguments: dict,
+) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_basic")
+
+    actions, valids = envharness_spreadsheetbench_projection([
+        _tool_call("fill_formula", arguments)
+    ])
+
+    assert valids == [0]
+    assert actions[0].name == "invalid"
 
 
 def test_projection_rejects_native_write_tools_in_native_read_mode(

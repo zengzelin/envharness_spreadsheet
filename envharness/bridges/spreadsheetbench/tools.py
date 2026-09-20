@@ -174,6 +174,48 @@ class ClearRange(Tool):
         raise NotImplementedError("SpreadsheetBenchEnv.step executes clear_range")
 
 
+class FillFormula(Tool):
+    name = "fill_formula"
+    description = (
+        "Fill a rectangular region with a formula translated from start_cell. "
+        "Relative references move for each destination while absolute and mixed "
+        "references retain Excel semantics."
+    )
+
+    @classmethod
+    def get_info(cls) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": cls.name,
+                "description": cls.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "start_cell": {"type": "string"},
+                        "formula_template": {"type": "string"},
+                        "sheet_name": {"type": "string"},
+                        "end_row": {"type": "integer", "minimum": 1},
+                        "end_col": {"type": "string"},
+                    },
+                    "required": ["start_cell", "formula_template"],
+                },
+            },
+        }
+
+    @classmethod
+    def invoke(
+        cls,
+        env_state: Any,
+        start_cell: str,
+        formula_template: str,
+        sheet_name: str = "",
+        end_row: int | None = None,
+        end_col: str = "",
+    ) -> Any:
+        raise NotImplementedError("SpreadsheetBenchEnv.step executes fill_formula")
+
+
 class ValidateWorkbook(Tool):
     name = "validate_workbook"
     description = (

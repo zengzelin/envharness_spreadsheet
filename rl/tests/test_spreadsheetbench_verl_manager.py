@@ -17,8 +17,11 @@ from envharness_rl.spreadsheetbench.projection import (
 class FakeVectorEnvs:
     def __init__(self) -> None:
         self.actions = None
+        self.action_batches = None
+        self.reset_task_seeds = None
 
-    def reset(self):
+    def reset(self, task_seeds=None):
+        self.reset_task_seeds = task_seeds
         return ["instruction: Fill Summary!A1\noutput_path: /tmp/out.xlsx"], None, [
             {"task_id": "task-1", "won": False}
         ]
@@ -28,6 +31,20 @@ class FakeVectorEnvs:
         return ["python completed"], None, [0.0], [False], [
             {"task_id": "task-1", "won": False}
         ]
+
+    def step_many(self, action_batches):
+        self.action_batches = action_batches
+        result = self.step([batch[0] for batch in action_batches])
+        for batch, info in zip(action_batches, result[4]):
+            info.update({
+                "tool_call_count": len(batch),
+                "tool_success_count": len(batch),
+                "tool_failure_count": 0,
+                "multi_call": len(batch) > 1,
+                "multi_call_partial_failure": False,
+                "tool_results": [],
+            })
+        return result
 
     def close(self):
         pass
@@ -66,6 +83,59 @@ def test_manager_builds_tool_prompt_and_preserves_history() -> None:
     assert next_infos[0]["output/has_think"] == 0
 
 
+def test_manager_executes_and_records_multiple_calls_from_one_model_turn(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_read")
+    envs = FakeVectorEnvs()
+    config = SimpleNamespace(env=SimpleNamespace(history_length=2))
+    manager = SpreadsheetBenchEnvironmentManager(
+        envs, envharness_spreadsheetbench_projection, config
+    )
+    manager.reset(kwargs={})
+    model_output = (
+        '<tool_call>{"name":"list_sheets","arguments":{}}</tool_call>\n'
+        '<tool_call>{"name":"inspect_range","arguments":'
+        '{"range":"A1:B2"}}</tool_call>'
+    )
+
+    _, _, _, infos = manager.step([model_output])
+
+    assert [[action.name for action in batch] for batch in envs.action_batches] == [
+        ["list_sheets", "inspect_range"]
+    ]
+    assert infos[0]["tool_calling"] == 2
+    assert infos[0]["episode/tool_calls_per_turn"] == 2
+    assert infos[0]["episode/multi_call"] == 1
+    assert infos[0]["parser/invalid"] == 0
+
+
+def test_validation_manager_resets_exact_parquet_task_indexes() -> None:
+    envs = FakeVectorEnvs()
+    config = SimpleNamespace(env=SimpleNamespace(history_length=2))
+    manager = SpreadsheetBenchEnvironmentManager(
+        envs, envharness_spreadsheetbench_projection, config, split="val"
+    )
+
+    manager.reset(kwargs=[
+        {"split": "test", "task_index": 384},
+    ])
+
+    assert envs.reset_task_seeds == [384]
+
+
+def test_train_manager_ignores_placeholder_indexes_and_keeps_seed_stride() -> None:
+    envs = FakeVectorEnvs()
+    config = SimpleNamespace(env=SimpleNamespace(history_length=2))
+    manager = SpreadsheetBenchEnvironmentManager(
+        envs, envharness_spreadsheetbench_projection, config, split="train"
+    )
+
+    manager.reset(kwargs=[{"split": "train", "task_index": 0}])
+
+    assert envs.reset_task_seeds is None
+
+
 def test_manager_native_read_prompt_describes_structured_tools(monkeypatch) -> None:
     monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_read")
     envs = FakeVectorEnvs()
@@ -97,6 +167,24 @@ def test_manager_python_prompt_omits_native_read_tools(monkeypatch) -> None:
     assert '"name":"list_sheets"' not in prompt
     assert '"name":"inspect_range"' not in prompt
     assert '"name":"find_cells"' not in prompt
+
+
+def test_manager_native_basic_prompt_describes_formula_and_multi_call(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_basic")
+    envs = FakeVectorEnvs()
+    config = SimpleNamespace(env=SimpleNamespace(history_length=2))
+    manager = SpreadsheetBenchEnvironmentManager(
+        envs, envharness_spreadsheetbench_projection, config
+    )
+
+    observations, _ = manager.reset(kwargs={})
+
+    prompt = observations["text"][0]
+    assert '"name":"fill_formula"' in prompt
+    assert "one to four ordered JSON tool calls" in prompt
+    assert "Put submit\nlast" in prompt
 
 
 def test_manager_returns_parser_error_observation_after_invalid_action() -> None:
@@ -255,6 +343,36 @@ def test_manager_does_not_classify_parser_failure_as_python_error() -> None:
     assert infos[0]["parser/invalid"] == 1
     assert infos[0]["env/python_error"] == 0
     assert infos[0]["env/syntax_error"] == 0
+
+
+def test_step_diagnostics_preserves_earlier_python_error_in_multi_call() -> None:
+    diagnostics = SpreadsheetBenchEnvironmentManager._step_diagnostics(
+        {"status": "native_tool_batch", "valid": 1, "invalid": 0},
+        {
+            "tool_call_count": 2,
+            "multi_call": True,
+            "tool_results": [
+                {
+                    "action_name": "run_python",
+                    "ok": False,
+                    "info": {
+                        "python_error": True,
+                        "syntax_error": True,
+                        "python_error_type": "SyntaxError",
+                    },
+                },
+                {
+                    "action_name": "inspect_range",
+                    "ok": True,
+                    "info": {"tool_category": "read", "tool_ok": True},
+                },
+            ],
+        },
+    )
+
+    assert diagnostics["env/python_error"] == 1
+    assert diagnostics["env/syntax_error"] == 1
+    assert diagnostics["env/python_error_type"] == "SyntaxError"
 
 
 class ReadToolVectorEnvs(FakeVectorEnvs):

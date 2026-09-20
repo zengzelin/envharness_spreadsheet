@@ -6,6 +6,7 @@ import time
 
 import openpyxl
 
+from envharness.bridges.spreadsheetbench import write_tools
 from envharness.bridges.spreadsheetbench.bridge import (
     SpreadsheetBenchEnv,
     SpreadsheetBenchEnvState,
@@ -254,7 +255,9 @@ def test_tool_schemas_follow_selected_tool_set(monkeypatch) -> None:
     assert native_names == python_names | {
         "list_sheets", "inspect_range", "find_cells"
     }
-    assert basic_names == native_names | {"write_range", "clear_range"}
+    assert basic_names == native_names | {
+        "write_range", "clear_range", "fill_formula"
+    }
     write_schema = next(
         item for item in SpreadsheetBenchEnv.tool_schemas()
         if item["function"]["name"] == "write_range"
@@ -262,6 +265,13 @@ def test_tool_schemas_follow_selected_tool_set(monkeypatch) -> None:
     assert write_schema["function"]["parameters"]["required"] == ["range", "data"]
     assert write_schema["function"]["parameters"]["properties"]["data"]["type"] == [
         "array", "string", "number", "boolean"
+    ]
+    fill_schema = next(
+        item for item in SpreadsheetBenchEnv.tool_schemas()
+        if item["function"]["name"] == "fill_formula"
+    )
+    assert fill_schema["function"]["parameters"]["required"] == [
+        "start_cell", "formula_template"
     ]
 
 
@@ -312,6 +322,84 @@ def test_native_basic_write_range_accepts_column_data(tmp_path: Path) -> None:
     assert [workbook["Sheet1"][f"C{row}"].value for row in range(2, 5)] == [
         1, 2, 3
     ]
+
+
+def test_native_basic_fill_formula_translates_relative_and_absolute_refs(
+    tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+
+    response = env.step(Action(name="fill_formula", kwargs={
+        "sheet_name": "Sheet1",
+        "start_cell": "C2",
+        "end_row": 4,
+        "end_col": "D",
+        "formula_template": "=A2+$B$1+C$1+$A2",
+    }))
+
+    workbook = openpyxl.load_workbook(env.state.output_path, data_only=False)
+    assert response.info["tool_ok"] is True
+    assert response.info["tool_category"] == "write"
+    assert workbook["Sheet1"]["C2"].value == "=A2+$B$1+C$1+$A2"
+    assert workbook["Sheet1"]["D2"].value == "=B2+$B$1+D$1+$A2"
+    assert workbook["Sheet1"]["C4"].value == "=A4+$B$1+C$1+$A4"
+
+
+def test_native_basic_fill_formula_rejects_non_formula_without_mutation(
+    tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+    before = Path(env.state.output_path).read_bytes()
+
+    response = env.step(Action(name="fill_formula", kwargs={
+        "start_cell": "C2",
+        "end_row": 4,
+        "formula_template": "SUM(A1:A2)",
+    }))
+
+    assert response.info["tool_ok"] is False
+    assert response.info["tool_error"] == "invalid_formula"
+    assert Path(env.state.output_path).read_bytes() == before
+
+
+def test_native_basic_fill_formula_save_failure_preserves_workbook(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+    before = Path(env.state.output_path).read_bytes()
+
+    def fail_save(workbook, path):
+        raise RuntimeError("simulated save failure")
+
+    monkeypatch.setattr(write_tools, "_atomic_save", fail_save)
+    response = env.step(Action(name="fill_formula", kwargs={
+        "start_cell": "C2",
+        "end_row": 4,
+        "formula_template": "=A2+B2",
+    }))
+
+    assert response.info["tool_ok"] is False
+    assert response.info["tool_error"] == "tool_execution_failed"
+    assert Path(env.state.output_path).read_bytes() == before
+
+
+def test_native_basic_fill_formula_rejects_oversized_range(
+    tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+
+    response = env.step(Action(name="fill_formula", kwargs={
+        "start_cell": "A1",
+        "end_row": 300001,
+        "formula_template": "=B1",
+    }))
+
+    assert response.info["tool_ok"] is False
+    assert response.info["tool_error"] == "range_too_large"
 
 
 def test_native_basic_write_range_rejects_formulas_without_mutation(

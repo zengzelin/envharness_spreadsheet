@@ -18,6 +18,7 @@ def summarize_trajectories(paths: Iterable[Path]) -> dict:
     steps = valid_actions = python_errors = syntax_errors = 0
     read_calls = read_successes = read_errors = 0
     write_calls = write_successes = write_errors = 0
+    tool_calls = multi_call_steps = multi_call_partial_failures = 0
 
     for path in paths:
         try:
@@ -32,9 +33,24 @@ def summarize_trajectories(paths: Iterable[Path]) -> dict:
         for step in trajectory.get("steps") or []:
             steps += 1
             valid_actions += int(bool(step.get("action_valid")))
-            action = step.get("projected_action") or {}
-            tool_counts[str(action.get("name") or "unknown")] += 1
+            actions = step.get("projected_actions")
+            if not isinstance(actions, list):
+                action = step.get("projected_action") or {}
+                actions = action if isinstance(action, list) else [action]
+            for action in actions:
+                if isinstance(action, dict):
+                    tool_counts[str(action.get("name") or "unknown")] += 1
             diagnostics = step.get("diagnostics") or {}
+            calls_this_turn = int(
+                diagnostics.get("episode/tool_calls_per_turn", len(actions))
+            )
+            tool_calls += calls_this_turn
+            multi_call_steps += int(bool(
+                diagnostics.get("episode/multi_call", calls_this_turn > 1)
+            ))
+            multi_call_partial_failures += int(bool(
+                diagnostics.get("env/multi_call_partial_failure")
+            ))
             python_errors += int(bool(diagnostics.get("env/python_error")))
             syntax_errors += int(bool(diagnostics.get("env/syntax_error")))
             read_calls += int(bool(diagnostics.get("env/read_tool_call")))
@@ -67,6 +83,11 @@ def summarize_trajectories(paths: Iterable[Path]) -> dict:
         "write_tool_call_ratio": _ratio(write_calls, steps),
         "write_tool_success_rate": _ratio(write_successes, write_calls),
         "write_tool_error_rate": _ratio(write_errors, write_calls),
+        "tool_calls_per_turn": _ratio(tool_calls, steps),
+        "multi_call_ratio": _ratio(multi_call_steps, steps),
+        "multi_call_partial_failure_rate": _ratio(
+            multi_call_partial_failures, multi_call_steps
+        ),
         "tool_counts": dict(tool_counts.most_common()),
         "error_types": dict(error_types.most_common()),
     }
