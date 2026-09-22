@@ -274,6 +274,12 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             for item in write_results
             if (item.get("info") or {}).get("tool_error")
         ), tool_error if write_call else "")
+        projected_call_count = int(
+            env_info.get("tool_call_count", 1 if action_name else 0)
+        )
+        executed_call_count = int(
+            env_info.get("tool_executed_count", projected_call_count)
+        )
         result = {
             "parser/status": parser_diagnostic.get("status", "unknown"),
             "parser/native_valid": int(
@@ -318,10 +324,12 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             ),
             "env/write_tool_error_type": write_error_type,
             "env/tool_error_type": write_error_type or read_error_type or tool_error,
-            "episode/tool_calls_per_turn": int(
-                env_info.get("tool_call_count", 1 if action_name else 0)
+            "episode/tool_calls_per_turn": executed_call_count,
+            "episode/projected_tool_calls_per_turn": projected_call_count,
+            "episode/multi_call": int(executed_call_count > 1),
+            "episode/projected_multi_call": int(
+                bool(env_info.get("multi_call", projected_call_count > 1))
             ),
-            "episode/multi_call": int(bool(env_info.get("multi_call", False))),
             "env/multi_call_partial_failure": int(bool(
                 env_info.get("multi_call_partial_failure", False)
             )),

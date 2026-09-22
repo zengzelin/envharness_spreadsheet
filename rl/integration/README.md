@@ -82,6 +82,9 @@ clones upstream at the pinned commit (`796ed310`) into
 `verl_agent_tracking_lifecycle.patch` (explicit, idempotent tracker shutdown).
 Both modes also apply `verl_agent_spreadsheetbench_runtime.patch`, which adds
 Spreadsheet-RL split routing and structured rollout diagnostics.
+They also apply `verl_agent_spreadsheetbench_stall_diagnostics.patch` for
+phase heartbeats and `verl_agent_spreadsheetbench_metrics.patch` for native-tool
+metrics, weighted validation, and reward-component logging.
 `PATCH=all` applies `verl_agent_all_changes.patch`
 instead of the route patch, followed by the same tracking lifecycle patch (a
 superset: DAPO / Qwen3-8B / webshop / SWE-Gym support; see

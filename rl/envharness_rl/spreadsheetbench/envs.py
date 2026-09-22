@@ -291,6 +291,7 @@ class EnvharnessSpreadsheetWorker:
                 break
             if action_failed and (
                 projected.name == "invalid"
+                or projected.name == "run_python"
                 or projected.name in NATIVE_WRITE_TOOLS
                 or sub_info.get("tool_category") == "write"
             ):

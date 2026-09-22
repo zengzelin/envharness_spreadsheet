@@ -1,0 +1,231 @@
+diff --git a/agent_system/multi_turn_rollout/rollout_loop.py b/agent_system/multi_turn_rollout/rollout_loop.py
+index 7b713ad..2b7d7d7 100644
+--- a/agent_system/multi_turn_rollout/rollout_loop.py
++++ b/agent_system/multi_turn_rollout/rollout_loop.py
+@@ -130,7 +130,20 @@ class TrajectoryCollector:
+ 
+         raw_prompt = gen_batch.non_tensor_batch['raw_prompt'][item]
+         data_source = gen_batch.non_tensor_batch['data_source'][item]
+-        apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
++        apply_chat_template_kwargs = dict(
++            self.config.data.get("apply_chat_template_kwargs", {}) or {}
++        )
++        if os.environ.get("ENVHARNESS_DISABLE_THINKING", "").lower() in (
++            "1",
++            "true",
++            "yes",
++        ):
++            apply_chat_template_kwargs["enable_thinking"] = False
++            chat_template_kwargs = dict(
++                apply_chat_template_kwargs.get("chat_template_kwargs", {}) or {}
++            )
++            chat_template_kwargs["enable_thinking"] = False
++            apply_chat_template_kwargs["chat_template_kwargs"] = chat_template_kwargs
+         
+         # Get observation components
+         obs_texts = obs.get('text', None)
+@@ -481,6 +494,24 @@ class TrajectoryCollector:
+                 'env_syntax_error': 'env/syntax_error',
+                 'env_python_runtime_error': 'env/python_runtime_error',
+                 'env_python_timeout': 'env/python_timeout',
++                'env_read_tool_call': 'env/read_tool_call',
++                'env_read_tool_success': 'env/read_tool_success',
++                'env_read_tool_error': 'env/read_tool_error',
++                'env_write_tool_call': 'env/write_tool_call',
++                'env_write_tool_success': 'env/write_tool_success',
++                'env_write_tool_error': 'env/write_tool_error',
++                'episode_tool_calls_per_turn': 'episode/tool_calls_per_turn',
++                'episode_multi_call': 'episode/multi_call',
++                'env_multi_call_partial_failure': 'env/multi_call_partial_failure',
++                'tool_run_python': 'tool/run_python',
++                'tool_list_sheets': 'tool/list_sheets',
++                'tool_inspect_range': 'tool/inspect_range',
++                'tool_find_cells': 'tool/find_cells',
++                'tool_write_range': 'tool/write_range',
++                'tool_clear_range': 'tool/clear_range',
++                'tool_fill_formula': 'tool/fill_formula',
++                'tool_validate_workbook': 'tool/validate_workbook',
++                'tool_submit': 'tool/submit',
+             }
+             for batch_key, info_key in spreadsheetbench_diagnostic_keys.items():
+                 if info_key in infos[0]:
+@@ -626,7 +657,6 @@ class TrajectoryCollector:
+                 gen_batch=gen_batch,
+                 actor_rollout_wg=actor_rollout_wg,
+                 envs=envs,
+-                is_train=is_train,
+             )
+         else:
+             # Vanilla Sampling   
+@@ -635,6 +665,7 @@ class TrajectoryCollector:
+                 gen_batch=gen_batch,
+                 actor_rollout_wg=actor_rollout_wg,
+                 envs=envs,
++                is_train=is_train,
+             )
+         assert len(total_batch_list) == len(total_episode_rewards)
+         assert len(total_batch_list) == len(total_episode_lengths)
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index cdc6725..33a6d33 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -233,12 +233,53 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
+         'env_syntax_error': 'env/syntax_error_ratio',
+         'env_python_runtime_error': 'env/python_runtime_error_ratio',
+         'env_python_timeout': 'env/python_timeout_ratio',
++        'env_read_tool_call': 'env/read_tool_call_ratio',
++        'env_write_tool_call': 'env/write_tool_call_ratio',
++        'episode_tool_calls_per_turn': 'episode/tool_calls_per_turn',
++        'episode_multi_call': 'episode/multi_call_ratio',
++        'env_multi_call_partial_failure': 'env/multi_call_partial_failure_rate',
++        'tool_run_python': 'tool/run_python_ratio',
++        'tool_list_sheets': 'tool/list_sheets_ratio',
++        'tool_inspect_range': 'tool/inspect_range_ratio',
++        'tool_find_cells': 'tool/find_cells_ratio',
++        'tool_write_range': 'tool/write_range_ratio',
++        'tool_clear_range': 'tool/clear_range_ratio',
++        'tool_fill_formula': 'tool/fill_formula_ratio',
++        'tool_validate_workbook': 'tool/validate_workbook_ratio',
++        'tool_submit': 'tool/submit_ratio',
+     }
+     for batch_key, metric_key in diagnostic_metrics.items():
+         if batch_key in data.non_tensor_batch:
+             metrics[metric_key] = np.mean(
+                 data.non_tensor_batch[batch_key].astype(np.float32)
+             ).item()
++    for category in ('read', 'write'):
++        call_key = f'env_{category}_tool_call'
++        calls = data.non_tensor_batch.get(call_key)
++        if calls is None:
++            continue
++        call_count = np.sum(calls.astype(np.float32))
++        for outcome in ('success', 'error'):
++            outcome_key = f'env_{category}_tool_{outcome}'
++            if outcome_key in data.non_tensor_batch:
++                outcomes = np.sum(
++                    data.non_tensor_batch[outcome_key].astype(np.float32)
++                )
++                metrics[f'env/{category}_tool_{outcome}_rate'] = (
++                    float(outcomes / call_count) if call_count else 0.0
++                )
++    for batch_key, metric_name in {
++        'reward_workbook_score': 'reward/workbook_score_mean',
++        'reward_execution_penalty': 'reward/execution_penalty_mean',
++        'reward_env_total': 'reward/env_total_mean',
++    }.items():
++        if batch_key in data.non_tensor_batch:
++            metrics[metric_name] = np.mean(
++                data.non_tensor_batch[batch_key].astype(np.float32)
++            ).item()
++    metrics['reward/invalid_action_penalty_mean'] = (
++        invalid_action_penalty_coef * (1.0 - valid_action_ratio)
++    )
+     return data, metrics
+ 
+ def compute_response_mask(data: DataProto):
+@@ -710,6 +751,9 @@ class RayPPOTrainer:
+         tool_calling_list = []
+         traj_uid_list = []
+         success_rate_dict = {}
++        success_rate_weights = {}
++        validation_diagnostics = {}
++        validation_reward_components = {}
+ 
+         # Lists to collect samples for the table
+         sample_inputs = []
+@@ -790,12 +834,38 @@ class RayPPOTrainer:
+             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+             tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
+             traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
++            for key in (
++                'env_read_tool_call', 'env_read_tool_success', 'env_read_tool_error',
++                'env_write_tool_call', 'env_write_tool_success', 'env_write_tool_error',
++                'episode_tool_calls_per_turn', 'episode_multi_call',
++                'env_multi_call_partial_failure', 'tool_fill_formula',
++            ):
++                if key in test_output_gen_batch.non_tensor_batch:
++                    validation_diagnostics.setdefault(key, []).append(
++                        test_output_gen_batch.non_tensor_batch[key].astype(np.float32)
++                    )
++            unique_trajectories = len(np.unique(
++                test_output_gen_batch.non_tensor_batch['traj_uid']
++            ))
++            for key in (
++                'reward_workbook_score', 'reward_execution_penalty',
++                'reward_env_total',
++            ):
++                if key in test_output_gen_batch.non_tensor_batch:
++                    values = test_output_gen_batch.non_tensor_batch[key].astype(np.float32)
++                    validation_reward_components.setdefault(key, []).append(
++                        (float(np.mean(values)), unique_trajectories)
++                    )
+             # success rate
+             for k in test_batch.non_tensor_batch.keys():
+                 if 'success_rate' in k:
+                     if k not in success_rate_dict:
+                         success_rate_dict[k] = []
++                        success_rate_weights[k] = []
+                     success_rate_dict[k].append(test_batch.non_tensor_batch[k][0])
++                    success_rate_weights[k].append(
++                        len(np.unique(test_output_gen_batch.non_tensor_batch['traj_uid']))
++                    )
+                     # all success_rate should be the same
+                     for i in range(1, len(test_batch.non_tensor_batch[k])):
+                         assert test_batch.non_tensor_batch[k][0] == test_batch.non_tensor_batch[k][i], f'not all success_rate are the same, 0: {test_batch.non_tensor_batch[k][0]}, {i}: {test_batch.non_tensor_batch[k][i]}'
+@@ -806,7 +876,10 @@ class RayPPOTrainer:
+         data_sources = np.concatenate(data_source_lst, axis=0)
+         tool_callings = np.concatenate(tool_calling_list, axis=0)
+         traj_uids = np.concatenate(traj_uid_list, axis=0)
+-        success_rate = {k: np.mean(v) for k, v in success_rate_dict.items()}
++        success_rate = {
++            k: np.average(v, weights=success_rate_weights[k])
++            for k, v in success_rate_dict.items()
++        }
+ 
+         # evaluate test_score based on data source
+         data_source_reward = {}
+@@ -841,6 +914,44 @@ class RayPPOTrainer:
+         for k, v in success_rate.items():
+             metric_dict[f'val/{k}'] = v
+ 
++        for key, samples in validation_reward_components.items():
++            metric_name = {
++                'reward_workbook_score': 'reward/workbook_score_mean',
++                'reward_execution_penalty': 'reward/execution_penalty_mean',
++                'reward_env_total': 'reward/env_total_mean',
++            }[key]
++            metric_dict[f'val/{metric_name}'] = float(np.average(
++                [value for value, _ in samples],
++                weights=[weight for _, weight in samples],
++            ))
++
++        for key, values in validation_diagnostics.items():
++            combined = np.concatenate(values, axis=0)
++            metric_name = {
++                'episode_tool_calls_per_turn': 'episode/tool_calls_per_turn',
++                'episode_multi_call': 'episode/multi_call_ratio',
++                'env_multi_call_partial_failure': 'env/multi_call_partial_failure_rate',
++                'tool_fill_formula': 'tool/fill_formula_ratio',
++            }.get(key)
++            if metric_name is not None:
++                metric_dict[f'val/{metric_name}'] = np.mean(combined).item()
++        for category in ('read', 'write'):
++            call_key = f'env_{category}_tool_call'
++            if call_key not in validation_diagnostics:
++                continue
++            call_count = np.sum(np.concatenate(
++                validation_diagnostics[call_key], axis=0
++            ))
++            for outcome in ('success', 'error'):
++                outcome_key = f'env_{category}_tool_{outcome}'
++                if outcome_key in validation_diagnostics:
++                    outcome_count = np.sum(np.concatenate(
++                        validation_diagnostics[outcome_key], axis=0
++                    ))
++                    metric_dict[f'val/env/{category}_tool_{outcome}_rate'] = (
++                        float(outcome_count / call_count) if call_count else 0.0
++                    )
++
+         return metric_dict
+ 
+     def init_workers(self):

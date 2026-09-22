@@ -73,6 +73,17 @@ def test_training_pipeline_logs_spreadsheet_rollout_phase_boundaries() -> None:
     assert "rollout_call=self._rollout_invocation" in rollout_source
 
 
+def test_fetch_verl_agent_reproduces_spreadsheet_metrics_patch() -> None:
+    source = (ROOT / "rl/scripts/fetch_verl_agent.sh").read_text()
+    patch = (ROOT / "rl/integration/verl_agent_spreadsheetbench_metrics.patch").read_text()
+
+    assert "verl_agent_spreadsheetbench_metrics.patch" in source
+    assert "git -C \"$DEST\" apply \"$SPREADSHEET_METRICS_PATCH_FILE\"" in source
+    assert "reward_workbook_score" in patch
+    assert "success_rate_weights" in patch
+    assert "episode_tool_calls_per_turn" in patch
+
+
 def test_loader_scale_smoke_exercises_128_actor_reset_without_model() -> None:
     source = (
         ROOT / "rl/scripts/smoke_spreadsheetbench_loader_scale.py"

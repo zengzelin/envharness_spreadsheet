@@ -372,6 +372,31 @@ def test_worker_stops_batch_after_terminated_action() -> None:
     assert info["tool_executed_count"] == 1
 
 
+def test_worker_stops_batch_after_run_python_failure() -> None:
+    fake = PenalizedSpreadsheetEnv()
+    worker = EnvharnessSpreadsheetWorker(
+        seed=0,
+        data_path="/dataset",
+        max_steps=3,
+        env_factory=lambda: fake,
+    )
+    worker.reset()
+
+    _, reward, done, info = worker.step_many([
+        Action(name="run_python", kwargs={"code": "broken"}),
+        Action(name="submit", kwargs={}),
+    ])
+
+    assert reward == -0.1
+    assert done is False
+    assert [action.name for action in fake.actions] == ["run_python"]
+    assert fake.evaluate_calls == 0
+    assert info["tool_call_count"] == 2
+    assert info["tool_executed_count"] == 1
+    assert info["tool_failure_count"] == 1
+    assert info["multi_call_partial_failure"] is True
+
+
 def test_worker_seeds_keep_each_grpo_group_on_the_same_task() -> None:
     assert _worker_seeds(seed=20, env_num=3, group_n=2) == [20, 20, 21, 21, 22, 22]
 

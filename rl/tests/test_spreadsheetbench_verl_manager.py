@@ -375,6 +375,32 @@ def test_step_diagnostics_preserves_earlier_python_error_in_multi_call() -> None
     assert diagnostics["env/python_error_type"] == "SyntaxError"
 
 
+def test_step_diagnostics_separates_projected_and_executed_call_counts() -> None:
+    diagnostics = SpreadsheetBenchEnvironmentManager._step_diagnostics(
+        {"status": "native_tool_batch", "valid": 1, "invalid": 0},
+        {
+            "tool_call_count": 2,
+            "tool_executed_count": 1,
+            "multi_call": True,
+            "tool_results": [
+                {
+                    "action_name": "run_python",
+                    "ok": False,
+                    "info": {
+                        "python_error": True,
+                        "python_error_type": "SyntaxError",
+                    },
+                },
+            ],
+        },
+    )
+
+    assert diagnostics["episode/tool_calls_per_turn"] == 1
+    assert diagnostics["episode/projected_tool_calls_per_turn"] == 2
+    assert diagnostics["episode/multi_call"] == 0
+    assert diagnostics["episode/projected_multi_call"] == 1
+
+
 class ReadToolVectorEnvs(FakeVectorEnvs):
     def step(self, actions):
         self.actions = actions

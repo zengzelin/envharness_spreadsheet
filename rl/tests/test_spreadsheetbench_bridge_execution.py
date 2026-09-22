@@ -364,6 +364,25 @@ def test_native_basic_fill_formula_rejects_non_formula_without_mutation(
     assert Path(env.state.output_path).read_bytes() == before
 
 
+def test_native_basic_fill_formula_rejects_malformed_formula_without_mutation(
+    tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+    before = Path(env.state.output_path).read_bytes()
+
+    response = env.step(Action(name="fill_formula", kwargs={
+        "start_cell": "C2",
+        "end_row": 4,
+        "formula_template": "=SUM(A2:B2",
+    }))
+
+    assert response.info["tool_ok"] is False
+    assert response.info["tool_error"] == "invalid_formula"
+    assert "unclosed '('" in response.observation.text
+    assert Path(env.state.output_path).read_bytes() == before
+
+
 def test_native_basic_fill_formula_save_failure_preserves_workbook(
     tmp_path: Path, monkeypatch,
 ) -> None:

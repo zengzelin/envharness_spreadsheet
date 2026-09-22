@@ -139,6 +139,112 @@ def _validate_static_value(value: Any) -> None:
         )
 
 
+def _validate_formula_syntax(formula: str) -> None:
+    """Reject structural formula errors that openpyxl otherwise saves silently."""
+    delimiter_pairs = {"(": ")", "{": "}"}
+    closing_delimiters = {value: key for key, value in delimiter_pairs.items()}
+    stack: list[tuple[str, int]] = []
+    quote: str | None = None
+    quote_start = 0
+    index = 0
+    while index < len(formula):
+        character = formula[index]
+        if quote is not None:
+            if character == quote:
+                if index + 1 < len(formula) and formula[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if character in {'"', "'"}:
+            quote = character
+            quote_start = index
+        elif character in delimiter_pairs:
+            stack.append((character, index))
+        elif character in closing_delimiters:
+            expected = closing_delimiters[character]
+            if not stack:
+                raise ReadToolError(
+                    "invalid_formula",
+                    f"formula syntax invalid at position {index + 1}: "
+                    f"unexpected {character!r}",
+                )
+            opening, opening_index = stack[-1]
+            if opening != expected:
+                raise ReadToolError(
+                    "invalid_formula",
+                    f"formula syntax invalid at position {index + 1}: expected "
+                    f"{delimiter_pairs[opening]!r} to close {opening!r} at "
+                    f"position {opening_index + 1}",
+                )
+            stack.pop()
+        index += 1
+
+    if quote is not None:
+        quote_name = "double quote" if quote == '"' else "single quote"
+        raise ReadToolError(
+            "invalid_formula",
+            f"formula syntax invalid at position {quote_start + 1}: "
+            f"unclosed {quote_name}",
+        )
+    if stack:
+        opening, opening_index = stack[-1]
+        raise ReadToolError(
+            "invalid_formula",
+            f"formula syntax invalid at position {opening_index + 1}: "
+            f"unclosed {opening!r}",
+        )
+
+    try:
+        from openpyxl.formula import Tokenizer
+        from openpyxl.formula.tokenizer import TokenizerError
+
+        tokens = [
+            token for token in Tokenizer(formula).items
+            if token.type != "WHITE-SPACE"
+        ]
+    except (IndexError, TokenizerError, ValueError) as exc:
+        raise ReadToolError(
+            "invalid_formula", f"formula syntax invalid: {exc}"
+        ) from None
+    if not tokens:
+        raise ReadToolError("invalid_formula", "formula has no expression")
+
+    for token_index, token in enumerate(tokens):
+        if token.type not in {"OPERATOR-INFIX", "OPERATOR-PREFIX"}:
+            continue
+        previous = tokens[token_index - 1] if token_index else None
+        following = (
+            tokens[token_index + 1]
+            if token_index + 1 < len(tokens)
+            else None
+        )
+        if token.type == "OPERATOR-INFIX" and (
+            previous is None
+            or following is None
+            or previous.type in {"OPERATOR-INFIX", "OPERATOR-PREFIX", "SEP"}
+            or previous.subtype == "OPEN"
+            or following.type in {"OPERATOR-INFIX", "OPERATOR-POSTFIX", "SEP"}
+            or following.subtype == "CLOSE"
+        ):
+            raise ReadToolError(
+                "invalid_formula",
+                f"formula syntax invalid: operator {token.value!r} "
+                "is missing an operand",
+            )
+        if token.type == "OPERATOR-PREFIX" and (
+            following is None
+            or following.type == "SEP"
+            or following.subtype == "CLOSE"
+        ):
+            raise ReadToolError(
+                "invalid_formula",
+                f"formula syntax invalid: operator {token.value!r} "
+                "is missing an operand",
+            )
+
+
 def _write_range(path: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], str]:
     _require_no_unknown(arguments, {"range", "sheet_name", "data"})
     if "data" not in arguments:
@@ -288,6 +394,7 @@ def _fill_formula(path: str, arguments: dict[str, Any]) -> tuple[dict[str, Any],
             "formula_too_large",
             f"formula_template may not exceed {MAX_CELL_CHARS} characters",
         )
+    _validate_formula_syntax(formula)
 
     end_row = arguments.get("end_row", min_row)
     if isinstance(end_row, bool) or not isinstance(end_row, int) or end_row < min_row:
