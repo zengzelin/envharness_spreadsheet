@@ -1,7 +1,8 @@
 diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index 2db3666..3aa7996 100644
 --- a/verl/trainer/ppo/ray_trainer.py
 +++ b/verl/trainer/ppo/ray_trainer.py
-@@ -1035,6 +1035,7 @@ class RayPPOTrainer:
+@@ -1226,6 +1226,7 @@ class RayPPOTrainer:
              pprint(f"Initial validation metrics: {val_metrics}")
              logger.log(data=val_metrics, step=self.global_steps)
              if self.config.trainer.get("val_only", False):
@@ -9,13 +10,14 @@ diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
                  return
  
          # add tqdm
-@@ -1301,4 +1302,5 @@ class RayPPOTrainer:
+@@ -1492,4 +1493,5 @@ class RayPPOTrainer:
                  if is_last_step:
                      pprint(f"Final validation metrics: {last_val_metrics}")
                      progress_bar.close()
 +                    logger.finish()
                      return
 diff --git a/verl/utils/tracking.py b/verl/utils/tracking.py
+index b8573ec..d628b5f 100644
 --- a/verl/utils/tracking.py
 +++ b/verl/utils/tracking.py
 @@ -47,6 +47,7 @@ class Tracking:

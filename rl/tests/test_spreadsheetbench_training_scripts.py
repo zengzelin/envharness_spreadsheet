@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -14,6 +15,17 @@ ROOT = Path(__file__).resolve().parents[2]
 def _load_prepare_module():
     path = ROOT / "rl/scripts/prepare_spreadsheetbench_verl_data.py"
     spec = importlib.util.spec_from_file_location("prepare_spreadsheetbench_verl_data", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_eval_compare_module():
+    path = ROOT / "rl/scripts/compare_spreadsheetbench_evals.py"
+    spec = importlib.util.spec_from_file_location(
+        "compare_spreadsheetbench_evals", path
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -35,8 +47,15 @@ def test_training_pipeline_exports_native_tool_metrics() -> None:
         "tool_fill_formula": "tool/fill_formula_ratio",
         "tool_submit": "tool/submit_ratio",
         "episode_tool_calls_per_turn": "episode/tool_calls_per_turn",
+        "episode_projected_tool_calls_per_turn": "episode/projected_tool_calls_per_turn",
         "episode_multi_call": "episode/multi_call_ratio",
         "env_multi_call_partial_failure": "env/multi_call_partial_failure_rate",
+        "env_multi_call_completed": "env/multi_call_completed_rate",
+        "env_multi_call_all_success": "env/multi_call_all_success_rate",
+        "env_multi_call_short_circuit": "env/multi_call_short_circuit_rate",
+        "env_multi_call_skipped_calls": "env/multi_call_skipped_calls_mean",
+        "env_multi_call_executed_fraction": "env/multi_call_executed_fraction_mean",
+        "env_multi_call_failure_index": "env/multi_call_failure_index_mean",
     }.items():
         assert batch_key in rollout_source
         assert batch_key in trainer_source
@@ -73,6 +92,15 @@ def test_training_pipeline_logs_spreadsheet_rollout_phase_boundaries() -> None:
     assert "rollout_call=self._rollout_invocation" in rollout_source
 
 
+def test_rollout_summary_cli_can_write_multi_call_events() -> None:
+    source = (
+        ROOT / "rl/scripts/summarize_spreadsheetbench_rollouts.py"
+    ).read_text()
+
+    assert '"--multi-call-events-output"' in source
+    assert "collect_multi_call_events" in source
+
+
 def test_fetch_verl_agent_reproduces_spreadsheet_metrics_patch() -> None:
     source = (ROOT / "rl/scripts/fetch_verl_agent.sh").read_text()
     patch = (ROOT / "rl/integration/verl_agent_spreadsheetbench_metrics.patch").read_text()
@@ -82,6 +110,12 @@ def test_fetch_verl_agent_reproduces_spreadsheet_metrics_patch() -> None:
     assert "reward_workbook_score" in patch
     assert "success_rate_weights" in patch
     assert "episode_tool_calls_per_turn" in patch
+    assert "env_multi_call_short_circuit" in patch
+    eval_patch = (
+        ROOT / "rl/integration/verl_agent_spreadsheetbench_eval.patch"
+    ).read_text()
+    assert "SPREADSHEET_EVAL_PATCH_FILE" in source
+    assert 'config.trainer.get("val_only", False)' in eval_patch
 
 
 def test_loader_scale_smoke_exercises_128_actor_reset_without_model() -> None:
@@ -324,6 +358,315 @@ def test_training_dry_run_accepts_spreadsheet_rl_parquet_splits(
     assert "train_split=train_hermes.parquet" in completed.stdout
     assert "val_split=test_verified_hermes.parquet" in completed.stdout
     assert "dry run complete" in completed.stdout
+
+
+def test_eval_submit_dry_run_uses_full_validation_with_bounded_concurrency(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "Spreadsheet-RL"
+    dataset.mkdir()
+    (dataset / "train_hermes.parquet").write_bytes(b"placeholder")
+    (dataset / "test_verified_hermes.parquet").write_bytes(b"placeholder")
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}\n")
+    (model / "model-00001-of-00001.safetensors").write_bytes(b"weights")
+    state_file = tmp_path / "ray_address.env"
+    state_file.write_text(
+        "export RAY_ADDRESS=10.0.0.1:6379\n"
+        "export RAY_DASHBOARD_ADDRESS=http://10.0.0.1:8265\n"
+        "export NNODES=1\n"
+        "export GPUS_PER_NODE=8\n"
+    )
+    env = dict(os.environ)
+    env.update({
+        "DRY_RUN": "1",
+        "RAY_STATE_FILE": str(state_file),
+        "SPREADSHEET_RL_DATA_ROOT": str(dataset),
+        "RUN_ROOT": str(tmp_path / "runs"),
+        "PY": "/usr/bin/python",
+        "VAL_SIZE": "399",
+        "VAL_CONCURRENCY": "64",
+    })
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "rl/scripts/submit_spreadsheetbench_eval.sh"),
+            f"step50={model}",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "[spreadsheet-eval] label=step50" in completed.stdout
+    assert '"VAL_SIZE": "399"' in completed.stdout
+    assert '"VAL_CONCURRENCY": "64"' in completed.stdout
+    assert '"TRAIN_BS": "8"' in completed.stdout
+    assert '"PPO_MINI_BS": "8"' in completed.stdout
+    assert '"GROUP_N": "1"' in completed.stdout
+    assert '"EXTRA_HYDRA": "trainer.val_only=True"' in completed.stdout
+    assert '"SPREADSHEETBENCH_TOOL_SET": "native_basic"' in completed.stdout
+    assert '"MODEL": "' + str(model) + '"' in completed.stdout
+
+
+def test_eval_submit_rejects_model_without_weights(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}\n")
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "rl/scripts/submit_spreadsheetbench_eval.sh"),
+            f"broken={model}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 2
+    assert "model weights not found" in completed.stderr
+
+
+def _write_eval_run(
+    run_dir: Path,
+    outcomes: dict[str, bool],
+    *,
+    python_error_tasks: set[str] | None = None,
+    write_success_tasks: set[str] | None = None,
+    evaluator_error_tasks: set[str] | None = None,
+    environment_overrides: dict[str, str] | None = None,
+) -> None:
+    trajectory_dir = run_dir / "rollouts/env/val"
+    trajectory_dir.mkdir(parents=True)
+    environment = {
+        "MODEL": "test-model",
+        "SPREADSHEETBENCH_DATA_FORMAT": "spreadsheet_rl",
+        "SPREADSHEET_RL_VAL_FILE": "test_verified_hermes.parquet",
+        "VAL_SIZE": str(len(outcomes)),
+        "MAX_STEPS": "15",
+        "MAX_PROMPT_LENGTH": "8192",
+        "MAX_RESPONSE_LENGTH": "16384",
+        "APPLY_CHAT_TEMPLATE_ENABLE_THINKING": "True",
+        "ENVHARNESS_DISABLE_THINKING": "0",
+        "VAL_TEMPERATURE": "0",
+        "VAL_DO_SAMPLE": "False",
+        "SPREADSHEETBENCH_TOOL_SET": "native_basic",
+        "SPREADSHEETBENCH_HISTORY_MODE": "compact",
+        "SPREADSHEETBENCH_HISTORY_ACTION_CHARS": "1200",
+        "SPREADSHEETBENCH_HISTORY_OBS_CHARS": "2000",
+        "ROLLOUT_MAX_MODEL_LEN": "24576",
+        "ROLLOUT_MAX_NUM_BATCHED_TOKENS": "32768",
+    }
+    environment.update(environment_overrides or {})
+    (run_dir / "run_manifest.json").write_text(json.dumps({
+        "manifest_version": 2,
+        "git_commit": "abc123",
+        "environment": environment,
+    }))
+    python_error_tasks = python_error_tasks or set()
+    write_success_tasks = write_success_tasks or set()
+    evaluator_error_tasks = evaluator_error_tasks or set()
+    for index, (task_id, won) in enumerate(outcomes.items()):
+        diagnostics = {
+            "env/python_error": int(task_id in python_error_tasks),
+            "env/write_tool_call": 1,
+            "env/write_tool_success": int(task_id in write_success_tasks),
+            "env/write_tool_error": int(task_id not in write_success_tasks),
+        }
+        payload = {
+            "task_id": task_id,
+            "steps": [{
+                "action_valid": True,
+                "projected_action": {"name": "write_range"},
+                "diagnostics": diagnostics,
+            }],
+            "final_info": (
+                {
+                    "won": False,
+                    "submitted": True,
+                    "error": "eval_error: LibreOffice recalc failed",
+                }
+                if task_id in evaluator_error_tasks
+                else {"won": won, "submitted": True}
+            ),
+        }
+        (trajectory_dir / f"{index}.json").write_text(json.dumps(payload))
+
+
+def test_compare_evals_reports_paired_outcomes_and_diagnostics(
+    tmp_path: Path,
+) -> None:
+    module = _load_eval_compare_module()
+    base = tmp_path / "base"
+    candidate = tmp_path / "candidate"
+    _write_eval_run(
+        base,
+        {"a": True, "b": True, "c": False, "d": False},
+        python_error_tasks={"d"},
+        write_success_tasks={"a", "b"},
+    )
+    _write_eval_run(
+        candidate,
+        {"a": True, "b": False, "c": True, "d": True},
+        write_success_tasks={"a", "c", "d"},
+    )
+
+    report = module.compare_runs(base, [candidate], expected_tasks=4)
+
+    assert report["base"]["success_count"] == 2
+    assert report["base"]["valid_task_count"] == 4
+    assert len(report["base"]["success_rate_ci95"]) == 2
+    compared = report["candidates"][0]
+    assert compared["success_count"] == 3
+    assert {
+        key: compared["paired"][key]
+        for key in (
+            "both_success", "base_only", "candidate_only", "both_failed",
+            "net_success_gain", "paired_task_count",
+            "excluded_evaluator_error",
+        )
+    } == {
+        "both_success": 1,
+        "base_only": 1,
+        "candidate_only": 2,
+        "both_failed": 0,
+        "net_success_gain": 1,
+        "paired_task_count": 4,
+        "excluded_evaluator_error": 0,
+    }
+    assert compared["task_results"] == [
+        {
+            "task_id": "a",
+            "base_won": True,
+            "candidate_won": True,
+            "transition": "both_success",
+        },
+        {
+            "task_id": "b",
+            "base_won": True,
+            "candidate_won": False,
+            "transition": "base_only",
+        },
+        {
+            "task_id": "c",
+            "base_won": False,
+            "candidate_won": True,
+            "transition": "candidate_only",
+        },
+        {
+            "task_id": "d",
+            "base_won": False,
+            "candidate_won": True,
+            "transition": "candidate_only",
+        },
+    ]
+    assert report["base"]["python_error_ratio"] == pytest.approx(0.25)
+    assert compared["write_call_success_rate"] == pytest.approx(0.75)
+    assert 0.0 <= compared["paired"]["mcnemar_exact_pvalue"] <= 1.0
+
+
+def test_compare_evals_rejects_mismatched_task_sets(tmp_path: Path) -> None:
+    module = _load_eval_compare_module()
+    base = tmp_path / "base"
+    candidate = tmp_path / "candidate"
+    _write_eval_run(base, {"a": True, "b": False})
+    _write_eval_run(candidate, {"a": True, "c": False})
+
+    with pytest.raises(ValueError, match="task set mismatch"):
+        module.compare_runs(base, [candidate], expected_tasks=2)
+
+
+def test_compare_evals_rejects_behavioral_config_mismatch(tmp_path: Path) -> None:
+    module = _load_eval_compare_module()
+    base = tmp_path / "base"
+    candidate = tmp_path / "candidate"
+    _write_eval_run(base, {"a": True})
+    _write_eval_run(
+        candidate,
+        {"a": True},
+        environment_overrides={"MAX_STEPS": "10"},
+    )
+
+    with pytest.raises(ValueError, match="evaluation config mismatch.*MAX_STEPS"):
+        module.compare_runs(base, [candidate], expected_tasks=1)
+
+    report = module.compare_runs(
+        base,
+        [candidate],
+        expected_tasks=1,
+        allow_config_mismatch=True,
+    )
+    assert report["candidates"][0]["config_mismatches"]["MAX_STEPS"] == {
+        "base": "15",
+        "candidate": "10",
+    }
+
+
+def test_compare_evals_rejects_evaluator_errors_by_default(tmp_path: Path) -> None:
+    module = _load_eval_compare_module()
+    base = tmp_path / "base"
+    candidate = tmp_path / "candidate"
+    _write_eval_run(base, {"a": True, "b": False})
+    _write_eval_run(
+        candidate,
+        {"a": True, "b": False},
+        evaluator_error_tasks={"b"},
+    )
+
+    with pytest.raises(ValueError, match="evaluator error"):
+        module.compare_runs(base, [candidate], expected_tasks=2)
+
+    report = module.compare_runs(
+        base,
+        [candidate],
+        expected_tasks=2,
+        allow_evaluator_errors=True,
+    )
+    compared = report["candidates"][0]
+    assert compared["evaluator_error_count"] == 1
+    assert compared["valid_task_count"] == 1
+    assert compared["paired"]["paired_task_count"] == 1
+    assert compared["paired"]["excluded_evaluator_error"] == 1
+    assert compared["task_results"][1]["transition"] == "evaluator_error"
+
+
+def test_eval_manifest_records_behavioral_comparison_fields() -> None:
+    source = (ROOT / "rl/scripts/run_spreadsheetbench_grpo.sh").read_text()
+    manifest_source = source[source.index("keys = ["):]
+
+    for name in (
+        "APPLY_CHAT_TEMPLATE_ENABLE_THINKING",
+        "ENVHARNESS_DISABLE_THINKING",
+        "VAL_TEMPERATURE",
+        "VAL_DO_SAMPLE",
+        "ROLLOUT_MAX_MODEL_LEN",
+        "ROLLOUT_MAX_NUM_BATCHED_TOKENS",
+    ):
+        assert f'"{name}"' in manifest_source
+        assert f"export {name}" in source or f" {name}" in source[
+            source.index("export VAL_TEMPERATURE"):source.index("if [[", source.index("export VAL_TEMPERATURE"))
+        ]
+
+
+def test_val_only_spreadsheet_env_skips_train_actor_pool() -> None:
+    source = (
+        ROOT / "third_party/verl-agent/agent_system/environments/env_manager.py"
+    ).read_text()
+    spreadsheet_route = source[
+        source.index('startswith("envharness_rl/spreadsheetbench")'):
+        source.index('    if "search" in config.env.env_name.lower():')
+    ]
+
+    assert '_val_only = bool(config.trainer.get("val_only", False))' in spreadsheet_route
+    assert "trainer.val_only=True requires trainer.val_before_train=True" in spreadsheet_route
+    assert "if not _val_only:" in spreadsheet_route
+    assert "envs = None" in spreadsheet_route
 
 
 def test_full_training_uses_qwen3_4b_for_150_steps_and_periodic_checkpoints(

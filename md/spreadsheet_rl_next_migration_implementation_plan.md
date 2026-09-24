@@ -411,8 +411,8 @@ git commit -m "feat: execute spreadsheet multi-call turns"
 **Interfaces:**
 - Produces metrics: `episode/tool_calls_per_turn`、`episode/multi_call_ratio`、`env/multi_call_partial_failure_rate`。
 
-- [ ] **Step 1: 写 trainer/source 导出和离线 summary 测试**
-- [ ] **Step 2: 实现 batch field 传递、train/val aggregate 和 trajectory summary**
+- [x] **Step 1: 写 trainer/source 导出和离线 summary 测试**
+- [x] **Step 2: 实现 batch field 传递、train/val aggregate 和 trajectory summary**
 - [ ] **Step 3: 运行全部 `rl/tests`**
 - [ ] **Step 4: 运行单 worker multi-call smoke，验证一轮两个 read 只消耗一个 turn**
 - [ ] **Step 5: 运行 5-step 固定 task A/B**
@@ -420,6 +420,10 @@ git commit -m "feat: execute spreadsheet multi-call turns"
 Gate: 平均 episode length 相对单 call 版下降，目标不高于 7.5；固定 64 成功率不下降；单步 wall time 下降或持平。
 
 - [ ] **Step 6: 提交指标与验收记录**
+
+2026-09-24 补充：代码侧已进一步区分 projected/executed/skipped、completed、all-success、
+short-circuit、首个失败位置和停止原因，并支持逐 turn JSONL badcase 导出。Step 3/4/5
+仍必须在 Python 3.11 训练镜像和真实 Ray 环境完成，不能以静态检查替代。
 
 ```bash
 git add third_party/verl-agent/agent_system/multi_turn_rollout/rollout_loop.py third_party/verl-agent/verl/trainer/ppo/ray_trainer.py rl/envharness_rl/spreadsheetbench/rollout_summary.py rl/scripts/summarize_spreadsheetbench_rollouts.py rl/tests/test_spreadsheetbench_training_scripts.py rl/tests/test_spreadsheetbench_rollout_summary.py

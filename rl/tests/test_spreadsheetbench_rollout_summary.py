@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from envharness_rl.spreadsheetbench.rollout_summary import summarize_trajectories
+from envharness_rl.spreadsheetbench.rollout_summary import (
+    collect_multi_call_events,
+    summarize_trajectories,
+)
 
 
 def test_summary_counts_tools_errors_submission_and_success(tmp_path: Path) -> None:
@@ -110,3 +113,126 @@ def test_summary_separates_projected_and_executed_tool_calls(tmp_path: Path) -> 
     assert summary["multi_call_ratio"] == 0.0
     assert summary["projected_multi_call_ratio"] == 1.0
     assert summary["multi_call_partial_failure_rate"] == 1.0
+
+
+def test_summary_reports_per_call_and_per_turn_write_success(tmp_path: Path) -> None:
+    path = tmp_path / "trajectory.json"
+    path.write_text(json.dumps({
+        "task_id": "task-1",
+        "final_info": {"won": False},
+        "steps": [{
+            "action_valid": True,
+            "projected_actions": [
+                {"name": "write_range"},
+                {"name": "fill_formula"},
+            ],
+            "info": {"tool_results": [
+                {"action_name": "write_range", "ok": True, "info": {}},
+                {"action_name": "fill_formula", "ok": False, "info": {
+                    "tool_error": "ValueError",
+                }},
+            ]},
+            "diagnostics": {
+                "env/write_tool_call": 1,
+                "env/write_tool_success": 0,
+                "env/write_tool_error": 1,
+            },
+        }],
+    }))
+
+    summary = summarize_trajectories([path])
+
+    assert summary["write_call_count"] == 2
+    assert summary["write_call_success_rate"] == 0.5
+    assert summary["write_turn_all_success_rate"] == 0.0
+    assert summary["episodes_with_write_error_rate"] == 1.0
+
+
+def test_summary_reports_multi_call_completion_and_stop_reasons(tmp_path: Path) -> None:
+    completed = tmp_path / "completed.json"
+    completed.write_text(json.dumps({
+        "task_id": "completed",
+        "final_info": {"won": True},
+        "steps": [{
+            "projected_actions": [
+                {"name": "list_sheets"},
+                {"name": "inspect_range"},
+            ],
+            "info": {
+                "tool_results": [
+                    {"action_index": 0, "action_name": "list_sheets", "ok": True},
+                    {"action_index": 1, "action_name": "inspect_range", "ok": True},
+                ],
+                "multi_call_stop_reason": "completed",
+            },
+            "diagnostics": {
+                "env/multi_call_completed": 1,
+                "env/multi_call_all_success": 1,
+                "env/multi_call_short_circuit": 0,
+                "env/multi_call_skipped_calls": 0,
+                "env/multi_call_executed_fraction": 1.0,
+                "env/multi_call_failure_index": -1,
+            },
+        }],
+    }))
+    failed = tmp_path / "failed.json"
+    failed.write_text(json.dumps({
+        "task_id": "failed",
+        "final_info": {"won": False},
+        "steps": [{
+            "projected_actions": [
+                {"name": "run_python"},
+                {"name": "submit"},
+            ],
+            "info": {
+                "tool_results": [
+                    {"action_index": 0, "action_name": "run_python", "ok": False},
+                ],
+                "multi_call_stop_reason": "run_python_failure",
+            },
+            "diagnostics": {
+                "env/multi_call_partial_failure": 1,
+                "env/multi_call_completed": 0,
+                "env/multi_call_all_success": 0,
+                "env/multi_call_short_circuit": 1,
+                "env/multi_call_skipped_calls": 1,
+                "env/multi_call_executed_fraction": 0.5,
+                "env/multi_call_failure_index": 0,
+            },
+        }],
+    }))
+
+    summary = summarize_trajectories([completed, failed])
+
+    assert summary["multi_call_projected_turns"] == 2
+    assert summary["multi_call_executed_turns"] == 1
+    assert summary["multi_call_completed_rate"] == 0.5
+    assert summary["multi_call_all_success_rate"] == 0.5
+    assert summary["multi_call_short_circuit_rate"] == 0.5
+    assert summary["multi_call_mean_executed_fraction"] == 0.75
+    assert summary["multi_call_skipped_call_count"] == 1
+    assert summary["multi_call_stop_reasons"] == {
+        "completed": 1,
+        "run_python_failure": 1,
+    }
+    assert summary["multi_call_failure_indexes"] == {"0": 1}
+
+    events = collect_multi_call_events([completed, failed])
+    assert events[1] == {
+        "task_id": "failed",
+        "trajectory": str(failed),
+        "step": 1,
+        "projected_tools": ["run_python", "submit"],
+        "executed_tools": ["run_python"],
+        "projected_count": 2,
+        "executed_count": 1,
+        "skipped_count": 1,
+        "completed": False,
+        "all_success": False,
+        "short_circuit": True,
+        "partial_failure": True,
+        "stop_reason": "run_python_failure",
+        "failure_index": 0,
+        "failure_tool": "run_python",
+        "failure_error_type": "",
+    }

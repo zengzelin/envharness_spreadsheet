@@ -110,6 +110,58 @@ def test_manager_executes_and_records_multiple_calls_from_one_model_turn(
     assert infos[0]["parser/invalid"] == 0
 
 
+class ShortCircuitVectorEnvs(FakeVectorEnvs):
+    def step_many(self, action_batches):
+        result = self.step([batch[0] for batch in action_batches])
+        for batch, info in zip(action_batches, result[4]):
+            info.update({
+                "tool_call_count": len(batch),
+                "tool_executed_count": 1,
+                "tool_skipped_count": len(batch) - 1,
+                "tool_success_count": 0,
+                "tool_failure_count": 1,
+                "multi_call": True,
+                "multi_call_partial_failure": True,
+                "multi_call_completed": False,
+                "multi_call_all_success": False,
+                "multi_call_short_circuit": True,
+                "multi_call_stop_reason": "run_python_failure",
+                "multi_call_failure_index": 0,
+                "multi_call_executed_fraction": 0.5,
+                "tool_results": [{
+                    "action_index": 0,
+                    "action_name": "run_python",
+                    "ok": False,
+                    "info": {"python_error": True},
+                }],
+            })
+        return result
+
+
+def test_manager_exports_multi_call_short_circuit_diagnostics() -> None:
+    envs = ShortCircuitVectorEnvs()
+    config = SimpleNamespace(env=SimpleNamespace(history_length=2))
+    manager = SpreadsheetBenchEnvironmentManager(
+        envs, envharness_spreadsheetbench_projection, config
+    )
+    manager.reset(kwargs={})
+
+    _, _, _, infos = manager.step([
+        '<tool_call>{"name":"run_python","arguments":{"code":"broken"}}</tool_call>'
+        '<tool_call>{"name":"submit","arguments":{}}</tool_call>'
+    ])
+
+    assert infos[0]["episode/projected_tool_calls_per_turn"] == 2
+    assert infos[0]["episode/tool_calls_per_turn"] == 1
+    assert infos[0]["env/multi_call_skipped_calls"] == 1
+    assert infos[0]["env/multi_call_completed"] == 0
+    assert infos[0]["env/multi_call_all_success"] == 0
+    assert infos[0]["env/multi_call_short_circuit"] == 1
+    assert infos[0]["env/multi_call_failure_index"] == 0
+    assert infos[0]["env/multi_call_executed_fraction"] == 0.5
+    assert infos[0]["env/multi_call_stop_reason"] == "run_python_failure"
+
+
 def test_validation_manager_resets_exact_parquet_task_indexes() -> None:
     envs = FakeVectorEnvs()
     config = SimpleNamespace(env=SimpleNamespace(history_length=2))

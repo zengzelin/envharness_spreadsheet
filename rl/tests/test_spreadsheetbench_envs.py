@@ -370,6 +370,11 @@ def test_worker_stops_batch_after_terminated_action() -> None:
     assert [action.name for action in fake.actions] == ["submit"]
     assert info["tool_call_count"] == 2
     assert info["tool_executed_count"] == 1
+    assert info["tool_skipped_count"] == 1
+    assert info["multi_call_completed"] is False
+    assert info["multi_call_short_circuit"] is True
+    assert info["multi_call_stop_reason"] == "terminated"
+    assert info["multi_call_failure_index"] == -1
 
 
 def test_worker_stops_batch_after_run_python_failure() -> None:
@@ -393,8 +398,40 @@ def test_worker_stops_batch_after_run_python_failure() -> None:
     assert fake.evaluate_calls == 0
     assert info["tool_call_count"] == 2
     assert info["tool_executed_count"] == 1
+    assert info["tool_skipped_count"] == 1
     assert info["tool_failure_count"] == 1
     assert info["multi_call_partial_failure"] is True
+    assert info["multi_call_completed"] is False
+    assert info["multi_call_all_success"] is False
+    assert info["multi_call_short_circuit"] is True
+    assert info["multi_call_stop_reason"] == "run_python_failure"
+    assert info["multi_call_failure_index"] == 0
+    assert info["multi_call_executed_fraction"] == 0.5
+
+
+def test_worker_reports_completed_multi_call_diagnostics() -> None:
+    fake = FakeSpreadsheetEnv()
+    worker = EnvharnessSpreadsheetWorker(
+        seed=0,
+        data_path="/dataset",
+        max_steps=3,
+        env_factory=lambda: fake,
+    )
+    worker.reset()
+
+    _, _, done, info = worker.step_many([
+        Action(name="list_sheets", kwargs={}),
+        Action(name="inspect_range", kwargs={"range": "A1"}),
+    ])
+
+    assert done is False
+    assert info["tool_skipped_count"] == 0
+    assert info["multi_call_completed"] is True
+    assert info["multi_call_all_success"] is True
+    assert info["multi_call_short_circuit"] is False
+    assert info["multi_call_stop_reason"] == "completed"
+    assert info["multi_call_failure_index"] == -1
+    assert info["multi_call_executed_fraction"] == 1.0
 
 
 def test_worker_seeds_keep_each_grpo_group_on_the_same_task() -> None:

@@ -760,3 +760,78 @@ validation_concurrency = 32 或 64
 pytest/openpyxl。因此这里只完成了 shell 语法、diff 和静态代码检查；必须在训练镜像
 运行完整 `rl/tests`、formula worker smoke、399/64 validation smoke 和 5-step GRPO
 后，才能把本节状态从“代码完成”升级为“运行验收完成”。
+
+## 21. 2026-09-24：专用评测工具实施进展
+
+为避免继续手工拼接 `trainer.val_only=True` 命令和人工读取聚合日志，本轮新增：
+
+1. `rl/scripts/submit_spreadsheetbench_eval.sh`
+   - 输入一个或多个 `LABEL=MODEL`；
+   - 只接受带 `config.json` 和模型权重的 Hugging Face 目录，不接受 optimizer resume
+     checkpoint；
+   - 默认完整评测 399 条，最多并发 64 个 validation actor；
+   - 固定确定性 validation、Spreadsheet-RL verified split、`native_basic` 和 compact
+     history；
+   - 每个模型单独建立 run 目录并顺序提交，前一个失败时停止后续评测。
+2. `rl/scripts/compare_spreadsheetbench_evals.py`
+   - 要求 evaluation-only run 中每个 task ID 恰好出现一次；
+   - 检查 Base/Candidate task ID 集合完全一致；
+   - 输出 success count/rate、paired gain/loss、Python error、write success 和 multi-call
+     partial failure；
+   - 支持聚合 JSON/Markdown 和逐任务 JSONL 结果落盘。
+
+当前 2-node Ray state 上的 dry-run 已确认 launcher 将 `VAL_SIZE=399`、
+`VAL_CONCURRENCY=64` 和 `trainer.val_only=True` 传入 Ray runtime env，且 checkpoint
+预检查可以识别 `global_step_50/actor/huggingface`。完整 pytest 和真实 399-task job 仍需
+在训练镜像执行后，才能关闭评测工具的运行验收项。
+
+下一步顺序保持不变：先用该工具完成新代码下 Base/step 50 的 399 条 paired evaluation；
+若 success rate 不低于 Base，再按 badcase 频次进入 `format_range`、行列操作和 sheet 管理
+工具迁移。数据 split ID/hash 重叠审计和 manifest 数据 hash 仍是评测基础设施的剩余项。
+
+### 21.1 评测工具代码审查后的修正
+
+后续审查发现第一版 launcher/comparison 仍有五个风险：配置不同仍可比较、LibreOffice
+`eval_error` 被算作策略失败、val-only 创建 128 个无用 train actors、缺少置信区间，以及
+multi-call 写工具指标实际按 turn 而非 call 统计。现已完成对应修正：
+
+1. comparison 对 manifest 中的关键行为配置执行严格一致性检查；缺字段同样视为不可比。
+2. evaluator error 默认中止正式比较；诊断模式可显式放行，但从有效任务和 paired 分母排除。
+3. 输出 success-rate Wilson 95% CI、paired delta 95% CI、exact McNemar p-value、
+   evaluator error 数和任务 ID。
+4. 新增逐写调用、逐写 turn 和 episode 级错误指标，原
+   `write_tool_success_rate` 仅作为向后兼容字段保留。
+5. `trainer.val_only=True` 时 SpreadsheetBench route 只创建 validation actor pool；对应变更
+   保存于 `rl/integration/verl_agent_spreadsheetbench_eval.patch`，新 checkout 可通过
+   `fetch_verl_agent.sh` 复现。
+6. manifest 升级为 version 2，并补齐 thinking、validation sampling、vLLM rollout 长度等
+   比较字段。
+
+当前宿主环境已完成 shell 语法、Python 语法、integration patch 可应用性以及 comparison/
+rollout-summary 的无 pytest 行为测试。完整 `PYTHONPATH=.:rl:third_party/verl-agent python -m
+pytest -q rl/tests` 仍需在 Python 3.11 训练镜像运行。
+
+### 21.2 2026-09-24：multi-call 诊断强化
+
+原有指标只能看到“模型输出了几个调用”和“该 turn 是否部分失败”，无法区分完整执行、
+因失败提前停止、因 `submit` 终止以及究竟跳过了几个调用。本轮补齐以下三级诊断：
+
+1. worker 在每个 turn 记录 projected/executed/skipped call 数、首个失败位置、执行比例、
+   是否完整执行、是否全部成功、是否短路，以及 `completed`、`terminated`、`truncated`、
+   `<tool>_failure`、`completed_with_failure` 等停止原因。
+2. manager 和 verl rollout 将数值字段传入 train/val batch。WandB 新增
+   `episode/projected_tool_calls_per_turn`、`episode/projected_multi_call_ratio`、
+   `env/multi_call_completed_rate`、`env/multi_call_all_success_rate`、
+   `env/multi_call_short_circuit_rate`、`env/multi_call_skipped_calls_mean` 和
+   `env/multi_call_executed_fraction_mean`；发生失败时另记
+   `env/multi_call_failure_index_mean`。这些 outcome 只在 projected multi-call turn
+   上计算，避免单调用 turn 稀释结果。
+3. 离线 summary 新增停止原因和失败位置分布；
+   `summarize_spreadsheetbench_rollouts.py --multi-call-events-output FILE.jsonl`
+   可以导出逐任务、逐 turn 的调用序列、短路位置和失败工具，直接用于 badcase 排查。
+
+评测 comparison 同步展示 multi-call 完整执行率和短路率，并在 JSON 中保留全部新增聚合。
+`verl_agent_spreadsheetbench_metrics.patch` 和 tracking patch 已按实际应用顺序重建，并已在
+干净的 pinned verl-agent checkout 上验证整套 patch 可顺序应用。当前宿主完成 Python 3.8
+语法检查和离线聚合行为检查；Python 3.11 训练镜像中的完整 `rl/tests` 及真实 rollout
+验收仍待执行。

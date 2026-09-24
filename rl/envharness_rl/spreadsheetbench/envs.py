@@ -246,6 +246,7 @@ class EnvharnessSpreadsheetWorker:
         tool_results: list[dict[str, Any]] = []
         terminated = False
         truncated = False
+        stop_reason = "completed"
         for action_index, projected in enumerate(projected_actions):
             print(
                 f"[spreadsheet-worker] worker_index={self._worker_index} "
@@ -287,7 +288,11 @@ class EnvharnessSpreadsheetWorker:
             })
             terminated = bool(response.terminated)
             truncated = bool(response.truncated)
-            if terminated or truncated:
+            if terminated:
+                stop_reason = "terminated"
+                break
+            if truncated:
+                stop_reason = "truncated"
                 break
             if action_failed and (
                 projected.name == "invalid"
@@ -295,6 +300,7 @@ class EnvharnessSpreadsheetWorker:
                 or projected.name in NATIVE_WRITE_TOOLS
                 or sub_info.get("tool_category") == "write"
             ):
+                stop_reason = f"{projected.name}_failure"
                 break
 
         self._episode_steps += 1
@@ -306,16 +312,33 @@ class EnvharnessSpreadsheetWorker:
         self._execution_penalty += reward
         success_count = sum(int(result["ok"]) for result in tool_results)
         failure_count = len(tool_results) - success_count
+        projected_count = len(projected_actions)
+        executed_count = len(tool_results)
+        skipped_count = projected_count - executed_count
+        failure_index = next((
+            int(result["action_index"])
+            for result in tool_results if not result["ok"]
+        ), -1)
+        completed = executed_count == projected_count
+        if stop_reason == "completed" and failure_count:
+            stop_reason = "completed_with_failure"
         info.update({
             "tool_results": tool_results,
-            "tool_call_count": len(projected_actions),
-            "tool_executed_count": len(tool_results),
+            "tool_call_count": projected_count,
+            "tool_executed_count": executed_count,
+            "tool_skipped_count": skipped_count,
             "tool_success_count": success_count,
             "tool_failure_count": failure_count,
-            "multi_call": len(projected_actions) > 1,
+            "multi_call": projected_count > 1,
             "multi_call_partial_failure": bool(
-                len(projected_actions) > 1 and failure_count
+                projected_count > 1 and failure_count
             ),
+            "multi_call_completed": completed,
+            "multi_call_all_success": bool(completed and not failure_count),
+            "multi_call_short_circuit": bool(skipped_count),
+            "multi_call_stop_reason": stop_reason,
+            "multi_call_failure_index": failure_index,
+            "multi_call_executed_fraction": executed_count / projected_count,
         })
 
         if done:

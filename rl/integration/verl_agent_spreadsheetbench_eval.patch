@@ -1,0 +1,46 @@
+diff --git a/agent_system/environments/env_manager.py b/agent_system/environments/env_manager.py
+--- a/agent_system/environments/env_manager.py
++++ b/agent_system/environments/env_manager.py
+@@ -666,14 +666,24 @@ def make_envs(config):
+             _val_reset_options["split_file"] = os.environ.get(
+                 "SPREADSHEET_RL_VAL_FILE", "test_verified_hermes.parquet"
+             )
+-        _envs = build_envharness_spreadsheetbench_envs(
+-            seed=config.env.seed,
+-            env_num=config.data.train_batch_size,
+-            group_n=group_n,
+-            resources_per_worker=resources_per_worker,
+-            is_train=True,
+-            env_kwargs=_train_reset_options,
+-        )
++        _val_only = bool(config.trainer.get("val_only", False))
++        if _val_only and not bool(config.trainer.get("val_before_train", True)):
++            raise ValueError(
++                "trainer.val_only=True requires trainer.val_before_train=True"
++            )
++        envs = None
++        if not _val_only:
++            _envs = build_envharness_spreadsheetbench_envs(
++                seed=config.env.seed,
++                env_num=config.data.train_batch_size,
++                group_n=group_n,
++                resources_per_worker=resources_per_worker,
++                is_train=True,
++                env_kwargs=_train_reset_options,
++            )
++            envs = SpreadsheetBenchEnvironmentManager(
++                _envs, envharness_spreadsheetbench_projection, config,
++                split="train")
+         _val_envs = build_envharness_spreadsheetbench_envs(
+             seed=config.env.seed + 1000,
+             env_num=config.data.val_batch_size,
+@@ -682,9 +692,6 @@ def make_envs(config):
+             is_train=False,
+             env_kwargs=_val_reset_options,
+         )
+-        envs = SpreadsheetBenchEnvironmentManager(
+-            _envs, envharness_spreadsheetbench_projection, config,
+-            split="train")
+         val_envs = SpreadsheetBenchEnvironmentManager(
+             _val_envs, envharness_spreadsheetbench_projection, config,
+             split="val")

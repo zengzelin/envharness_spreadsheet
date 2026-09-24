@@ -280,6 +280,16 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
         executed_call_count = int(
             env_info.get("tool_executed_count", projected_call_count)
         )
+        is_projected_multi_call = bool(
+            env_info.get("multi_call", projected_call_count > 1)
+        )
+        skipped_call_count = int(env_info.get(
+            "tool_skipped_count",
+            max(projected_call_count - executed_call_count, 0),
+        ))
+        completed = bool(env_info.get(
+            "multi_call_completed", executed_call_count == projected_call_count
+        ))
         result = {
             "parser/status": parser_diagnostic.get("status", "unknown"),
             "parser/native_valid": int(
@@ -327,12 +337,38 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             "episode/tool_calls_per_turn": executed_call_count,
             "episode/projected_tool_calls_per_turn": projected_call_count,
             "episode/multi_call": int(executed_call_count > 1),
-            "episode/projected_multi_call": int(
-                bool(env_info.get("multi_call", projected_call_count > 1))
-            ),
+            "episode/projected_multi_call": int(is_projected_multi_call),
             "env/multi_call_partial_failure": int(bool(
                 env_info.get("multi_call_partial_failure", False)
             )),
+            "env/multi_call_completed": int(
+                is_projected_multi_call and completed
+            ),
+            "env/multi_call_all_success": int(
+                is_projected_multi_call
+                and bool(env_info.get("multi_call_all_success", False))
+            ),
+            "env/multi_call_short_circuit": int(
+                is_projected_multi_call and bool(env_info.get(
+                    "multi_call_short_circuit", skipped_call_count > 0
+                ))
+            ),
+            "env/multi_call_skipped_calls": (
+                skipped_call_count if is_projected_multi_call else 0
+            ),
+            "env/multi_call_executed_fraction": (
+                float(env_info.get(
+                    "multi_call_executed_fraction",
+                    executed_call_count / projected_call_count
+                    if projected_call_count else 0.0,
+                )) if is_projected_multi_call else 0.0
+            ),
+            "env/multi_call_failure_index": int(
+                env_info.get("multi_call_failure_index", -1)
+            ),
+            "env/multi_call_stop_reason": str(
+                env_info.get("multi_call_stop_reason", "unknown")
+            ),
         }
         for name in (
             "run_python", "list_sheets", "inspect_range", "find_cells",

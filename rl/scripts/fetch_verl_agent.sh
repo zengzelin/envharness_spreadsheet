@@ -30,6 +30,8 @@
 #      -- phase heartbeats around environment and model rollout calls.
 #   6. apply rl/integration/verl_agent_spreadsheetbench_metrics.patch --
 #      native-tool metrics, weighted validation, and reward components.
+#   7. apply rl/integration/verl_agent_spreadsheetbench_eval.patch -- avoid
+#      allocating unused training environment actors for val-only jobs.
 #
 # The result lands at third_party/verl-agent/ (gitignored). Optional extras
 # (DAPO / Qwen3-8B / webshop / SWE-Gym) live in
@@ -54,6 +56,7 @@ TRACKING_PATCH_FILE="$ROOT/rl/integration/verl_agent_tracking_lifecycle.patch"
 SPREADSHEET_RUNTIME_PATCH_FILE="$ROOT/rl/integration/verl_agent_spreadsheetbench_runtime.patch"
 SPREADSHEET_STALL_PATCH_FILE="$ROOT/rl/integration/verl_agent_spreadsheetbench_stall_diagnostics.patch"
 SPREADSHEET_METRICS_PATCH_FILE="$ROOT/rl/integration/verl_agent_spreadsheetbench_metrics.patch"
+SPREADSHEET_EVAL_PATCH_FILE="$ROOT/rl/integration/verl_agent_spreadsheetbench_eval.patch"
 
 if [ -e "$DEST" ]; then
   HEAD_COMMIT="$(git -C "$DEST" rev-parse HEAD 2>/dev/null || true)"
@@ -69,8 +72,10 @@ if [ -e "$DEST" ]; then
      grep -q 'env_python_runtime_error' "$DEST/agent_system/multi_turn_rollout/rollout_loop.py" &&
      grep -q 'SPREADSHEETBENCH_PHASE_HEARTBEAT_SECONDS' "$DEST/agent_system/multi_turn_rollout/rollout_loop.py" &&
      grep -q 'episode_tool_calls_per_turn' "$DEST/agent_system/multi_turn_rollout/rollout_loop.py" &&
+     grep -q 'env_multi_call_short_circuit' "$DEST/agent_system/multi_turn_rollout/rollout_loop.py" &&
      grep -q 'reward_workbook_score' "$DEST/verl/trainer/ppo/ray_trainer.py" &&
      grep -q 'success_rate_weights' "$DEST/verl/trainer/ppo/ray_trainer.py" &&
+     grep -q '_val_only = bool(config.trainer.get("val_only", False))' "$DEST/agent_system/environments/env_manager.py" &&
      grep -q 'def finish' "$DEST/verl/utils/tracking.py"; then
     echo "[fetch_verl_agent] $DEST already at $COMMIT + patches; nothing to do."
     exit 0
@@ -99,6 +104,8 @@ echo "[fetch_verl_agent] applying $(basename "$SPREADSHEET_STALL_PATCH_FILE")"
 git -C "$DEST" apply "$SPREADSHEET_STALL_PATCH_FILE"
 echo "[fetch_verl_agent] applying $(basename "$SPREADSHEET_METRICS_PATCH_FILE")"
 git -C "$DEST" apply "$SPREADSHEET_METRICS_PATCH_FILE"
+echo "[fetch_verl_agent] applying $(basename "$SPREADSHEET_EVAL_PATCH_FILE")"
+git -C "$DEST" apply "$SPREADSHEET_EVAL_PATCH_FILE"
 echo "[fetch_verl_agent] applying $(basename "$TRACKING_PATCH_FILE")"
 git -C "$DEST" apply "$TRACKING_PATCH_FILE"
 

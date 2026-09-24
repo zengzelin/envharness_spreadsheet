@@ -1,5 +1,5 @@
 diff --git a/agent_system/multi_turn_rollout/rollout_loop.py b/agent_system/multi_turn_rollout/rollout_loop.py
-index 7b713ad..2b7d7d7 100644
+index 7b713ad..56af48a 100644
 --- a/agent_system/multi_turn_rollout/rollout_loop.py
 +++ b/agent_system/multi_turn_rollout/rollout_loop.py
 @@ -130,7 +130,20 @@ class TrajectoryCollector:
@@ -24,7 +24,7 @@ index 7b713ad..2b7d7d7 100644
          
          # Get observation components
          obs_texts = obs.get('text', None)
-@@ -481,6 +494,24 @@ class TrajectoryCollector:
+@@ -481,6 +494,32 @@ class TrajectoryCollector:
                  'env_syntax_error': 'env/syntax_error',
                  'env_python_runtime_error': 'env/python_runtime_error',
                  'env_python_timeout': 'env/python_timeout',
@@ -35,8 +35,16 @@ index 7b713ad..2b7d7d7 100644
 +                'env_write_tool_success': 'env/write_tool_success',
 +                'env_write_tool_error': 'env/write_tool_error',
 +                'episode_tool_calls_per_turn': 'episode/tool_calls_per_turn',
++                'episode_projected_tool_calls_per_turn': 'episode/projected_tool_calls_per_turn',
 +                'episode_multi_call': 'episode/multi_call',
++                'episode_projected_multi_call': 'episode/projected_multi_call',
 +                'env_multi_call_partial_failure': 'env/multi_call_partial_failure',
++                'env_multi_call_completed': 'env/multi_call_completed',
++                'env_multi_call_all_success': 'env/multi_call_all_success',
++                'env_multi_call_short_circuit': 'env/multi_call_short_circuit',
++                'env_multi_call_skipped_calls': 'env/multi_call_skipped_calls',
++                'env_multi_call_executed_fraction': 'env/multi_call_executed_fraction',
++                'env_multi_call_failure_index': 'env/multi_call_failure_index',
 +                'tool_run_python': 'tool/run_python',
 +                'tool_list_sheets': 'tool/list_sheets',
 +                'tool_inspect_range': 'tool/inspect_range',
@@ -49,7 +57,7 @@ index 7b713ad..2b7d7d7 100644
              }
              for batch_key, info_key in spreadsheetbench_diagnostic_keys.items():
                  if info_key in infos[0]:
-@@ -626,7 +657,6 @@ class TrajectoryCollector:
+@@ -626,7 +665,6 @@ class TrajectoryCollector:
                  gen_batch=gen_batch,
                  actor_rollout_wg=actor_rollout_wg,
                  envs=envs,
@@ -57,7 +65,7 @@ index 7b713ad..2b7d7d7 100644
              )
          else:
              # Vanilla Sampling   
-@@ -635,6 +665,7 @@ class TrajectoryCollector:
+@@ -635,6 +673,7 @@ class TrajectoryCollector:
                  gen_batch=gen_batch,
                  actor_rollout_wg=actor_rollout_wg,
                  envs=envs,
@@ -66,17 +74,19 @@ index 7b713ad..2b7d7d7 100644
          assert len(total_batch_list) == len(total_episode_rewards)
          assert len(total_batch_list) == len(total_episode_lengths)
 diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
-index cdc6725..33a6d33 100644
+index 8fc547a..2db3666 100644
 --- a/verl/trainer/ppo/ray_trainer.py
 +++ b/verl/trainer/ppo/ray_trainer.py
-@@ -233,12 +233,53 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
+@@ -233,12 +233,82 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
          'env_syntax_error': 'env/syntax_error_ratio',
          'env_python_runtime_error': 'env/python_runtime_error_ratio',
          'env_python_timeout': 'env/python_timeout_ratio',
 +        'env_read_tool_call': 'env/read_tool_call_ratio',
 +        'env_write_tool_call': 'env/write_tool_call_ratio',
 +        'episode_tool_calls_per_turn': 'episode/tool_calls_per_turn',
++        'episode_projected_tool_calls_per_turn': 'episode/projected_tool_calls_per_turn',
 +        'episode_multi_call': 'episode/multi_call_ratio',
++        'episode_projected_multi_call': 'episode/projected_multi_call_ratio',
 +        'env_multi_call_partial_failure': 'env/multi_call_partial_failure_rate',
 +        'tool_run_python': 'tool/run_python_ratio',
 +        'tool_list_sheets': 'tool/list_sheets_ratio',
@@ -93,6 +103,33 @@ index cdc6725..33a6d33 100644
              metrics[metric_key] = np.mean(
                  data.non_tensor_batch[batch_key].astype(np.float32)
              ).item()
++    projected_multi_call = data.non_tensor_batch.get(
++        'episode_projected_multi_call'
++    )
++    if projected_multi_call is not None:
++        multi_mask = projected_multi_call.astype(bool)
++        for batch_key, metric_key in {
++            'env_multi_call_completed': 'env/multi_call_completed_rate',
++            'env_multi_call_all_success': 'env/multi_call_all_success_rate',
++            'env_multi_call_short_circuit': 'env/multi_call_short_circuit_rate',
++            'env_multi_call_skipped_calls': 'env/multi_call_skipped_calls_mean',
++            'env_multi_call_executed_fraction': 'env/multi_call_executed_fraction_mean',
++        }.items():
++            if batch_key in data.non_tensor_batch:
++                values = data.non_tensor_batch[batch_key].astype(np.float32)
++                metrics[metric_key] = (
++                    np.mean(values[multi_mask]).item()
++                    if np.any(multi_mask) else 0.0
++                )
++        if 'env_multi_call_failure_index' in data.non_tensor_batch:
++            failure_indexes = data.non_tensor_batch[
++                'env_multi_call_failure_index'
++            ].astype(np.float32)
++            failure_mask = multi_mask & (failure_indexes >= 0)
++            metrics['env/multi_call_failure_index_mean'] = (
++                np.mean(failure_indexes[failure_mask]).item()
++                if np.any(failure_mask) else -1.0
++            )
 +    for category in ('read', 'write'):
 +        call_key = f'env_{category}_tool_call'
 +        calls = data.non_tensor_batch.get(call_key)
@@ -123,7 +160,7 @@ index cdc6725..33a6d33 100644
      return data, metrics
  
  def compute_response_mask(data: DataProto):
-@@ -710,6 +751,9 @@ class RayPPOTrainer:
+@@ -710,6 +780,9 @@ class RayPPOTrainer:
          tool_calling_list = []
          traj_uid_list = []
          success_rate_dict = {}
@@ -133,15 +170,19 @@ index cdc6725..33a6d33 100644
  
          # Lists to collect samples for the table
          sample_inputs = []
-@@ -790,12 +834,38 @@ class RayPPOTrainer:
+@@ -790,12 +863,42 @@ class RayPPOTrainer:
              data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
              tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
              traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
 +            for key in (
 +                'env_read_tool_call', 'env_read_tool_success', 'env_read_tool_error',
 +                'env_write_tool_call', 'env_write_tool_success', 'env_write_tool_error',
-+                'episode_tool_calls_per_turn', 'episode_multi_call',
-+                'env_multi_call_partial_failure', 'tool_fill_formula',
++                'episode_tool_calls_per_turn', 'episode_projected_tool_calls_per_turn',
++                'episode_multi_call', 'episode_projected_multi_call',
++                'env_multi_call_partial_failure', 'env_multi_call_completed',
++                'env_multi_call_all_success', 'env_multi_call_short_circuit',
++                'env_multi_call_skipped_calls', 'env_multi_call_executed_fraction',
++                'env_multi_call_failure_index', 'tool_fill_formula',
 +            ):
 +                if key in test_output_gen_batch.non_tensor_batch:
 +                    validation_diagnostics.setdefault(key, []).append(
@@ -172,7 +213,7 @@ index cdc6725..33a6d33 100644
                      # all success_rate should be the same
                      for i in range(1, len(test_batch.non_tensor_batch[k])):
                          assert test_batch.non_tensor_batch[k][0] == test_batch.non_tensor_batch[k][i], f'not all success_rate are the same, 0: {test_batch.non_tensor_batch[k][0]}, {i}: {test_batch.non_tensor_batch[k][i]}'
-@@ -806,7 +876,10 @@ class RayPPOTrainer:
+@@ -806,7 +909,10 @@ class RayPPOTrainer:
          data_sources = np.concatenate(data_source_lst, axis=0)
          tool_callings = np.concatenate(tool_calling_list, axis=0)
          traj_uids = np.concatenate(traj_uid_list, axis=0)
@@ -184,7 +225,7 @@ index cdc6725..33a6d33 100644
  
          # evaluate test_score based on data source
          data_source_reward = {}
-@@ -841,6 +914,44 @@ class RayPPOTrainer:
+@@ -841,6 +947,73 @@ class RayPPOTrainer:
          for k, v in success_rate.items():
              metric_dict[f'val/{k}'] = v
  
@@ -203,12 +244,41 @@ index cdc6725..33a6d33 100644
 +            combined = np.concatenate(values, axis=0)
 +            metric_name = {
 +                'episode_tool_calls_per_turn': 'episode/tool_calls_per_turn',
++                'episode_projected_tool_calls_per_turn': 'episode/projected_tool_calls_per_turn',
 +                'episode_multi_call': 'episode/multi_call_ratio',
++                'episode_projected_multi_call': 'episode/projected_multi_call_ratio',
 +                'env_multi_call_partial_failure': 'env/multi_call_partial_failure_rate',
 +                'tool_fill_formula': 'tool/fill_formula_ratio',
 +            }.get(key)
 +            if metric_name is not None:
 +                metric_dict[f'val/{metric_name}'] = np.mean(combined).item()
++        if 'episode_projected_multi_call' in validation_diagnostics:
++            multi_mask = np.concatenate(
++                validation_diagnostics['episode_projected_multi_call'], axis=0
++            ).astype(bool)
++            for key, metric_name in {
++                'env_multi_call_completed': 'env/multi_call_completed_rate',
++                'env_multi_call_all_success': 'env/multi_call_all_success_rate',
++                'env_multi_call_short_circuit': 'env/multi_call_short_circuit_rate',
++                'env_multi_call_skipped_calls': 'env/multi_call_skipped_calls_mean',
++                'env_multi_call_executed_fraction': 'env/multi_call_executed_fraction_mean',
++            }.items():
++                if key in validation_diagnostics:
++                    values = np.concatenate(validation_diagnostics[key], axis=0)
++                    metric_dict[f'val/{metric_name}'] = (
++                        np.mean(values[multi_mask]).item()
++                        if np.any(multi_mask) else 0.0
++                    )
++            if 'env_multi_call_failure_index' in validation_diagnostics:
++                failure_indexes = np.concatenate(
++                    validation_diagnostics['env_multi_call_failure_index'],
++                    axis=0,
++                )
++                failure_mask = multi_mask & (failure_indexes >= 0)
++                metric_dict['val/env/multi_call_failure_index_mean'] = (
++                    np.mean(failure_indexes[failure_mask]).item()
++                    if np.any(failure_mask) else -1.0
++                )
 +        for category in ('read', 'write'):
 +            call_key = f'env_{category}_tool_call'
 +            if call_key not in validation_diagnostics:
