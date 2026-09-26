@@ -9,7 +9,9 @@ import time
 from typing import Any, Iterator
 
 from envharness.bridges.spreadsheetbench.bridge import SpreadsheetBenchEnv
-from envharness.bridges.spreadsheetbench.read_tools import NATIVE_WRITE_TOOLS
+from envharness.bridges.spreadsheetbench.read_tools import (
+    NATIVE_RECALC_TOOLS, NATIVE_STRUCTURE_TOOLS, NATIVE_WRITE_TOOLS,
+)
 from envharness.core.types import Action, EvaluationResult
 
 
@@ -298,7 +300,10 @@ class EnvharnessSpreadsheetWorker:
                 projected.name == "invalid"
                 or projected.name == "run_python"
                 or projected.name in NATIVE_WRITE_TOOLS
+                or projected.name in NATIVE_RECALC_TOOLS
+                or projected.name in NATIVE_STRUCTURE_TOOLS
                 or sub_info.get("tool_category") == "write"
+                or sub_info.get("tool_category") == "recalc"
             ):
                 stop_reason = f"{projected.name}_failure"
                 break

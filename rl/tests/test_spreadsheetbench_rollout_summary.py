@@ -74,6 +74,44 @@ def test_summary_counts_each_action_in_multi_call_turn(tmp_path: Path) -> None:
     assert summary["multi_call_partial_failure_rate"] == 0.0
 
 
+def test_summary_reports_recalc_and_preflight_metrics(tmp_path: Path) -> None:
+    path = tmp_path / "recalc.json"
+    path.write_text(json.dumps({
+        "task_id": "recalc",
+        "steps": [{
+            "projected_action": {"name": "recalculate_and_read"},
+            "action_valid": True,
+            "diagnostics": {
+                "env/recalc_tool_call": 1,
+                "env/recalc_tool_success": 1,
+                "env/recalc_elapsed_ms": 250.0,
+                "env/recalc_formula_error_count": 2,
+                "env/python_preflight_reject": 1,
+                "env/python_preflight_warning_count": 3,
+            },
+        }, {
+            "projected_action": {"name": "submit"},
+            "action_valid": True,
+            "diagnostics": {
+                "env/submitted_after_recalc": 1,
+                "env/recalc_stale_at_submit": 0,
+            },
+        }],
+        "final_info": {"won": False, "submitted": True},
+    }), encoding="utf-8")
+
+    summary = summarize_trajectories([path])
+
+    assert summary["recalc_tool_call_ratio"] == 0.5
+    assert summary["recalc_tool_success_rate"] == 1.0
+    assert summary["recalc_formula_error_count_mean"] == 2.0
+    assert summary["recalc_elapsed_ms_mean"] == 250.0
+    assert summary["submitted_after_recalc_rate"] == 1.0
+    assert summary["recalc_stale_at_submit_rate"] == 0.0
+    assert summary["python_preflight_reject_ratio"] == 0.5
+    assert summary["python_preflight_warning_count_mean"] == 1.5
+
+
 def test_summary_separates_projected_and_executed_tool_calls(tmp_path: Path) -> None:
     trajectory = {
         "task_id": "task-3",

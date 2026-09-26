@@ -6,7 +6,7 @@ import time
 
 import openpyxl
 
-from envharness.bridges.spreadsheetbench import write_tools
+from envharness.bridges.spreadsheetbench import recalc_tools, write_tools
 from envharness.bridges.spreadsheetbench.bridge import (
     SpreadsheetBenchEnv,
     SpreadsheetBenchEnvState,
@@ -256,7 +256,9 @@ def test_tool_schemas_follow_selected_tool_set(monkeypatch) -> None:
         "list_sheets", "inspect_range", "find_cells"
     }
     assert basic_names == native_names | {
-        "write_range", "clear_range", "fill_formula"
+        "write_range", "clear_range", "fill_formula",
+        "recalculate_and_read", "format_range", "delete_rows",
+        "delete_columns", "manage_sheet",
     }
     write_schema = next(
         item for item in SpreadsheetBenchEnv.tool_schemas()
@@ -419,6 +421,206 @@ def test_native_basic_fill_formula_rejects_oversized_range(
 
     assert response.info["tool_ok"] is False
     assert response.info["tool_error"] == "range_too_large"
+
+
+def test_fill_formula_rejects_formula_wrapped_as_string(tmp_path: Path) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+
+    response = env.step(Action(name="fill_formula", kwargs={
+        "start_cell": "C2",
+        "formula_template": '="=TEXT(B2, ""dddd"")"',
+    }))
+
+    assert response.info["tool_ok"] is False
+    assert response.info["tool_error"] == "invalid_formula"
+
+
+def test_recalculate_and_read_uses_temporary_copy(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+    before = Path(env.state.output_path).read_bytes()
+
+    def fake_recalc(path, soffice_path=None, timeout=120):
+        workbook = openpyxl.load_workbook(path)
+        workbook["Sheet1"]["B2"] = 2
+        workbook.save(path)
+        return True
+
+    monkeypatch.setattr(
+        recalc_tools.online_judge_eval, "recalc_with_libreoffice", fake_recalc
+    )
+    response = env.step(Action(name="recalculate_and_read", kwargs={
+        "cell_ranges": ["Sheet1!A1:B2"],
+    }))
+
+    payload = _tool_payload(response)
+    assert response.info["tool_ok"] is True
+    assert payload["ranges"][0]["values"][-1][-1] == 2
+    assert Path(env.state.output_path).read_bytes() == before
+
+
+def test_recalculate_and_read_is_bounded_to_one_call(tmp_path: Path) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+    env._recalc_calls = 1
+
+    response = env.step(Action(name="recalculate_and_read", kwargs={
+        "cell_ranges": ["A1"],
+    }))
+
+    assert response.info["tool_ok"] is False
+    assert response.info["tool_error"] == "recalc_limit_reached"
+
+
+def test_run_python_preflight_rejects_cell_formula_assignment(
+    tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+
+    response = env.step(Action(name="run_python", kwargs={
+        "code": "wb = load_workbook_for_edit()\nwb.active['A1'].formula = '=1+1'",
+    }))
+
+    assert response.info["python_error"] is True
+    assert response.info["python_error_type"] == "PreflightError"
+    assert "cell.value" in response.observation.text
+
+
+def test_format_range_updates_style_and_dimensions(tmp_path: Path) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+    workbook = openpyxl.load_workbook(env.state.output_path)
+    workbook["Sheet1"]["A1"].font = openpyxl.styles.Font(
+        name="Arial", italic=True
+    )
+    workbook.save(env.state.output_path)
+
+    response = env.step(Action(name="format_range", kwargs={
+        "sheet_name": "Sheet1",
+        "range": "A1:B2",
+        "font": {"bold": True, "color": "FF0000"},
+        "fill": {"color": "FFFF00"},
+        "alignment": {"horizontal": "center"},
+        "number_format": "0.00",
+        "column_width": 18,
+        "row_height": 24,
+    }))
+
+    assert response.info["tool_ok"] is True
+    workbook = openpyxl.load_workbook(env.state.output_path)
+    assert workbook["Sheet1"]["A1"].font.bold is True
+    assert workbook["Sheet1"]["A1"].font.italic is True
+    assert workbook["Sheet1"]["A1"].font.name == "Arial"
+    assert workbook["Sheet1"]["A1"].number_format == "0.00"
+    assert workbook["Sheet1"].column_dimensions["A"].width == 18
+    assert workbook["Sheet1"].row_dimensions[1].height == 24
+
+
+def test_delete_rows_rolls_back_on_invalid_range(tmp_path: Path) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+    before = Path(env.state.output_path).read_bytes()
+
+    response = env.step(Action(name="delete_rows", kwargs={
+        "sheet_name": "Sheet1", "rows": ["0:2"],
+    }))
+
+    assert response.info["tool_ok"] is False
+    assert Path(env.state.output_path).read_bytes() == before
+
+
+def test_delete_rows_rejects_out_of_bounds_without_mutation(tmp_path: Path) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+    before = Path(env.state.output_path).read_bytes()
+
+    response = env.step(Action(name="delete_rows", kwargs={
+        "sheet_name": "Sheet1", "rows": ["3:4"],
+    }))
+
+    assert response.info["tool_ok"] is False
+    assert response.info["tool_error"] == "range_out_of_bounds"
+    assert Path(env.state.output_path).read_bytes() == before
+
+
+def test_delete_rows_merges_overlapping_ranges_and_warns_about_formulas(
+    tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+
+    response = env.step(Action(name="delete_rows", kwargs={
+        "sheet_name": "Sheet1", "rows": ["2", "2:2"],
+    }))
+
+    payload = _tool_payload(response)
+    assert response.info["tool_ok"] is True
+    assert payload["deleted_ranges"] == ["2:2"]
+    assert payload["formula_reference_update"] == "not_guaranteed_by_openpyxl"
+    workbook = openpyxl.load_workbook(env.state.output_path)
+    assert workbook["Sheet1"].max_row == 1
+
+
+def test_manage_sheet_refuses_to_hide_only_visible_sheet(tmp_path: Path) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+
+    response = env.step(Action(name="manage_sheet", kwargs={
+        "operation": "hide", "sheet_name": "Sheet1",
+    }))
+
+    assert response.info["tool_ok"] is False
+    assert response.info["tool_error"] == "cannot_hide_only_visible_sheet"
+
+
+def test_manage_sheet_create_rename_copy_move_and_visibility(tmp_path: Path) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+
+    for arguments in (
+        {"operation": "create", "sheet_name": "Work"},
+        {"operation": "rename", "sheet_name": "Work", "new_name": "Result"},
+        {"operation": "copy", "sheet_name": "Result", "new_name": "Result Copy"},
+        {"operation": "move", "sheet_name": "Result Copy", "index": 0},
+        {"operation": "hide", "sheet_name": "Result"},
+        {"operation": "unhide", "sheet_name": "Hidden Data"},
+    ):
+        response = env.step(Action(name="manage_sheet", kwargs=arguments))
+        assert response.info["tool_ok"] is True
+
+    workbook = openpyxl.load_workbook(env.state.output_path)
+    assert workbook.sheetnames[0] == "Result Copy"
+    assert workbook["Result"].sheet_state == "hidden"
+    assert workbook["Hidden Data"].sheet_state == "visible"
+
+
+def test_submit_reports_recalc_staleness_after_later_edit(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+
+    monkeypatch.setattr(
+        recalc_tools.online_judge_eval,
+        "recalc_with_libreoffice",
+        lambda path, soffice_path=None, timeout=120: True,
+    )
+    recalc = env.step(Action(name="recalculate_and_read", kwargs={
+        "cell_ranges": ["Sheet1!B2"],
+    }))
+    assert recalc.info["tool_ok"] is True
+    write = env.step(Action(name="write_range", kwargs={
+        "sheet_name": "Sheet1", "range": "A2", "data": "changed",
+    }))
+    assert write.info["tool_ok"] is True
+
+    submitted = env.step(Action(name="submit", kwargs={}))
+
+    assert submitted.info["submitted_after_recalc"] == 1
+    assert submitted.info["recalc_stale_at_submit"] == 1
 
 
 def test_native_basic_write_range_rejects_formulas_without_mutation(

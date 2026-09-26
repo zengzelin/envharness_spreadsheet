@@ -389,6 +389,12 @@ def _fill_formula(path: str, arguments: dict[str, Any]) -> tuple[dict[str, Any],
         raise ReadToolError(
             "invalid_formula", "formula_template must be an Excel formula starting with '='"
         )
+    if formula.startswith(('="=', "='=")):
+        raise ReadToolError(
+            "invalid_formula",
+            "formula_template is wrapped as a text string; pass the formula "
+            "directly, for example =TEXT(A1,\"dddd\")",
+        )
     if len(formula) > MAX_CELL_CHARS:
         raise ReadToolError(
             "formula_too_large",

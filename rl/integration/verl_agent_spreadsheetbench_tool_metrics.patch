@@ -1,0 +1,118 @@
+diff --git a/agent_system/multi_turn_rollout/rollout_loop.py b/agent_system/multi_turn_rollout/rollout_loop.py
+index 56af48a..31eb7f6 100644
+--- a/agent_system/multi_turn_rollout/rollout_loop.py
++++ b/agent_system/multi_turn_rollout/rollout_loop.py
+@@ -500,6 +500,15 @@ class TrajectoryCollector:
+                 'env_write_tool_call': 'env/write_tool_call',
+                 'env_write_tool_success': 'env/write_tool_success',
+                 'env_write_tool_error': 'env/write_tool_error',
++                'env_recalc_tool_call': 'env/recalc_tool_call',
++                'env_recalc_tool_success': 'env/recalc_tool_success',
++                'env_recalc_tool_error': 'env/recalc_tool_error',
++                'env_recalc_elapsed_ms': 'env/recalc_elapsed_ms',
++                'env_recalc_formula_error_count': 'env/recalc_formula_error_count',
++                'env_submitted_after_recalc': 'env/submitted_after_recalc',
++                'env_recalc_stale_at_submit': 'env/recalc_stale_at_submit',
++                'env_python_preflight_reject': 'env/python_preflight_reject',
++                'env_python_preflight_warning_count': 'env/python_preflight_warning_count',
+                 'episode_tool_calls_per_turn': 'episode/tool_calls_per_turn',
+                 'episode_projected_tool_calls_per_turn': 'episode/projected_tool_calls_per_turn',
+                 'episode_multi_call': 'episode/multi_call',
+@@ -518,6 +527,11 @@ class TrajectoryCollector:
+                 'tool_write_range': 'tool/write_range',
+                 'tool_clear_range': 'tool/clear_range',
+                 'tool_fill_formula': 'tool/fill_formula',
++                'tool_format_range': 'tool/format_range',
++                'tool_delete_rows': 'tool/delete_rows',
++                'tool_delete_columns': 'tool/delete_columns',
++                'tool_manage_sheet': 'tool/manage_sheet',
++                'tool_recalculate_and_read': 'tool/recalculate_and_read',
+                 'tool_validate_workbook': 'tool/validate_workbook',
+                 'tool_submit': 'tool/submit',
+             }
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index 2db3666..441ca48 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -235,6 +235,13 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
+         'env_python_timeout': 'env/python_timeout_ratio',
+         'env_read_tool_call': 'env/read_tool_call_ratio',
+         'env_write_tool_call': 'env/write_tool_call_ratio',
++        'env_recalc_tool_call': 'env/recalc_tool_call_ratio',
++        'env_recalc_elapsed_ms': 'env/recalc_elapsed_ms_mean',
++        'env_recalc_formula_error_count': 'env/recalc_formula_error_count_mean',
++        'env_submitted_after_recalc': 'env/submitted_after_recalc_ratio',
++        'env_recalc_stale_at_submit': 'env/recalc_stale_at_submit_ratio',
++        'env_python_preflight_reject': 'env/python_preflight_reject_ratio',
++        'env_python_preflight_warning_count': 'env/python_preflight_warning_count_mean',
+         'episode_tool_calls_per_turn': 'episode/tool_calls_per_turn',
+         'episode_projected_tool_calls_per_turn': 'episode/projected_tool_calls_per_turn',
+         'episode_multi_call': 'episode/multi_call_ratio',
+@@ -247,6 +254,11 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
+         'tool_write_range': 'tool/write_range_ratio',
+         'tool_clear_range': 'tool/clear_range_ratio',
+         'tool_fill_formula': 'tool/fill_formula_ratio',
++        'tool_format_range': 'tool/format_range_ratio',
++        'tool_delete_rows': 'tool/delete_rows_ratio',
++        'tool_delete_columns': 'tool/delete_columns_ratio',
++        'tool_manage_sheet': 'tool/manage_sheet_ratio',
++        'tool_recalculate_and_read': 'tool/recalculate_and_read_ratio',
+         'tool_validate_workbook': 'tool/validate_workbook_ratio',
+         'tool_submit': 'tool/submit_ratio',
+     }
+@@ -282,7 +294,7 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
+                 np.mean(failure_indexes[failure_mask]).item()
+                 if np.any(failure_mask) else -1.0
+             )
+-    for category in ('read', 'write'):
++    for category in ('read', 'write', 'recalc'):
+         call_key = f'env_{category}_tool_call'
+         calls = data.non_tensor_batch.get(call_key)
+         if calls is None:
+@@ -866,12 +878,18 @@ class RayPPOTrainer:
+             for key in (
+                 'env_read_tool_call', 'env_read_tool_success', 'env_read_tool_error',
+                 'env_write_tool_call', 'env_write_tool_success', 'env_write_tool_error',
++                'env_recalc_tool_call', 'env_recalc_tool_success', 'env_recalc_tool_error',
++                'env_recalc_elapsed_ms', 'env_recalc_formula_error_count',
++                'env_submitted_after_recalc', 'env_recalc_stale_at_submit',
++                'env_python_preflight_reject', 'env_python_preflight_warning_count',
+                 'episode_tool_calls_per_turn', 'episode_projected_tool_calls_per_turn',
+                 'episode_multi_call', 'episode_projected_multi_call',
+                 'env_multi_call_partial_failure', 'env_multi_call_completed',
+                 'env_multi_call_all_success', 'env_multi_call_short_circuit',
+                 'env_multi_call_skipped_calls', 'env_multi_call_executed_fraction',
+                 'env_multi_call_failure_index', 'tool_fill_formula',
++                'tool_format_range', 'tool_delete_rows', 'tool_delete_columns',
++                'tool_manage_sheet', 'tool_recalculate_and_read',
+             ):
+                 if key in test_output_gen_batch.non_tensor_batch:
+                     validation_diagnostics.setdefault(key, []).append(
+@@ -967,6 +985,18 @@ class RayPPOTrainer:
+                 'episode_projected_multi_call': 'episode/projected_multi_call_ratio',
+                 'env_multi_call_partial_failure': 'env/multi_call_partial_failure_rate',
+                 'tool_fill_formula': 'tool/fill_formula_ratio',
++                'env_recalc_tool_call': 'env/recalc_tool_call_ratio',
++                'env_recalc_elapsed_ms': 'env/recalc_elapsed_ms_mean',
++                'env_recalc_formula_error_count': 'env/recalc_formula_error_count_mean',
++                'env_submitted_after_recalc': 'env/submitted_after_recalc_ratio',
++                'env_recalc_stale_at_submit': 'env/recalc_stale_at_submit_ratio',
++                'env_python_preflight_reject': 'env/python_preflight_reject_ratio',
++                'env_python_preflight_warning_count': 'env/python_preflight_warning_count_mean',
++                'tool_format_range': 'tool/format_range_ratio',
++                'tool_delete_rows': 'tool/delete_rows_ratio',
++                'tool_delete_columns': 'tool/delete_columns_ratio',
++                'tool_manage_sheet': 'tool/manage_sheet_ratio',
++                'tool_recalculate_and_read': 'tool/recalculate_and_read_ratio',
+             }.get(key)
+             if metric_name is not None:
+                 metric_dict[f'val/{metric_name}'] = np.mean(combined).item()
+@@ -997,7 +1027,7 @@ class RayPPOTrainer:
+                     np.mean(failure_indexes[failure_mask]).item()
+                     if np.any(failure_mask) else -1.0
+                 )
+-        for category in ('read', 'write'):
++        for category in ('read', 'write', 'recalc'):
+             call_key = f'env_{category}_tool_call'
+             if call_key not in validation_diagnostics:
+                 continue

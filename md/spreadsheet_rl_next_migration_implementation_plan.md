@@ -509,3 +509,22 @@ Gate: 只在成功率改善大于重算失败引入的回归，且单步 wall ti
 3. Milestone 3 必须降低 episode length 且不使固定验评成功率下降，才扩展剩余工具。
 4. 任何里程碑在完整 399 上显著低于 Base `122/399`，都不进入长训练，先回滚并分析 paired badcase。
 5. 本计划完成后仍不默认迁移 native verl loop；只在 `run_python` 占比、episode length 和多轮 wall time 仍是主瓶颈时，另立 PoC 设计与计划。
+
+## 2026-09-24 五阶段扩展实施状态
+
+在既有 validation batching、`fill_formula` 和 multi-call 基础上，本轮按确认顺序完成：
+
+- [x] Linux LibreOffice `recalculate_and_read` 临时副本实现与每 episode 调用上限；
+- [x] `fill_formula` malformed/quoted-formula 双层校验；
+- [x] submit 前重算协议、workbook revision 和 stale-recalc 指标；
+- [x] `run_python` AST preflight 与 reject/warning 指标；
+- [x] `format_range`、`delete_rows`、`delete_columns`、`manage_sheet` 的有界原子实现；
+- [x] manager、rollout、trainer、offline summary 和启动脚本指标透传；
+- [x] 新增可复现 verl-agent tool metrics integration patch；
+- [ ] Python 3.11 集群完整单测；
+- [ ] 真实 LibreOffice recalc smoke；
+- [ ] 5-step 固定任务 A/B；
+- [ ] Base/候选 checkpoint 完整 399 条 paired evaluation。
+
+代码验收前不修改现有长期训练结论。正在运行的 Ray job 使用提交时 runtime package，
+不会自动加载本轮修改；必须新提交 job 才能观察这些工具和指标。

@@ -105,10 +105,14 @@ VAL_SIZE=399 VAL_CONCURRENCY=64 \
 MODE=full bash rl/scripts/submit_spreadsheetbench_grpo.sh
 ```
 
-With `native_basic`, the model can call `write_range`, `clear_range`, and
-`fill_formula` in addition to the structured read tools. One model turn may
-contain up to four ordered `<tool_call>` blocks; they execute sequentially and
-consume one episode step. `submit` must be the final call in its batch.
+With `native_basic`, the model can call `write_range`, `clear_range`,
+`fill_formula`, `format_range`, `delete_rows`, `delete_columns`,
+`manage_sheet`, and `recalculate_and_read` in addition to the structured read
+tools. One model turn may contain up to four ordered `<tool_call>` blocks; they
+execute sequentially and consume one episode step. `submit` must be the final
+call in its batch. `recalculate_and_read` recalculates a temporary copy with
+LibreOffice, must be last in its turn, and should be followed by `submit` in a
+new turn after the returned values have been checked.
 
 The launcher writes `launch.log`, `train.log`, and checkpoints under
 `runs/grpo_spreadsheetbench_<mode>_<timestamp>/`; the corresponding
@@ -154,6 +158,8 @@ timed out.
 # Defaults shown; override before submitting when a workload needs more time.
 export SPREADSHEETBENCH_ACTOR_TIMEOUT_SECONDS=600
 export SPREADSHEETBENCH_PHASE_HEARTBEAT_SECONDS=60
+export SPREADSHEETBENCH_MAX_RECALC_CALLS=1
+export SPREADSHEETBENCH_RECALC_TIMEOUT_SECONDS=120
 ```
 
 The actor timeout bounds each parallel environment `reset`, `step`, and
@@ -174,8 +180,9 @@ bash rl/scripts/fetch_verl_agent.sh
 
 That clones [verl-agent](https://github.com/langfengQ/verl-agent) at commit
 `796ed310287fa605c9292a0fce07a86d79fde05e` into `third_party/verl-agent/`
-(gitignored) and applies `rl/integration/verl_agent_env_manager.patch` — the
-single additive change (the `envharness_rl/alfworld` env route). It is
+(gitignored) and applies the ordered patches under `rl/integration/`, including
+the EnvHarness routes, tracking lifecycle, SpreadsheetBench runtime,
+diagnostics, metrics, val-only actor allocation, and native-tool metrics. It is
 idempotent: re-running on an already-patched tree is a no-op.
 
 Equivalent manual steps, if you'd rather drive git yourself or place the

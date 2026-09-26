@@ -118,6 +118,31 @@ def test_project_action_batch_requires_submit_to_be_last() -> None:
     assert diagnostics[0]["status"] == "submit_not_last"
 
 
+def test_projection_accepts_recalculate_and_read(monkeypatch) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_basic")
+
+    actions, valids = envharness_spreadsheetbench_projection([
+        _tool_call("recalculate_and_read", {
+            "cell_ranges": ["Sheet1!A1:B2"],
+        })
+    ])
+
+    assert valids == [1]
+    assert actions[0].name == "recalculate_and_read"
+
+
+def test_project_action_batch_requires_recalc_to_be_last(monkeypatch) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_basic")
+    model_output = _tool_call("recalculate_and_read", {
+        "cell_ranges": ["A1:B2"],
+    }) + _tool_call("submit", {})
+
+    actions, diagnostics = project_action_batch(model_output)
+
+    assert actions[0].name == "invalid"
+    assert diagnostics[0]["status"] == "recalc_not_last"
+
+
 @pytest.mark.parametrize(
     ("name", "arguments"),
     [
@@ -185,6 +210,7 @@ def test_projection_accepts_native_basic_write_tools(
     [
         {"start_cell": "A1"},
         {"start_cell": "A1", "formula_template": "SUM(B1:B2)"},
+        {"start_cell": "A1", "formula_template": '="=SUM(B1:B2)"'},
         {"start_cell": "A3", "end_row": 2, "formula_template": "=B3"},
     ],
 )

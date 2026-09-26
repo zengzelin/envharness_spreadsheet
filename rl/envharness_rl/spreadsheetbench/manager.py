@@ -22,9 +22,8 @@ edits from earlier turns. Prefer openpyxl for workbook-preserving edits. Before
 assuming a sheet or table layout, inspect workbook.sheetnames and dimensions.
 Return one to four ordered JSON tool calls per turn, each wrapped in
 <tool_call> tags. Calls execute sequentially in one episode turn. Put submit
-last. If you
-write a <think>...</think> reasoning block, put the tool call only after the
-final </think>. Do not wrap the tool call in Markdown fences.
+last. If you write a <think>...</think> reasoning block, put the tool call only
+after the final </think>. Do not wrap the tool call in Markdown fences.
 
 Run Python:
 <tool_call>{\"name\":\"run_python\",\"arguments\":{\"code\":\"print('inspect')\"}}</tool_call>
@@ -76,8 +75,24 @@ Clear values or formulas without shifting cells:
 Fill formulas from one template. Relative and mixed references are translated:
 <tool_call>{"name":"fill_formula","arguments":{"sheet_name":"Sheet1","start_cell":"C2","end_row":100,"formula_template":"=A2+B2"}}</tool_call>
 
-Use run_python for formatting, sorting, structural edits, or other
-operations not covered by these tools."""
+Use cell.value, not cell.formula, in run_python. Formula templates must be raw
+Excel formulas beginning with exactly one '='; do not quote the formula as text.
+
+Format a finite range without changing its values:
+<tool_call>{"name":"format_range","arguments":{"sheet_name":"Sheet1","range":"A1:D20","font":{"bold":true},"number_format":"0.00"}}</tool_call>
+
+Delete rows or columns, or manage worksheets:
+<tool_call>{"name":"delete_rows","arguments":{"sheet_name":"Sheet1","rows":["2:4"]}}</tool_call>
+<tool_call>{"name":"manage_sheet","arguments":{"operation":"rename","sheet_name":"Sheet1","new_name":"Summary"}}</tool_call>
+
+validate_workbook checks workbook structure only; it does not calculate formulas.
+After the final edit, use recalculate_and_read in a turn by itself to inspect
+cached formula values and Excel errors. It recalculates a temporary copy, never
+modifies output_path, and is limited to one call by default. It must be the last
+call in its turn; submit in the next turn after checking the result:
+<tool_call>{"name":"recalculate_and_read","arguments":{"cell_ranges":["Sheet1!C2:C20"]}}</tool_call>
+
+Use run_python only for sorting or operations not covered by these tools."""
 
 
 def _tool_instructions() -> str:
@@ -227,7 +242,11 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
         tool_category = str(env_info.get("tool_category") or "")
         tool_error = str(env_info.get("tool_error") or "")
         read_names = {"list_sheets", "inspect_range", "find_cells"}
-        write_names = {"write_range", "clear_range", "fill_formula"}
+        write_names = {
+            "write_range", "clear_range", "fill_formula", "format_range",
+            "delete_rows", "delete_columns", "manage_sheet",
+        }
+        recalc_names = {"recalculate_and_read"}
         read_results = [
             item for item in tool_results
             if isinstance(item, dict) and (
@@ -242,6 +261,13 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
                 or (item.get("info") or {}).get("tool_category") == "write"
             )
         ]
+        recalc_results = [
+            item for item in tool_results
+            if isinstance(item, dict) and (
+                item.get("action_name") in recalc_names
+                or (item.get("info") or {}).get("tool_category") == "recalc"
+            )
+        ]
         read_call = bool(
             read_results or tool_name and (
                 tool_category == "read"
@@ -254,6 +280,11 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
                 or tool_name in write_names
             )
         )
+        recalc_call = bool(
+            recalc_results or tool_name and (
+                tool_category == "recalc" or tool_name in recalc_names
+            )
+        )
         read_success = (
             all(bool(item.get("ok")) for item in read_results)
             if read_results else bool(env_info.get("tool_ok", False))
@@ -262,8 +293,13 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             all(bool(item.get("ok")) for item in write_results)
             if write_results else bool(env_info.get("tool_ok", False))
         )
+        recalc_success = (
+            all(bool(item.get("ok")) for item in recalc_results)
+            if recalc_results else bool(env_info.get("tool_ok", False))
+        )
         read_error = any(not bool(item.get("ok")) for item in read_results)
         write_error = any(not bool(item.get("ok")) for item in write_results)
+        recalc_error = any(not bool(item.get("ok")) for item in recalc_results)
         read_error_type = next((
             str((item.get("info") or {}).get("tool_error") or "")
             for item in read_results
@@ -274,6 +310,26 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             for item in write_results
             if (item.get("info") or {}).get("tool_error")
         ), tool_error if write_call else "")
+        recalc_error_type = next((
+            str((item.get("info") or {}).get("tool_error") or "")
+            for item in recalc_results
+            if (item.get("info") or {}).get("tool_error")
+        ), tool_error if recalc_call else "")
+        metric_infos = sub_infos or [env_info]
+        recalc_elapsed_ms = max(
+            (float(info.get("recalc_elapsed_ms", 0.0)) for info in metric_infos),
+            default=0.0,
+        )
+        recalc_formula_errors = sum(
+            int(info.get("recalc_formula_error_count", 0)) for info in metric_infos
+        )
+        preflight_rejected = any(
+            bool(info.get("python_preflight_rejected", False))
+            for info in metric_infos
+        )
+        preflight_warning_count = sum(
+            len(info.get("python_preflight_warnings") or []) for info in metric_infos
+        )
         projected_call_count = int(
             env_info.get("tool_call_count", 1 if action_name else 0)
         )
@@ -333,7 +389,25 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
                 write_call and (write_error or bool(tool_error))
             ),
             "env/write_tool_error_type": write_error_type,
-            "env/tool_error_type": write_error_type or read_error_type or tool_error,
+            "env/recalc_tool_call": int(recalc_call),
+            "env/recalc_tool_success": int(recalc_call and recalc_success),
+            "env/recalc_tool_error": int(
+                recalc_call and (recalc_error or bool(recalc_error_type))
+            ),
+            "env/recalc_tool_error_type": recalc_error_type,
+            "env/recalc_elapsed_ms": recalc_elapsed_ms,
+            "env/recalc_formula_error_count": recalc_formula_errors,
+            "env/submitted_after_recalc": int(bool(
+                env_info.get("submitted_after_recalc", False)
+            )),
+            "env/recalc_stale_at_submit": int(bool(
+                env_info.get("recalc_stale_at_submit", False)
+            )),
+            "env/python_preflight_reject": int(preflight_rejected),
+            "env/python_preflight_warning_count": preflight_warning_count,
+            "env/tool_error_type": (
+                write_error_type or read_error_type or recalc_error_type or tool_error
+            ),
             "episode/tool_calls_per_turn": executed_call_count,
             "episode/projected_tool_calls_per_turn": projected_call_count,
             "episode/multi_call": int(executed_call_count > 1),
@@ -372,7 +446,9 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
         }
         for name in (
             "run_python", "list_sheets", "inspect_range", "find_cells",
-            "write_range", "clear_range", "fill_formula",
+            "write_range", "clear_range", "fill_formula", "format_range",
+            "delete_rows", "delete_columns", "manage_sheet",
+            "recalculate_and_read",
             "validate_workbook", "submit",
         ):
             result[f"tool/{name}"] = int(

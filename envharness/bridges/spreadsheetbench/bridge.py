@@ -48,7 +48,8 @@ Action contract (multi-turn ReAct):
     available: list_sheets(), inspect_range(), and find_cells(). They always
     read the current output workbook and cannot access arbitrary paths.
     tool_set=native_basic additionally enables write_range(), clear_range(),
-    and fill_formula().
+    fill_formula(), recalculate_and_read(), format_range(), delete_rows(),
+    delete_columns(), and manage_sheet().
     If the agent never submits, the episode runs to max_steps and we grade
     whatever is at output_path (it is pre-seeded as a copy of the input).
 
@@ -112,6 +113,8 @@ from .dataset import (
 )
 from .read_tools import (
     NATIVE_READ_TOOLS,
+    NATIVE_RECALC_TOOLS,
+    NATIVE_STRUCTURE_TOOLS,
     NATIVE_WRITE_TOOLS,
     ReadToolError,
     TOOL_SET_NATIVE_BASIC,
@@ -120,9 +123,13 @@ from .read_tools import (
     execute_read_tool,
     normalize_tool_set,
 )
+from .python_preflight import preflight_python
+from .recalc_tools import execute_recalculate_and_read
+from .structure_tools import execute_structure_tool
 from .write_tools import execute_write_tool
 from .tools import (
-    ClearRange, FillFormula, FindCells, InspectRange, ListSheets, RunPython, Submit,
+    ClearRange, DeleteColumns, DeleteRows, FillFormula, FindCells, FormatRange,
+    InspectRange, ListSheets, ManageSheet, RecalculateAndRead, RunPython, Submit,
     ValidateWorkbook, WriteRange,
 )
 
@@ -173,7 +180,8 @@ class SpreadsheetBenchEnv(ActionableEnv):
 
     tool_registry: ClassVar[list[type[Tool]]] = [
         RunPython, ListSheets, InspectRange, FindCells, WriteRange, ClearRange,
-        FillFormula,
+        FillFormula, RecalculateAndRead, FormatRange, DeleteRows, DeleteColumns,
+        ManageSheet,
         ValidateWorkbook, Submit
     ]
 
@@ -186,7 +194,10 @@ class SpreadsheetBenchEnv(ActionableEnv):
         if tool_set in {TOOL_SET_NATIVE_READ, TOOL_SET_NATIVE_BASIC}:
             selected[1:1] = [ListSheets, InspectRange, FindCells]
         if tool_set == TOOL_SET_NATIVE_BASIC:
-            selected[4:4] = [WriteRange, ClearRange, FillFormula]
+            selected[4:4] = [
+                WriteRange, ClearRange, FillFormula, RecalculateAndRead,
+                FormatRange, DeleteRows, DeleteColumns, ManageSheet,
+            ]
         return [tool.get_info() for tool in selected]
 
     def __init__(self) -> None:
@@ -209,6 +220,9 @@ class SpreadsheetBenchEnv(ActionableEnv):
         )
         self._terminated: bool = False
         self._eval_cache: EvaluationResult | None = None
+        self._recalc_calls: int = 0
+        self._max_recalc_calls: int = 1
+        self._recalc_timeout: int = 120
         self.state: SpreadsheetBenchEnvState = SpreadsheetBenchEnvState()
         # Retained for save/load round-trips.
         self._last_reset_seed: int | None = None
@@ -266,6 +280,15 @@ class SpreadsheetBenchEnv(ActionableEnv):
             opts.get("tool_set")
             or os.environ.get("SPREADSHEETBENCH_TOOL_SET", "python")
         )
+        self._recalc_calls = 0
+        self._max_recalc_calls = int(opts.get(
+            "max_recalc_calls",
+            os.environ.get("SPREADSHEETBENCH_MAX_RECALC_CALLS", "1"),
+        ))
+        self._recalc_timeout = int(opts.get(
+            "recalc_timeout",
+            os.environ.get("SPREADSHEETBENCH_RECALC_TIMEOUT_SECONDS", "120"),
+        ))
 
         # `instance_id` (explicit id, used by the eval driver) wins; otherwise
         # select by seed. The orchestrator-injected options["task_id"] is the
@@ -322,6 +345,7 @@ class SpreadsheetBenchEnv(ActionableEnv):
             output_path=output_path,
             spreadsheet_preview=spreadsheet_preview,
             step_count=0,
+            extras={"workbook_revision": 0, "last_recalc_revision": -1},
         )
         return EnvResetResponse(
             observation=self._observe(),
@@ -352,7 +376,17 @@ class SpreadsheetBenchEnv(ActionableEnv):
                     data={"submitted": True},
                 ),
                 reward=0.0, terminated=True, truncated=False,
-                info={"submitted": True, "won": None},
+                info={
+                    "submitted": True,
+                    "won": None,
+                    "submitted_after_recalc": int(
+                        self.state.extras.get("last_recalc_revision", -1) >= 0
+                    ),
+                    "recalc_stale_at_submit": int(
+                        self.state.extras.get("last_recalc_revision", -1)
+                        != self.state.extras.get("workbook_revision", 0)
+                    ),
+                },
             )
 
         if action.name == ValidateWorkbook.name:
@@ -367,8 +401,17 @@ class SpreadsheetBenchEnv(ActionableEnv):
                 },
             )
 
-        if action.name in NATIVE_READ_TOOLS | NATIVE_WRITE_TOOLS:
-            category = "read" if action.name in NATIVE_READ_TOOLS else "write"
+        native_tools = (
+            NATIVE_READ_TOOLS | NATIVE_WRITE_TOOLS | NATIVE_RECALC_TOOLS
+            | NATIVE_STRUCTURE_TOOLS
+        )
+        if action.name in native_tools:
+            if action.name in NATIVE_READ_TOOLS:
+                category = "read"
+            elif action.name in NATIVE_RECALC_TOOLS:
+                category = "recalc"
+            else:
+                category = "write"
             enabled = (
                 self._tool_set in {TOOL_SET_NATIVE_READ, TOOL_SET_NATIVE_BASIC}
                 if category == "read"
@@ -394,14 +437,44 @@ class SpreadsheetBenchEnv(ActionableEnv):
                     info={"error": "tool_disabled", "won": None},
                 )
             try:
-                executor = (
-                    execute_read_tool if category == "read" else execute_write_tool
-                )
+                if category == "recalc":
+                    if self._recalc_calls >= self._max_recalc_calls:
+                        raise ReadToolError(
+                            "recalc_limit_reached",
+                            f"recalculate_and_read is limited to "
+                            f"{self._max_recalc_calls} call(s) per episode",
+                        )
+                    self._recalc_calls += 1
+                    executor = None
+                elif category == "read":
+                    executor = execute_read_tool
+                elif action.name in NATIVE_STRUCTURE_TOOLS:
+                    executor = execute_structure_tool
+                else:
+                    executor = execute_write_tool
                 with self._stage(f"native_{category}", action=action.name):
-                    payload, tool_output = executor(
-                        action.name, self.state.output_path, dict(action.kwargs))
+                    if category == "recalc":
+                        payload, tool_output = execute_recalculate_and_read(
+                            self.state.output_path,
+                            dict(action.kwargs),
+                            soffice_path=self._soffice_path,
+                            timeout=self._recalc_timeout,
+                        )
+                    else:
+                        assert executor is not None
+                        payload, tool_output = executor(
+                            action.name, self.state.output_path, dict(action.kwargs)
+                        )
                 tool_ok = True
                 tool_error = ""
+                if category == "write":
+                    self.state.extras["workbook_revision"] = int(
+                        self.state.extras.get("workbook_revision", 0)
+                    ) + 1
+                elif category == "recalc":
+                    self.state.extras["last_recalc_revision"] = int(
+                        self.state.extras.get("workbook_revision", 0)
+                    )
             except ReadToolError as exc:
                 payload, tool_output = error_payload(exc)
                 tool_ok = False
@@ -425,6 +498,10 @@ class SpreadsheetBenchEnv(ActionableEnv):
                     "tool_ok": tool_ok,
                     "tool_error": tool_error,
                     "tool_result": payload,
+                    "recalc_elapsed_ms": float(payload.get("elapsed_ms", 0.0)),
+                    "recalc_formula_error_count": int(
+                        payload.get("formula_error_cells", 0)
+                    ),
                     "won": None,
                 },
             )
@@ -454,6 +531,34 @@ class SpreadsheetBenchEnv(ActionableEnv):
                 info={"error": "empty_code"},
             )
 
+        preflight = preflight_python(code)
+        if preflight.error:
+            output = "[python preflight failed] " + preflight.error
+            error_type = preflight.error_type or "PreflightError"
+            syntax_error = error_type in _SYNTAX_ERROR_TYPES
+            self.state.last_code = code
+            self.state.last_output = output
+            self.state.last_returncode = -1
+            self.state.last_error_type = error_type
+            return EnvResponse(
+                observation=self._observe(run_output=output),
+                reward=(
+                    self._syntax_error_penalty
+                    if syntax_error else self._python_error_penalty
+                ),
+                terminated=False,
+                truncated=False,
+                info={
+                    "returncode": -1,
+                    "python_error": True,
+                    "python_error_type": error_type,
+                    "syntax_error": syntax_error,
+                    "python_preflight_rejected": True,
+                    "python_preflight_warnings": list(preflight.warnings),
+                    "won": None,
+                },
+            )
+
         self.state.step_count += 1
         with self._stage("run_python", action=action.name):
             stdout, returncode, error_type = self._run_python(code)
@@ -468,6 +573,10 @@ class SpreadsheetBenchEnv(ActionableEnv):
             reward = self._syntax_error_penalty
         elif python_error:
             reward = self._python_error_penalty
+        else:
+            self.state.extras["workbook_revision"] = int(
+                self.state.extras.get("workbook_revision", 0)
+            ) + 1
 
         return EnvResponse(
             observation=self._observe(run_output=stdout),
@@ -480,6 +589,8 @@ class SpreadsheetBenchEnv(ActionableEnv):
                 "python_error": python_error,
                 "python_error_type": error_type,
                 "syntax_error": syntax_error,
+                "python_preflight_rejected": False,
+                "python_preflight_warnings": list(preflight.warnings),
                 "won": None,
             },
         )
@@ -876,7 +987,10 @@ exec(compile(source, agent_script, "exec"), namespace)
         if self._tool_set == TOOL_SET_NATIVE_BASIC:
             tools[4:4] = [
                 "write_range(range, data, ...)", "clear_range(range, ...)",
-                "fill_formula(start_cell, formula_template, ...)"
+                "fill_formula(start_cell, formula_template, ...)",
+                "recalculate_and_read(cell_ranges)", "format_range(range, ...)",
+                "delete_rows(rows, ...)", "delete_columns(columns, ...)",
+                "manage_sheet(operation, sheet_name, ...)"
             ]
         return ", ".join(tools)
 
