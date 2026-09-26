@@ -1,6 +1,6 @@
 # Spreadsheet-RL 与当前 EnvHarness 方案对比及适配建议
 
-> 首次整理：2026-09-10；最后更新：2026-09-20
+> 首次整理：2026-09-10；最后更新：2026-09-24
 > 对比代码：Spreadsheet-RL `389be8c`；EnvHarness `180e258`  
 > 当前固定基座模型：`Qwen3-4B-Thinking-2507`
 
@@ -168,11 +168,13 @@ Spreadsheet-RL 是论文对应的完整训练栈，包含：
 - `python`：`run_python`、`validate_workbook`、`submit`；
 - `native_read`：在 `python` 基础上增加 `list_sheets`、`inspect_range`、
   `find_cells`；
-- `native_basic`：再增加 `write_range`、`clear_range` 和 `fill_formula`。
+- `native_basic`：再增加 `write_range`、`clear_range`、`fill_formula`、
+  `recalculate_and_read`、`format_range`、`delete_rows`、`delete_columns` 和
+  `manage_sheet`。
 
 只读工具已支持范围、返回字符数和 workbook 大小限制。写工具已使用统一文件锁、
-临时文件校验和原子替换，避免失败写入损坏工作簿。`run_python` 仍是公式、格式、
-排序和结构操作的兜底路径。
+临时文件校验和原子替换，避免失败写入损坏工作簿。`run_python` 仍是排序和未覆盖
+复杂操作的兜底路径。
 
 优点：能力上限高，开发量小，复杂任务可直接写任意 openpyxl/pandas 逻辑。
 
@@ -835,3 +837,81 @@ pytest -q rl/tests` 仍需在 Python 3.11 训练镜像运行。
 干净的 pinned verl-agent checkout 上验证整套 patch 可顺序应用。当前宿主完成 Python 3.8
 语法检查和离线聚合行为检查；Python 3.11 训练镜像中的完整 `rl/tests` 及真实 rollout
 验收仍待执行。
+
+## 22. 2026-09-24：五阶段工具迁移代码进展
+
+本轮在 njceph5 分支 `feat/spreadsheet-five-stage-migration` 上完成五阶段代码实现，尚未把
+“代码完成”标记为“集群验收完成”。
+
+### 22.1 阶段一：Linux 中间重算
+
+- 新增 `recalculate_and_read`，在 workbook lock 下复制当前 `output.xlsx`；
+- 仅对临时副本调用 headless LibreOffice，原输出文件不被重写；
+- 一次最多读取 10 个 range、400 个 cell，默认每 episode 只允许调用一次；
+- 返回 cached values、公式数、公式错误数和耗时；
+- projection 强制它是本 turn 最后一个调用，模型必须在下一 turn 检查结果后 submit；
+- 启动脚本新增并透传 `SPREADSHEETBENCH_MAX_RECALC_CALLS` 和
+  `SPREADSHEETBENCH_RECALC_TIMEOUT_SECONDS`。
+
+该工具不依赖 Windows；它复用当前 evaluator 已部署的 Linux LibreOffice。兼容性仍以
+LibreOffice 为准，不能宣称与 Microsoft Excel 完全一致。
+
+### 22.2 阶段二：强化 `fill_formula`
+
+- projection 和 bridge 双层检查 `formula_template`；
+- 拒绝不以 `=` 开头、括号/引号不闭合、操作数缺失，以及 `="=..."` 这类把公式
+  包成文本的输出；
+- 保留相对、混合和绝对引用平移、范围上限、文件锁、临时文件重开校验和原子替换；
+- prompt 明确要求用 `cell.value = '=...'`，禁止不存在的 `cell.formula` API。
+
+### 22.3 阶段三：submit 前自检协议
+
+- prompt 区分 `validate_workbook` 的结构检查与 LibreOffice 公式重算；
+- 推荐最终编辑后单独调用 `recalculate_and_read`，确认结果后下一 turn submit；
+- bridge 维护 workbook revision，记录 `submitted_after_recalc` 和
+  `recalc_stale_at_submit`，可识别“重算后又修改再提交”的轨迹。
+
+### 22.4 阶段四：`run_python` AST preflight
+
+- subprocess 启动前先执行 Python AST parse；
+- syntax error 和 `Cell.formula = ...` 直接拒绝，不启动子进程；
+- bare `except`、从 `input_path` 重新加载、疑似修改但未调用 `save_workbook()` 作为警告；
+- 新增 preflight reject/warning 指标，避免把静态可识别错误全部归为普通 runtime error。
+
+### 22.5 阶段五：格式和结构工具
+
+- `format_range`：font、fill、alignment、border、number format、行高、列宽；未指定的
+  font/alignment 属性保持原值；参数有白名单和范围校验；
+- `delete_rows` / `delete_columns`：范围解析、重叠区间合并、used-range 边界、merged
+  range 拒绝、失败不覆盖原 workbook；
+- `manage_sheet`：create、rename、copy、move、hide、unhide，检查非法/重名 sheet、
+  越界 index 和唯一可见 sheet；
+- 所有 mutation 共用 lock + 临时保存 + 重新打开校验 + `os.replace()`。
+
+openpyxl 不保证在删除行列后重写所有依赖公式，因此删除工具会显式返回
+`formula_reference_update=not_guaranteed_by_openpyxl`。需要依赖公式引用变化的任务应在
+删除后使用中间重算检查；该限制必须保留在实验报告中。
+
+### 22.6 新增训练观测
+
+train、validation、env trajectory 和离线 summary 已补充：
+
+- `env/recalc_tool_call_ratio`、`env/recalc_tool_success_rate`、
+  `env/recalc_tool_error_rate`；
+- `env/recalc_elapsed_ms_mean`、`env/recalc_formula_error_count_mean`；
+- `env/submitted_after_recalc_ratio`、`env/recalc_stale_at_submit_ratio`；
+- `env/python_preflight_reject_ratio`、`env/python_preflight_warning_count_mean`；
+- 新增五个工具各自的 `tool/<name>_ratio`。
+
+新建 `verl_agent_spreadsheetbench_tool_metrics.patch`，并在 `fetch_verl_agent.sh` 中按序应用，
+保证重新拉取 pinned verl-agent 时不会丢失指标改动。
+
+### 22.7 待验收
+
+1. 在 Python 3.11 训练镜像运行完整 `rl/tests`；当前 Codex 宿主没有 pytest/openpyxl
+   对应环境，不能替代集群测试。
+2. 用真实 LibreOffice 运行 recalc worker smoke，记录成功率和 p50/p95 耗时。
+3. 固定任务运行 5-step diagnostic，对比 Base 的 workbook success、write success、
+   preflight reject、formula error、episode length 和 wall time。
+4. 候选 checkpoint 再跑完整 399 条 paired evaluation；五阶段工具不能只凭 fast-val
+   或 parser 指标判定有效。

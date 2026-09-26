@@ -216,6 +216,121 @@ class FillFormula(Tool):
         raise NotImplementedError("SpreadsheetBenchEnv.step executes fill_formula")
 
 
+class RecalculateAndRead(Tool):
+    name = "recalculate_and_read"
+    description = (
+        "Recalculate a temporary copy of the current output workbook with "
+        "headless LibreOffice and read cached values from finite A1 ranges. "
+        "This does not modify output_path. Make it the final call of a turn so "
+        "you can inspect its result before submitting."
+    )
+
+    @classmethod
+    def get_info(cls) -> dict:
+        return {"type": "function", "function": {
+            "name": cls.name,
+            "description": cls.description,
+            "parameters": {"type": "object", "properties": {
+                "cell_ranges": {"type": "array", "items": {"type": "string"}},
+            }, "required": ["cell_ranges"]},
+        }}
+
+    @classmethod
+    def invoke(cls, env_state: Any, cell_ranges: list[str]) -> Any:
+        raise NotImplementedError("SpreadsheetBenchEnv.step executes recalculate_and_read")
+
+
+class FormatRange(Tool):
+    name = "format_range"
+    description = (
+        "Apply bounded cell formatting and optional row height or column width "
+        "to one finite range."
+    )
+
+    @classmethod
+    def get_info(cls) -> dict:
+        return {"type": "function", "function": {
+            "name": cls.name, "description": cls.description,
+            "parameters": {"type": "object", "properties": {
+                "range": {"type": "string"},
+                "sheet_name": {"type": "string"},
+                "font": {"type": "object"}, "fill": {"type": "object"},
+                "alignment": {"type": "object"}, "border": {"type": "object"},
+                "number_format": {"type": "string"},
+                "row_height": {"type": "number"},
+                "column_width": {"type": "number"},
+            }, "required": ["range"]},
+        }}
+
+    @classmethod
+    def invoke(cls, env_state: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("SpreadsheetBenchEnv.step executes format_range")
+
+
+class DeleteRows(Tool):
+    name = "delete_rows"
+    description = "Delete worksheet row ranges and shift remaining cells up."
+
+    @classmethod
+    def get_info(cls) -> dict:
+        return {"type": "function", "function": {
+            "name": cls.name, "description": cls.description,
+            "parameters": {"type": "object", "properties": {
+                "rows": {"type": "array", "items": {"type": "string"}},
+                "sheet_name": {"type": "string"},
+            }, "required": ["rows"]},
+        }}
+
+    @classmethod
+    def invoke(cls, env_state: Any, rows: list[str], sheet_name: str = "") -> Any:
+        raise NotImplementedError("SpreadsheetBenchEnv.step executes delete_rows")
+
+
+class DeleteColumns(Tool):
+    name = "delete_columns"
+    description = "Delete worksheet column ranges and shift remaining cells left."
+
+    @classmethod
+    def get_info(cls) -> dict:
+        return {"type": "function", "function": {
+            "name": cls.name, "description": cls.description,
+            "parameters": {"type": "object", "properties": {
+                "columns": {"type": "array", "items": {"type": "string"}},
+                "sheet_name": {"type": "string"},
+            }, "required": ["columns"]},
+        }}
+
+    @classmethod
+    def invoke(cls, env_state: Any, columns: list[str], sheet_name: str = "") -> Any:
+        raise NotImplementedError("SpreadsheetBenchEnv.step executes delete_columns")
+
+
+class ManageSheet(Tool):
+    name = "manage_sheet"
+    description = (
+        "Create, rename, copy, move, hide, or unhide a worksheet with safety "
+        "checks for duplicate names and the last visible sheet."
+    )
+
+    @classmethod
+    def get_info(cls) -> dict:
+        return {"type": "function", "function": {
+            "name": cls.name, "description": cls.description,
+            "parameters": {"type": "object", "properties": {
+                "operation": {"type": "string", "enum": [
+                    "create", "rename", "copy", "move", "hide", "unhide"
+                ]},
+                "sheet_name": {"type": "string"},
+                "new_name": {"type": "string"},
+                "index": {"type": "integer", "minimum": 0},
+            }, "required": ["operation", "sheet_name"]},
+        }}
+
+    @classmethod
+    def invoke(cls, env_state: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("SpreadsheetBenchEnv.step executes manage_sheet")
+
+
 class ValidateWorkbook(Tool):
     name = "validate_workbook"
     description = (

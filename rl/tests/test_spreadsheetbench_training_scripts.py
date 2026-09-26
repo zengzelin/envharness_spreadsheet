@@ -45,6 +45,11 @@ def test_training_pipeline_exports_native_tool_metrics() -> None:
         "tool_list_sheets": "tool/list_sheets_ratio",
         "tool_write_range": "tool/write_range_ratio",
         "tool_fill_formula": "tool/fill_formula_ratio",
+        "tool_recalculate_and_read": "tool/recalculate_and_read_ratio",
+        "tool_format_range": "tool/format_range_ratio",
+        "env_recalc_tool_call": "env/recalc_tool_call_ratio",
+        "env_recalc_formula_error_count": "env/recalc_formula_error_count_mean",
+        "env_python_preflight_reject": "env/python_preflight_reject_ratio",
         "tool_submit": "tool/submit_ratio",
         "episode_tool_calls_per_turn": "episode/tool_calls_per_turn",
         "episode_projected_tool_calls_per_turn": "episode/projected_tool_calls_per_turn",
@@ -81,6 +86,16 @@ def test_training_pipeline_exports_native_tool_metrics() -> None:
         assert metric_name in trainer_source
 
 
+def test_training_scripts_forward_recalc_limits() -> None:
+    for script_name in (
+        "run_spreadsheetbench_grpo.sh",
+        "submit_spreadsheetbench_grpo.sh",
+    ):
+        source = (ROOT / "rl/scripts" / script_name).read_text()
+        assert "SPREADSHEETBENCH_MAX_RECALC_CALLS" in source
+        assert "SPREADSHEETBENCH_RECALC_TIMEOUT_SECONDS" in source
+
+
 def test_training_pipeline_logs_spreadsheet_rollout_phase_boundaries() -> None:
     rollout_source = (
         ROOT / "third_party/verl-agent/agent_system/multi_turn_rollout/rollout_loop.py"
@@ -111,6 +126,12 @@ def test_fetch_verl_agent_reproduces_spreadsheet_metrics_patch() -> None:
     assert "success_rate_weights" in patch
     assert "episode_tool_calls_per_turn" in patch
     assert "env_multi_call_short_circuit" in patch
+    tool_patch = (
+        ROOT / "rl/integration/verl_agent_spreadsheetbench_tool_metrics.patch"
+    ).read_text()
+    assert "SPREADSHEET_TOOL_METRICS_PATCH_FILE" in source
+    assert "env_recalc_tool_call" in tool_patch
+    assert "tool_format_range" in tool_patch
     eval_patch = (
         ROOT / "rl/integration/verl_agent_spreadsheetbench_eval.patch"
     ).read_text()
@@ -639,6 +660,12 @@ def test_compare_evals_rejects_evaluator_errors_by_default(tmp_path: Path) -> No
 def test_eval_manifest_records_behavioral_comparison_fields() -> None:
     source = (ROOT / "rl/scripts/run_spreadsheetbench_grpo.sh").read_text()
     manifest_source = source[source.index("keys = ["):]
+    exported_names = {
+        token
+        for line in source.splitlines()
+        if line.startswith("export ")
+        for token in line[len("export "):].split()
+    }
 
     for name in (
         "APPLY_CHAT_TEMPLATE_ENABLE_THINKING",
@@ -649,9 +676,7 @@ def test_eval_manifest_records_behavioral_comparison_fields() -> None:
         "ROLLOUT_MAX_NUM_BATCHED_TOKENS",
     ):
         assert f'"{name}"' in manifest_source
-        assert f"export {name}" in source or f" {name}" in source[
-            source.index("export VAL_TEMPERATURE"):source.index("if [[", source.index("export VAL_TEMPERATURE"))
-        ]
+        assert name in exported_names
 
 
 def test_val_only_spreadsheet_env_skips_train_actor_pool() -> None:

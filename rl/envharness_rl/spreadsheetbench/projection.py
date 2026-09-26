@@ -16,6 +16,10 @@ _THINK_END_TAG = "</think>"
 _FENCED_JSON_RE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
 _NATIVE_READ_TOOLS = frozenset({"list_sheets", "inspect_range", "find_cells"})
 _NATIVE_WRITE_TOOLS = frozenset({"write_range", "clear_range", "fill_formula"})
+_NATIVE_RECALC_TOOLS = frozenset({"recalculate_and_read"})
+_NATIVE_STRUCTURE_TOOLS = frozenset({
+    "format_range", "delete_rows", "delete_columns", "manage_sheet"
+})
 _CELL_RE = re.compile(
     r"^(?:(?:'[^']+'|[^!]+)!)?\$?([A-Za-z]{1,3})\$?([1-9]\d*)$"
 )
@@ -51,6 +55,11 @@ def _fill_formula_error(arguments: dict[str, Any]) -> str | None:
         return "fill_formula start_cell must be one A1 cell."
     if not isinstance(formula, str) or not formula.startswith("="):
         return "fill_formula formula_template must start with '='."
+    if formula.startswith(('="=', "='=")):
+        return (
+            "fill_formula formula_template looks like a quoted formula; use the "
+            "Excel formula directly, for example '=A2+B2'."
+        )
     start_col, start_row_text = match.groups()
     start_row = int(start_row_text)
     end_row = arguments.get("end_row", start_row)
@@ -231,7 +240,7 @@ def _project_one_with_diagnostics(
         diagnostics["native_valid"] = int(status == "native_tool_call")
         diagnostics["recovered"] = int(status.endswith("_recovered"))
         return Action(name=name, kwargs=arguments), 1, diagnostics
-    if name in _NATIVE_WRITE_TOOLS:
+    if name in _NATIVE_WRITE_TOOLS | _NATIVE_RECALC_TOOLS | _NATIVE_STRUCTURE_TOOLS:
         if not _native_write_enabled():
             diagnostics["status"] = "tool_disabled"
             diagnostics["error"] = (
@@ -243,6 +252,11 @@ def _project_one_with_diagnostics(
             "write_range": {"range", "data"},
             "clear_range": {"range"},
             "fill_formula": {"start_cell", "formula_template"},
+            "recalculate_and_read": {"cell_ranges"},
+            "format_range": {"range"},
+            "delete_rows": {"rows"},
+            "delete_columns": {"columns"},
+            "manage_sheet": {"operation", "sheet_name"},
         }
         missing = [key for key in required[name] if key not in arguments]
         if missing:
@@ -260,7 +274,7 @@ def _project_one_with_diagnostics(
                 diagnostics["error"] = f"Tool call parse error: {fill_error}"
                 return _invalid_action(diagnostics["error"]), 0, diagnostics
         range_value = arguments.get("range")
-        if name != "fill_formula" and (
+        if name in {"write_range", "clear_range", "format_range"} and (
             not isinstance(range_value, str) or not range_value.strip()
         ):
             diagnostics["status"] = "missing_range"
@@ -366,6 +380,18 @@ def project_action_batch(
             "status": "submit_not_last",
             "valid": 0,
             "invalid": 1,
+            "error": message,
+        })
+    for call_index, action in enumerate(actions[:-1]):
+        if action.name != "recalculate_and_read":
+            continue
+        message = (
+            "Tool call parse error: recalculate_and_read must be the final "
+            "call in a batch so its values can be inspected before submit."
+        )
+        actions[call_index] = _invalid_action(message)
+        diagnostics[call_index].update({
+            "status": "recalc_not_last", "valid": 0, "invalid": 1,
             "error": message,
         })
     return actions, diagnostics

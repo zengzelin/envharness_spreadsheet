@@ -235,8 +235,40 @@ def test_manager_native_basic_prompt_describes_formula_and_multi_call(
 
     prompt = observations["text"][0]
     assert '"name":"fill_formula"' in prompt
+    assert '"name":"recalculate_and_read"' in prompt
+    assert '"name":"format_range"' in prompt
+    assert "It must be the last\ncall in its turn" in prompt
+    assert "submit in the next turn" in prompt
+    assert "cell.value, not cell.formula" in prompt
     assert "one to four ordered JSON tool calls" in prompt
     assert "Put submit\nlast" in prompt
+
+
+def test_manager_exports_recalc_and_preflight_diagnostics() -> None:
+    diagnostics = SpreadsheetBenchEnvironmentManager._step_diagnostics(
+        {"tool_name": "recalculate_and_read", "native_valid": 1},
+        {
+            "tool_name": "recalculate_and_read",
+            "tool_category": "recalc",
+            "tool_ok": True,
+            "recalc_elapsed_ms": 123.5,
+            "recalc_formula_error_count": 2,
+            "submitted_after_recalc": True,
+            "recalc_stale_at_submit": False,
+            "python_preflight_rejected": True,
+            "python_preflight_warnings": ["warning"],
+        },
+    )
+
+    assert diagnostics["env/recalc_tool_call"] == 1
+    assert diagnostics["env/recalc_tool_success"] == 1
+    assert diagnostics["env/recalc_elapsed_ms"] == 123.5
+    assert diagnostics["env/recalc_formula_error_count"] == 2
+    assert diagnostics["env/submitted_after_recalc"] == 1
+    assert diagnostics["env/recalc_stale_at_submit"] == 0
+    assert diagnostics["env/python_preflight_reject"] == 1
+    assert diagnostics["env/python_preflight_warning_count"] == 1
+    assert diagnostics["tool/recalculate_and_read"] == 1
 
 
 def test_manager_returns_parser_error_observation_after_invalid_action() -> None:

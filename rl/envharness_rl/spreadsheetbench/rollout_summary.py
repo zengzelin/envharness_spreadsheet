@@ -128,6 +128,10 @@ def summarize_trajectories(paths: Iterable[Path]) -> dict:
     steps = valid_actions = python_errors = syntax_errors = 0
     read_calls = read_successes = read_errors = 0
     write_calls = write_successes = write_errors = 0
+    recalc_calls = recalc_successes = recalc_errors = 0
+    recalc_formula_errors = recalc_elapsed_ms = 0.0
+    submitted_after_recalc = recalc_stale_at_submit = 0
+    python_preflight_rejects = python_preflight_warnings = 0
     write_call_count = write_call_successes = 0
     episodes_with_write_error = 0
     tool_calls = projected_tool_calls = 0
@@ -170,7 +174,10 @@ def summarize_trajectories(paths: Iterable[Path]) -> dict:
                 # did not record tool_results, so projected calls are the best
                 # available approximation for those files.
                 executed_actions = projected_actions
-            write_names = {"write_range", "clear_range", "fill_formula"}
+            write_names = {
+                "write_range", "clear_range", "fill_formula", "format_range",
+                "delete_rows", "delete_columns", "manage_sheet",
+            }
             if isinstance(tool_results, list):
                 write_results = [
                     result for result in tool_results
@@ -251,6 +258,29 @@ def summarize_trajectories(paths: Iterable[Path]) -> dict:
             write_calls += int(bool(diagnostics.get("env/write_tool_call")))
             write_successes += int(bool(diagnostics.get("env/write_tool_success")))
             write_errors += int(bool(diagnostics.get("env/write_tool_error")))
+            recalc_calls += int(bool(diagnostics.get("env/recalc_tool_call")))
+            recalc_successes += int(bool(
+                diagnostics.get("env/recalc_tool_success")
+            ))
+            recalc_errors += int(bool(diagnostics.get("env/recalc_tool_error")))
+            recalc_formula_errors += float(
+                diagnostics.get("env/recalc_formula_error_count", 0)
+            )
+            recalc_elapsed_ms += float(
+                diagnostics.get("env/recalc_elapsed_ms", 0.0)
+            )
+            submitted_after_recalc += int(bool(
+                diagnostics.get("env/submitted_after_recalc")
+            ))
+            recalc_stale_at_submit += int(bool(
+                diagnostics.get("env/recalc_stale_at_submit")
+            ))
+            python_preflight_rejects += int(bool(
+                diagnostics.get("env/python_preflight_reject")
+            ))
+            python_preflight_warnings += int(
+                diagnostics.get("env/python_preflight_warning_count", 0)
+            )
             if not isinstance(tool_results, list) and diagnostics.get(
                 "env/write_tool_call"
             ):
@@ -265,6 +295,7 @@ def summarize_trajectories(paths: Iterable[Path]) -> dict:
                 diagnostics.get("env/python_error_type")
                 or diagnostics.get("env/write_tool_error_type")
                 or diagnostics.get("env/read_tool_error_type")
+                or diagnostics.get("env/recalc_tool_error_type")
                 or ""
             )
             if error_type:
@@ -294,6 +325,19 @@ def summarize_trajectories(paths: Iterable[Path]) -> dict:
             episodes_with_write_error, episodes
         ),
         "write_tool_error_rate": _ratio(write_errors, write_calls),
+        "recalc_tool_call_ratio": _ratio(recalc_calls, steps),
+        "recalc_tool_success_rate": _ratio(recalc_successes, recalc_calls),
+        "recalc_tool_error_rate": _ratio(recalc_errors, recalc_calls),
+        "recalc_formula_error_count_mean": _ratio(
+            recalc_formula_errors, recalc_calls
+        ),
+        "recalc_elapsed_ms_mean": _ratio(recalc_elapsed_ms, recalc_calls),
+        "submitted_after_recalc_rate": _ratio(submitted_after_recalc, episodes),
+        "recalc_stale_at_submit_rate": _ratio(recalc_stale_at_submit, episodes),
+        "python_preflight_reject_ratio": _ratio(python_preflight_rejects, steps),
+        "python_preflight_warning_count_mean": _ratio(
+            python_preflight_warnings, steps
+        ),
         "tool_calls_per_turn": _ratio(tool_calls, steps),
         "projected_tool_calls_per_turn": _ratio(projected_tool_calls, steps),
         "multi_call_ratio": _ratio(multi_call_steps, steps),
