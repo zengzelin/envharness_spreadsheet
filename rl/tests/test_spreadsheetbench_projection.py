@@ -81,13 +81,80 @@ def test_project_action_batch_parses_multiple_native_calls(monkeypatch) -> None:
     assert all(item["valid"] == 1 for item in diagnostics)
 
 
-def test_project_action_batch_rejects_more_than_four_calls() -> None:
-    model_output = "\n".join(_tool_call("submit", {}) for _ in range(5))
+def test_project_action_batch_safely_truncates_more_than_four_calls(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_read")
+    model_output = "\n".join(
+        _tool_call("list_sheets", {}) for _ in range(5)
+    )
 
     actions, diagnostics = project_action_batch(model_output)
 
-    assert [action.name for action in actions] == ["invalid"]
-    assert diagnostics[0]["status"] == "too_many_tool_calls"
+    assert [action.name for action in actions] == ["list_sheets"] * 4
+    assert all(item["valid"] == 1 for item in diagnostics)
+    assert diagnostics[0]["batch_truncated"] == 1
+    assert diagnostics[0]["total_call_count"] == 5
+    assert diagnostics[0]["truncated_call_count"] == 1
+
+
+def test_project_action_batch_does_not_execute_truncated_submit() -> None:
+    model_output = "\n".join([
+        _tool_call("validate_workbook", {}),
+        _tool_call("validate_workbook", {}),
+        _tool_call("validate_workbook", {}),
+        _tool_call("validate_workbook", {}),
+        _tool_call("submit", {}),
+    ])
+
+    actions, diagnostics = project_action_batch(model_output)
+
+    assert [action.name for action in actions] == ["validate_workbook"] * 4
+    assert diagnostics[0]["batch_truncated"] == 1
+
+
+def test_project_action_batch_rejects_submit_before_truncated_calls() -> None:
+    model_output = "\n".join([
+        _tool_call("validate_workbook", {}),
+        _tool_call("validate_workbook", {}),
+        _tool_call("validate_workbook", {}),
+        _tool_call("submit", {}),
+        _tool_call("validate_workbook", {}),
+    ])
+
+    actions, diagnostics = project_action_batch(model_output)
+
+    assert actions[-1].name == "invalid"
+    assert diagnostics[-1]["status"] == "submit_not_last"
+
+
+def test_project_action_batch_rejects_retained_recalc_before_truncated_calls(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_basic")
+    model_output = "\n".join([
+        _tool_call("validate_workbook", {}),
+        _tool_call("validate_workbook", {}),
+        _tool_call("validate_workbook", {}),
+        _tool_call("recalculate_and_read", {"cell_ranges": ["Sheet1!A1"]}),
+        _tool_call("submit", {}),
+    ])
+
+    actions, diagnostics = project_action_batch(model_output)
+
+    assert actions[-1].name == "invalid"
+    assert diagnostics[-1]["status"] == "recalc_not_last"
+
+
+def test_project_action_batch_never_allows_cap_above_four() -> None:
+    model_output = "\n".join(_tool_call("validate_workbook", {}) for _ in range(5))
+
+    try:
+        project_action_batch(model_output, max_calls=5)
+    except ValueError as exc:
+        assert "between 1 and 4" in str(exc)
+    else:
+        raise AssertionError("max_calls=5 must not be accepted")
 
 
 def test_project_action_batch_preserves_invalid_call_index(monkeypatch) -> None:

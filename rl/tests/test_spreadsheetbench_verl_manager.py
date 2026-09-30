@@ -110,6 +110,52 @@ def test_manager_executes_and_records_multiple_calls_from_one_model_turn(
     assert infos[0]["parser/invalid"] == 0
 
 
+def test_manager_reports_safely_truncated_tool_batch(monkeypatch) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_TOOL_SET", "native_read")
+    envs = FakeVectorEnvs()
+    config = SimpleNamespace(env=SimpleNamespace(history_length=2))
+    manager = SpreadsheetBenchEnvironmentManager(
+        envs, envharness_spreadsheetbench_projection, config
+    )
+    manager.reset(kwargs={})
+    model_output = "\n".join(
+        '<tool_call>{"name":"list_sheets","arguments":{}}</tool_call>'
+        for _ in range(5)
+    )
+
+    observations, _, _, infos = manager.step([model_output])
+
+    assert len(envs.action_batches[0]) == 4
+    assert infos[0]["parser/tool_calls_truncated"] == 1
+    assert infos[0]["episode/projected_tool_calls_per_turn"] == 5
+    assert infos[0]["episode/tool_calls_per_turn"] == 4
+    assert infos[0]["env/multi_call_skipped_calls"] == 1
+    assert "Accepted only the first 4 of 5" in observations["anchor"][0]
+
+
+def test_manager_reports_parser_error_and_truncation_together() -> None:
+    envs = FakeVectorEnvs()
+    config = SimpleNamespace(env=SimpleNamespace(history_length=2))
+    manager = SpreadsheetBenchEnvironmentManager(
+        envs, envharness_spreadsheetbench_projection, config
+    )
+    manager.reset(kwargs={})
+    calls = [
+        '<tool_call>{"name":"validate_workbook","arguments":{}}</tool_call>'
+        for _ in range(3)
+    ]
+    calls.extend([
+        '<tool_call>{"name":"submit","arguments":{}}</tool_call>',
+        '<tool_call>{"name":"validate_workbook","arguments":{}}</tool_call>',
+    ])
+
+    observations, _, _, infos = manager.step(["\n".join(calls)])
+
+    assert infos[0]["is_action_valid"].item() == 0
+    assert "submit must be the final call" in observations["anchor"][0]
+    assert "Accepted only the first 4 of 5" in observations["anchor"][0]
+
+
 class ShortCircuitVectorEnvs(FakeVectorEnvs):
     def step_many(self, action_batches):
         result = self.step([batch[0] for batch in action_batches])

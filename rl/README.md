@@ -114,6 +114,13 @@ call in its batch. `recalculate_and_read` recalculates a temporary copy with
 LibreOffice, must be last in its turn, and should be followed by `submit` in a
 new turn after the returned values have been checked.
 
+The SpreadsheetBench launchers require a successful validation of the current
+workbook revision before submission. `run_python` writes transactionally, and
+failed Python calls or invalid xlsx output are rolled back. Cell-addressed
+mutation tools are limited to 50,000 cells per call and 100,000 attempted cells
+per turn. If a model emits more than four calls, only the first four are
+admitted and the next observation asks it to continue in a later turn.
+
 The launcher writes `launch.log`, `train.log`, and checkpoints under
 `runs/grpo_spreadsheetbench_<mode>_<timestamp>/`; the corresponding
 `*_latest` symlink points at the newest run. The parquet inputs are generated
@@ -160,6 +167,7 @@ export SPREADSHEETBENCH_ACTOR_TIMEOUT_SECONDS=600
 export SPREADSHEETBENCH_PHASE_HEARTBEAT_SECONDS=60
 export SPREADSHEETBENCH_MAX_RECALC_CALLS=1
 export SPREADSHEETBENCH_RECALC_TIMEOUT_SECONDS=120
+export SPREADSHEETBENCH_REQUIRE_VALIDATION_BEFORE_SUBMIT=true
 ```
 
 The actor timeout bounds each parallel environment `reset`, `step`, and
@@ -182,8 +190,9 @@ That clones [verl-agent](https://github.com/langfengQ/verl-agent) at commit
 `796ed310287fa605c9292a0fce07a86d79fde05e` into `third_party/verl-agent/`
 (gitignored) and applies the ordered patches under `rl/integration/`, including
 the EnvHarness routes, tracking lifecycle, SpreadsheetBench runtime,
-diagnostics, metrics, val-only actor allocation, and native-tool metrics. It is
-idempotent: re-running on an already-patched tree is a no-op.
+diagnostics, metrics, val-only actor allocation, native-tool metrics, and
+SpreadsheetBench hardening metrics. It is idempotent: re-running on an
+already-patched tree is a no-op.
 
 Equivalent manual steps, if you'd rather drive git yourself or place the
 tree elsewhere (then point `$VERL_AGENT` at it):

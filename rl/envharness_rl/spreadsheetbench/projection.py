@@ -23,6 +23,7 @@ _NATIVE_STRUCTURE_TOOLS = frozenset({
 _CELL_RE = re.compile(
     r"^(?:(?:'[^']+'|[^!]+)!)?\$?([A-Za-z]{1,3})\$?([1-9]\d*)$"
 )
+MAX_TOOL_CALLS_PER_TURN = 4
 
 
 def _tool_set() -> str:
@@ -317,14 +318,27 @@ def _project_one(model_output: str) -> tuple[Action, int]:
 
 
 def project_action_batch(
-    model_output: str, max_calls: int = 4,
+    model_output: str, max_calls: int = MAX_TOOL_CALLS_PER_TURN,
 ) -> tuple[list[Action], list[dict[str, Any]]]:
-    """Parse an ordered, bounded list of native tool calls from one turn."""
+    """Parse an ordered, bounded list of native tool calls from one turn.
+
+    Calls beyond the hard bound are not executed. The valid prefix is
+    returned with explicit truncation diagnostics so the manager can tell the
+    model to continue in its next turn. This preserves useful prefix work while
+    preventing unbounded batches from reaching the environment.
+    """
+    if max_calls < 1 or max_calls > MAX_TOOL_CALLS_PER_TURN:
+        raise ValueError(
+            f"max_calls must be between 1 and {MAX_TOOL_CALLS_PER_TURN}"
+        )
     text = str(model_output or "")
     parse_region, region_error = _parse_region(text)
     if region_error is not None:
         action, _, diagnostic = _project_one_with_diagnostics(text)
         diagnostic["call_index"] = 0
+        diagnostic["batch_truncated"] = 0
+        diagnostic["total_call_count"] = 1
+        diagnostic["truncated_call_count"] = 0
         return [action], [diagnostic]
 
     blocks: list[str] = []
@@ -344,19 +358,13 @@ def project_action_batch(
     if not blocks:
         action, _, diagnostic = _project_one_with_diagnostics(text)
         diagnostic["call_index"] = 0
+        diagnostic["batch_truncated"] = 0
+        diagnostic["total_call_count"] = 1
+        diagnostic["truncated_call_count"] = 0
         return [action], [diagnostic]
-    if len(blocks) > max_calls:
-        message = (
-            f"Tool call parse error: {len(blocks)} calls exceed the "
-            f"per-turn maximum of {max_calls}."
-        )
-        diagnostic = _base_diagnostics(text)
-        diagnostic.update({
-            "status": "too_many_tool_calls",
-            "error": message,
-            "call_index": 0,
-        })
-        return [_invalid_action(message)], [diagnostic]
+    total_call_count = len(blocks)
+    truncated_call_count = max(total_call_count - max_calls, 0)
+    blocks = blocks[:max_calls]
 
     actions: list[Action] = []
     diagnostics: list[dict[str, Any]] = []
@@ -368,11 +376,16 @@ def project_action_batch(
             _THINK_START_TAG in text or _THINK_END_TAG in text
         )
         diagnostic["has_markdown_fence"] = int("```" in text)
+        diagnostic["batch_truncated"] = int(truncated_call_count > 0)
+        diagnostic["total_call_count"] = total_call_count
+        diagnostic["truncated_call_count"] = truncated_call_count
         actions.append(action)
         diagnostics.append(diagnostic)
 
-    for call_index, action in enumerate(actions[:-1]):
+    for call_index, action in enumerate(actions):
         if action.name != "submit":
+            continue
+        if call_index == total_call_count - 1:
             continue
         message = "Tool call parse error: submit must be the final call in a batch."
         actions[call_index] = _invalid_action(message)
@@ -382,8 +395,10 @@ def project_action_batch(
             "invalid": 1,
             "error": message,
         })
-    for call_index, action in enumerate(actions[:-1]):
+    for call_index, action in enumerate(actions):
         if action.name != "recalculate_and_read":
+            continue
+        if call_index == total_call_count - 1:
             continue
         message = (
             "Tool call parse error: recalculate_and_read must be the final "

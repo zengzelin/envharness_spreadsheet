@@ -83,6 +83,8 @@ Reset options (passed through `options` in reset()):
                                    (default -0.05).
     syntax_error_penalty: float -- reward for Syntax/Indentation/TabError
                                    (default -0.1).
+    require_validation_before_submit: bool -- require a current successful
+                            validate_workbook or recalculate_and_read result.
     tool_set: str        -- python (default), native_read, or native_basic.
 """
 from __future__ import annotations
@@ -90,6 +92,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -126,7 +129,7 @@ from .read_tools import (
 from .python_preflight import preflight_python
 from .recalc_tools import execute_recalculate_and_read
 from .structure_tools import execute_structure_tool
-from .write_tools import execute_write_tool
+from .write_tools import execute_write_tool, validate_formula_syntax
 from .tools import (
     ClearRange, DeleteColumns, DeleteRows, FillFormula, FindCells, FormatRange,
     InspectRange, ListSheets, ManageSheet, RecalculateAndRead, RunPython, Submit,
@@ -215,6 +218,7 @@ class SpreadsheetBenchEnv(ActionableEnv):
         self._recalc_golden: bool = True
         self._python_error_penalty: float = DEFAULT_PYTHON_ERROR_PENALTY
         self._syntax_error_penalty: float = DEFAULT_SYNTAX_ERROR_PENALTY
+        self._require_validation_before_submit = False
         self._tool_set: str = normalize_tool_set(
             os.environ.get("SPREADSHEETBENCH_TOOL_SET", "python")
         )
@@ -276,6 +280,17 @@ class SpreadsheetBenchEnv(ActionableEnv):
         self._syntax_error_penalty = float(opts.get(
             "syntax_error_penalty", DEFAULT_SYNTAX_ERROR_PENALTY
         ))
+        require_validation = opts.get(
+            "require_validation_before_submit",
+            os.environ.get(
+                "SPREADSHEETBENCH_REQUIRE_VALIDATION_BEFORE_SUBMIT", "false"
+            ),
+        )
+        if isinstance(require_validation, str):
+            require_validation = require_validation.strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+        self._require_validation_before_submit = bool(require_validation)
         self._tool_set = normalize_tool_set(
             opts.get("tool_set")
             or os.environ.get("SPREADSHEETBENCH_TOOL_SET", "python")
@@ -345,7 +360,11 @@ class SpreadsheetBenchEnv(ActionableEnv):
             output_path=output_path,
             spreadsheet_preview=spreadsheet_preview,
             step_count=0,
-            extras={"workbook_revision": 0, "last_recalc_revision": -1},
+            extras={
+                "workbook_revision": 0,
+                "last_recalc_revision": -1,
+                "last_validation_revision": -1,
+            },
         )
         return EnvResetResponse(
             observation=self._observe(),
@@ -368,6 +387,43 @@ class SpreadsheetBenchEnv(ActionableEnv):
             )
 
         if action.name == Submit.name:
+            workbook_revision = int(
+                self.state.extras.get("workbook_revision", 0)
+            )
+            validation_revision = max(
+                int(self.state.extras.get("last_validation_revision", -1)),
+                int(self.state.extras.get("last_recalc_revision", -1)),
+            )
+            if (
+                self._require_validation_before_submit
+                and validation_revision != workbook_revision
+            ):
+                stale = validation_revision >= 0
+                message = (
+                    "[submit rejected] The workbook changed after its last "
+                    "successful validation. Run validate_workbook or "
+                    "recalculate_and_read again before submit."
+                    if stale else
+                    "[submit rejected] Run validate_workbook or "
+                    "recalculate_and_read successfully before submit."
+                )
+                return EnvResponse(
+                    observation=Observation(
+                        text=message,
+                        data={"submitted": False, "error": "submit_validation_required"},
+                    ),
+                    reward=0.0,
+                    terminated=False,
+                    truncated=False,
+                    info={
+                        "submitted": False,
+                        "submit_rejected": True,
+                        "validation_stale": stale,
+                        "error": "submit_validation_required",
+                        "failure_class": "submit_gate_error",
+                        "won": None,
+                    },
+                )
             self.state.submitted = True
             self._terminated = True
             return EnvResponse(
@@ -378,6 +434,8 @@ class SpreadsheetBenchEnv(ActionableEnv):
                 reward=0.0, terminated=True, truncated=False,
                 info={
                     "submitted": True,
+                    "submit_rejected": False,
+                    "validation_stale": False,
                     "won": None,
                     "submitted_after_recalc": int(
                         self.state.extras.get("last_recalc_revision", -1) >= 0
@@ -391,12 +449,24 @@ class SpreadsheetBenchEnv(ActionableEnv):
 
         if action.name == ValidateWorkbook.name:
             with self._stage("validate_workbook", action=action.name):
-                validation_output, validation_ok = self._validate_output()
+                validation_output, validation_ok, validation_metrics = (
+                    self._validate_output()
+                )
+            if validation_ok:
+                self.state.extras["last_validation_revision"] = int(
+                    self.state.extras.get("workbook_revision", 0)
+                )
             return EnvResponse(
                 observation=self._observe(run_output=validation_output),
-                reward=0.0, terminated=False, truncated=False,
+                reward=0.0,
+                terminated=False, truncated=False,
                 info={
                     "validation_ok": validation_ok,
+                    "validation_revision": int(
+                        self.state.extras.get("last_validation_revision", -1)
+                    ),
+                    "failure_class": "" if validation_ok else "validation_error",
+                    **validation_metrics,
                     "won": None,
                 },
             )
@@ -460,18 +530,41 @@ class SpreadsheetBenchEnv(ActionableEnv):
                             soffice_path=self._soffice_path,
                             timeout=self._recalc_timeout,
                         )
+                        static_output, static_ok, static_metrics = (
+                            self._validate_output()
+                        )
+                        payload.update(static_metrics)
+                        formula_errors = int(
+                            payload.get("formula_error_cells", 0)
+                        )
+                        if not static_ok or formula_errors:
+                            tool_ok = False
+                            tool_error = (
+                                "formula_errors_found" if formula_errors
+                                else "formula_validation_failed"
+                            )
+                            payload["validation_ok"] = False
+                            tool_output = (
+                                f"{tool_output}\n{static_output}\n"
+                                "[recalculation validation failed] Fix the "
+                                "reported formulas and recalculate again."
+                            )
+                        else:
+                            tool_ok = True
+                            tool_error = ""
+                            payload["validation_ok"] = True
                     else:
                         assert executor is not None
                         payload, tool_output = executor(
                             action.name, self.state.output_path, dict(action.kwargs)
                         )
-                tool_ok = True
-                tool_error = ""
+                        tool_ok = True
+                        tool_error = ""
                 if category == "write":
                     self.state.extras["workbook_revision"] = int(
                         self.state.extras.get("workbook_revision", 0)
                     ) + 1
-                elif category == "recalc":
+                elif category == "recalc" and tool_ok:
                     self.state.extras["last_recalc_revision"] = int(
                         self.state.extras.get("workbook_revision", 0)
                     )
@@ -485,6 +578,14 @@ class SpreadsheetBenchEnv(ActionableEnv):
                 tool_ok = False
                 tool_error = wrapped.code
             self.state.last_output = tool_output
+            failure_class = ""
+            if not tool_ok:
+                if category == "read":
+                    failure_class = "read_tool_error"
+                elif category == "recalc":
+                    failure_class = "recalc_tool_error"
+                else:
+                    failure_class = "write_tool_error"
             return EnvResponse(
                 observation=self._observe(
                     run_output=tool_output, output_label="last tool output"
@@ -497,10 +598,14 @@ class SpreadsheetBenchEnv(ActionableEnv):
                     "tool_category": category,
                     "tool_ok": tool_ok,
                     "tool_error": tool_error,
+                    "failure_class": failure_class,
                     "tool_result": payload,
                     "recalc_elapsed_ms": float(payload.get("elapsed_ms", 0.0)),
                     "recalc_formula_error_count": int(
                         payload.get("formula_error_cells", 0)
+                    ),
+                    "formula_validation_errors": int(
+                        payload.get("formula_validation_errors", 0)
                     ),
                     "won": None,
                 },
@@ -555,13 +660,21 @@ class SpreadsheetBenchEnv(ActionableEnv):
                     "syntax_error": syntax_error,
                     "python_preflight_rejected": True,
                     "python_preflight_warnings": list(preflight.warnings),
+                    "transaction_committed": False,
+                    "transaction_rolled_back": False,
+                    "failure_class": (
+                        "python_syntax_error" if syntax_error
+                        else "python_preflight_error"
+                    ),
                     "won": None,
                 },
             )
 
         self.state.step_count += 1
         with self._stage("run_python", action=action.name):
-            stdout, returncode, error_type = self._run_python(code)
+            stdout, returncode, error_type, transaction_committed = (
+                self._run_python(code)
+            )
         self.state.last_code = code
         self.state.last_output = stdout
         self.state.last_returncode = returncode
@@ -591,6 +704,14 @@ class SpreadsheetBenchEnv(ActionableEnv):
                 "syntax_error": syntax_error,
                 "python_preflight_rejected": False,
                 "python_preflight_warnings": list(preflight.warnings),
+                "transaction_committed": transaction_committed,
+                "transaction_rolled_back": not transaction_committed,
+                "failure_class": (
+                    "" if not python_error else
+                    "python_syntax_error" if syntax_error else
+                    "python_timeout" if error_type == "TimeoutExpired" else
+                    "python_runtime_error"
+                ),
                 "won": None,
             },
         )
@@ -740,9 +861,12 @@ exec(compile(source, agent_script, "exec"), namespace)
         matches = _PYTHON_EXCEPTION_RE.findall(output)
         return matches[-1].rsplit(".", 1)[-1] if matches else "ProcessError"
 
-    def _run_python(self, code: str) -> tuple[str, int, str]:
+    def _run_python(self, code: str) -> tuple[str, int, str, bool]:
         """Write `code` to a unique file in the working dir and execute it with
-        `python_exe` (cwd = working dir). Return (combined_output, returncode)."""
+        `python_exe` (cwd = working dir).
+
+        Return ``(combined_output, returncode, error_type, committed)``.
+        """
         assert self._workdir is not None
         # Write the snippet to a scratch file OUTSIDE the working dir (cwd stays
         # the working dir, so the agent's relative paths still resolve). This
@@ -750,56 +874,154 @@ exec(compile(source, agent_script, "exec"), namespace)
         # sees a pile of `_step_*.py` files and wastes turns inspecting them /
         # hunting for "grading logic".
         fd, script = tempfile.mkstemp(suffix=".py", prefix="sbstep_")
+        output_path = self.state.output_path
+        transaction_path = ""
+        backup_path = ""
+        backup_ready = False
+
+        def cleanup_transaction_files() -> None:
+            for path in (transaction_path, backup_path):
+                if not path:
+                    continue
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+        def restore_backup() -> None:
+            """Atomically restore without following an agent-created symlink."""
+            if not backup_ready:
+                return
+            restore_fd, restore_path = tempfile.mkstemp(
+                prefix=".sbrestore_", suffix=".xlsx",
+                dir=os.path.dirname(output_path),
+            )
+            os.close(restore_fd)
+            try:
+                shutil.copyfile(backup_path, restore_path)
+                os.replace(restore_path, output_path)
+            finally:
+                try:
+                    os.remove(restore_path)
+                except OSError:
+                    pass
+
         try:
+            transaction_fd, transaction_path = tempfile.mkstemp(
+                prefix=".sbtxn_", suffix=".xlsx", dir=self._workdir
+            )
+            os.close(transaction_fd)
+            backup_fd, backup_path = tempfile.mkstemp(
+                prefix="sbbackup_", suffix=".xlsx"
+            )
+            os.close(backup_fd)
+            shutil.copyfile(output_path, transaction_path)
+            shutil.copyfile(output_path, backup_path)
+            backup_ready = True
             with os.fdopen(fd, "w") as f:
                 f.write(code)
-            proc = run_process_group(
-                [
-                    self._python_exe,
-                    "-c",
-                    self._python_bootstrap(),
-                    script,
-                    self.state.input_path,
-                    self.state.output_path,
-                    self._workdir,
-                ],
-                cwd=self._workdir, capture_output=True, text=True,
-                timeout=self._step_timeout,
+            try:
+                proc = run_process_group(
+                    [
+                        self._python_exe,
+                        "-c",
+                        self._python_bootstrap(),
+                        script,
+                        self.state.input_path,
+                        transaction_path,
+                        self._workdir,
+                    ],
+                    cwd=self._workdir, capture_output=True, text=True,
+                    timeout=self._step_timeout,
+                )
+            except subprocess.TimeoutExpired:
+                restore_backup()
+                return (
+                    f"[ERROR] run_python timed out after {self._step_timeout}s",
+                    -1,
+                    "TimeoutExpired",
+                    False,
+                )
+            if proc.returncode == 0:
+                try:
+                    import openpyxl
+
+                    if not stat.S_ISREG(os.lstat(transaction_path).st_mode):
+                        raise OSError(
+                            "transaction workbook must be a regular file"
+                        )
+                    check = openpyxl.load_workbook(
+                        transaction_path, read_only=True, data_only=False
+                    )
+                    check.close()
+                    os.replace(transaction_path, output_path)
+                    committed = True
+                except Exception as exc:  # noqa: BLE001
+                    restore_backup()
+                    proc.returncode = -1
+                    committed = False
+                    validation_error = (
+                        "[ERROR] transaction workbook validation failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    proc.stderr = "\n".join(
+                        part for part in (proc.stderr, validation_error) if part
+                    )
+                    forced_error_type = "WorkbookValidationError"
+            else:
+                restore_backup()
+                committed = False
+            parts = []
+            if proc.stdout:
+                parts.append(proc.stdout)
+            if proc.stderr:
+                parts.append(f"[STDERR]\n{proc.stderr}")
+            if proc.returncode != 0:
+                parts.append(f"[exit code: {proc.returncode}]")
+            out = "\n".join(parts).strip() or "[run_python completed with no output]"
+            error_type = (
+                forced_error_type
+                if "forced_error_type" in locals()
+                else self._python_error_type(out, proc.returncode)
             )
-        except subprocess.TimeoutExpired:
-            output = (
-                f"[ERROR] run_python timed out after {self._step_timeout}s"
-            )
-            return output, -1, "TimeoutExpired"
-        except Exception as e:  # noqa: BLE001
+            if len(out) > self._obs_truncate:
+                out = out[: self._obs_truncate] + "\n...[output truncated]"
+            return out, proc.returncode, error_type, committed
+        except Exception as exc:  # noqa: BLE001
+            restore_error = ""
+            try:
+                restore_backup()
+            except Exception as rollback_exc:  # noqa: BLE001
+                restore_error = (
+                    "; rollback failed: "
+                    f"{type(rollback_exc).__name__}: {rollback_exc}"
+                )
             return (
-                f"[ERROR] failed to execute: {type(e).__name__}: {e}",
+                f"[ERROR] failed to execute: {type(exc).__name__}: {exc}"
+                f"{restore_error}",
                 -1,
-                type(e).__name__,
+                type(exc).__name__,
+                False,
             )
         finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
             try:
                 os.remove(script)
             except OSError:
                 pass
-        parts = []
-        if proc.stdout:
-            parts.append(proc.stdout)
-        if proc.stderr:
-            parts.append(f"[STDERR]\n{proc.stderr}")
-        if proc.returncode != 0:
-            parts.append(f"[exit code: {proc.returncode}]")
-        out = "\n".join(parts).strip() or "[run_python completed with no output]"
-        error_type = self._python_error_type(out, proc.returncode)
-        if len(out) > self._obs_truncate:
-            out = out[: self._obs_truncate] + "\n...[output truncated]"
-        return out, proc.returncode, error_type
+            cleanup_transaction_files()
 
-    def _validate_output(self) -> tuple[str, bool]:
+    def _validate_output(self) -> tuple[str, bool, dict[str, int]]:
         """Validate output structure without consulting the golden workbook."""
         output_path = self.state.output_path
         if not os.path.isfile(output_path):
-            return "[validation failed] output_path does not exist.", False
+            return (
+                "[validation failed] output_path does not exist.", False,
+                {"formula_validation_errors": 0},
+            )
         try:
             import openpyxl
 
@@ -811,11 +1033,13 @@ exec(compile(source, agent_script, "exec"), namespace)
                 "[validation failed] output workbook cannot be opened: "
                 f"{type(exc).__name__}: {exc}",
                 False,
+                {"formula_validation_errors": 0},
             )
 
         sheet_names = list(workbook.sheetnames)
         details: list[str] = []
         errors: list[str] = []
+        formula_validation_errors = 0
         try:
             for segment in online_judge_eval._split_answer_position(
                 self.state.answer_position
@@ -857,9 +1081,40 @@ exec(compile(source, agent_script, "exec"), namespace)
                     for cell in row:
                         value = cell.value
                         nonempty += int(value is not None and value != "")
-                        formulas += int(
+                        formula_text = (
                             isinstance(value, str) and value.startswith("=")
                         )
+                        is_formula = cell.data_type == "f"
+                        formulas += int(is_formula)
+                        if formula_text and not is_formula:
+                            formula_validation_errors += 1
+                            if formula_validation_errors <= 20:
+                                errors.append(
+                                    "malformed formula "
+                                    f"{sheet_name}!{cell.coordinate}: formula "
+                                    "is stored as text"
+                                )
+                        elif is_formula:
+                            try:
+                                formula = str(value)
+                                validate_formula_syntax(formula)
+                                if "#REF!" in formula.upper():
+                                    raise ReadToolError(
+                                        "invalid_formula",
+                                        "formula contains a broken #REF! reference",
+                                    )
+                                if formula.startswith(('="=', "='=")):
+                                    raise ReadToolError(
+                                        "invalid_formula",
+                                        "formula is wrapped as formula text",
+                                    )
+                            except ReadToolError as exc:
+                                formula_validation_errors += 1
+                                if formula_validation_errors <= 20:
+                                    errors.append(
+                                        "malformed formula "
+                                        f"{sheet_name}!{cell.coordinate}: {exc}"
+                                    )
                 details.append(
                     f"{sheet_name}!{cell_range}: cells={cell_count}, "
                     f"nonempty={nonempty}, formulas={formulas}"
@@ -868,12 +1123,17 @@ exec(compile(source, agent_script, "exec"), namespace)
             workbook.close()
 
         if errors:
-            return "[validation failed] " + "; ".join(errors), False
+            return (
+                "[validation failed] " + "; ".join(errors),
+                False,
+                {"formula_validation_errors": formula_validation_errors},
+            )
         sheet_list = ", ".join(sheet_names)
         return (
             "[validation ok] workbook opens; sheets=" + sheet_list + "\n"
             + "\n".join(details),
             True,
+            {"formula_validation_errors": 0},
         )
 
     def _grade(self, task: SBTask) -> EvaluationResult:

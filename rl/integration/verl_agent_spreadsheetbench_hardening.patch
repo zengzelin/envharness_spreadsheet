@@ -1,0 +1,72 @@
+diff --git a/agent_system/environments/env_manager.py b/agent_system/environments/env_manager.py
+--- a/agent_system/environments/env_manager.py
++++ b/agent_system/environments/env_manager.py
+@@ -656,6 +656,8 @@
+                 "SPREADSHEETBENCH_PYTHON_ERROR_PENALTY", "-0.05")),
+             "syntax_error_penalty": float(os.environ.get(
+                 "SPREADSHEETBENCH_SYNTAX_ERROR_PENALTY", "-0.1")),
++            "require_validation_before_submit": os.environ.get(
++                "SPREADSHEETBENCH_REQUIRE_VALIDATION_BEFORE_SUBMIT", "true"),
+         }
+         _train_reset_options = dict(_common_reset_options)
+         _val_reset_options = dict(_common_reset_options)
+diff --git a/agent_system/multi_turn_rollout/rollout_loop.py b/agent_system/multi_turn_rollout/rollout_loop.py
+--- a/agent_system/multi_turn_rollout/rollout_loop.py
++++ b/agent_system/multi_turn_rollout/rollout_loop.py
+@@ -486,6 +486,7 @@
+                 'parser_native_valid': 'parser/native_valid',
+                 'parser_recovered': 'parser/recovered',
+                 'parser_invalid': 'parser/invalid',
++                'parser_tool_calls_truncated': 'parser/tool_calls_truncated',
+                 'output_char_len': 'output/char_len',
+                 'output_has_think': 'output/has_think',
+                 'output_has_markdown_fence': 'output/has_markdown_fence',
+@@ -494,6 +495,9 @@
+                 'env_syntax_error': 'env/syntax_error',
+                 'env_python_runtime_error': 'env/python_runtime_error',
+                 'env_python_timeout': 'env/python_timeout',
++                'env_python_transaction_rollback': 'env/python_transaction_rollback',
++                'env_submit_gate_reject': 'env/submit_gate_reject',
++                'env_formula_validation_error_count': 'env/formula_validation_error_count',
+                 'env_read_tool_call': 'env/read_tool_call',
+                 'env_read_tool_success': 'env/read_tool_success',
+                 'env_read_tool_error': 'env/read_tool_error',
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -225,6 +225,7 @@
+         'parser_native_valid': 'parser/native_valid_ratio',
+         'parser_recovered': 'parser/recovered_ratio',
+         'parser_invalid': 'parser/invalid_ratio',
++        'parser_tool_calls_truncated': 'parser/tool_calls_truncated_mean',
+         'output_char_len': 'output/char_len_mean',
+         'output_has_think': 'output/has_think_ratio',
+         'output_has_markdown_fence': 'output/has_markdown_fence_ratio',
+@@ -233,6 +234,9 @@
+         'env_syntax_error': 'env/syntax_error_ratio',
+         'env_python_runtime_error': 'env/python_runtime_error_ratio',
+         'env_python_timeout': 'env/python_timeout_ratio',
++        'env_python_transaction_rollback': 'env/python_transaction_rollback_ratio',
++        'env_submit_gate_reject': 'env/submit_gate_reject_ratio',
++        'env_formula_validation_error_count': 'env/formula_validation_error_count_mean',
+         'env_read_tool_call': 'env/read_tool_call_ratio',
+         'env_write_tool_call': 'env/write_tool_call_ratio',
+         'env_recalc_tool_call': 'env/recalc_tool_call_ratio',
+@@ -942,6 +946,7 @@
+             'parser_native_valid': 'val/parser/native_valid_ratio',
+             'parser_recovered': 'val/parser/recovered_ratio',
+             'parser_invalid': 'val/parser/invalid_ratio',
++            'parser_tool_calls_truncated': 'val/parser/tool_calls_truncated_mean',
+             'output_char_len': 'val/output/char_len_mean',
+             'output_has_think': 'val/output/has_think_ratio',
+             'output_has_markdown_fence': 'val/output/has_markdown_fence_ratio',
+@@ -950,6 +955,9 @@
+             'env_syntax_error': 'val/env/syntax_error_ratio',
+             'env_python_runtime_error': 'val/env/python_runtime_error_ratio',
+             'env_python_timeout': 'val/env/python_timeout_ratio',
++            'env_python_transaction_rollback': 'val/env/python_transaction_rollback_ratio',
++            'env_submit_gate_reject': 'val/env/submit_gate_reject_ratio',
++            'env_formula_validation_error_count': 'val/env/formula_validation_error_count_mean',
+             'env_read_tool_call': 'val/env/read_tool_call_ratio',
+             'env_write_tool_call': 'val/env/write_tool_call_ratio',
+             'env_recalc_tool_call': 'val/env/recalc_tool_call_ratio',
