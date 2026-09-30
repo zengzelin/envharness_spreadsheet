@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import contextmanager
+import json
 import os
 from pathlib import Path
 import time
@@ -11,11 +12,92 @@ from typing import Any, Iterator
 from envharness.bridges.spreadsheetbench.bridge import SpreadsheetBenchEnv
 from envharness.bridges.spreadsheetbench.read_tools import (
     NATIVE_RECALC_TOOLS, NATIVE_STRUCTURE_TOOLS, NATIVE_WRITE_TOOLS,
+    _range_bounds, _split_range,
 )
-from envharness.core.types import Action, EvaluationResult
+from envharness.core.types import (
+    Action, EnvResponse, EvaluationResult, Observation,
+)
 
 
 MAX_MULTI_CALL_OBSERVATION_CHARS = 12_000
+MAX_MULTI_CALL_MUTATION_CELLS = 100_000
+MAX_ACTION_LOG_CHARS = 1_000
+
+
+def _action_log_detail(action: Action) -> str:
+    """Render bounded action arguments while keeping Python source out of logs."""
+    arguments = dict(action.kwargs)
+    if "code" in arguments:
+        arguments["code_chars"] = len(str(arguments.pop("code")))
+    rendered = json.dumps(
+        arguments, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        default=str,
+    )
+    if len(rendered) > MAX_ACTION_LOG_CHARS:
+        rendered = rendered[:MAX_ACTION_LOG_CHARS] + "...[truncated]"
+    return f"arguments={rendered}"
+
+
+def _mutation_cell_count(action: Action) -> int:
+    """Best-effort size estimate for bounded native cell mutations."""
+    arguments = dict(action.kwargs)
+    try:
+        if action.name in {"write_range", "clear_range", "format_range"}:
+            _, range_text = _split_range(
+                arguments.get("range"), arguments.get("sheet_name")
+            )
+            min_col, min_row, max_col, max_row = _range_bounds(range_text)
+            return (max_row - min_row + 1) * (max_col - min_col + 1)
+        if action.name == "fill_formula":
+            _, start_text = _split_range(
+                arguments.get("start_cell"), arguments.get("sheet_name")
+            )
+            min_col, min_row, max_col, max_row = _range_bounds(start_text)
+            if min_col != max_col or min_row != max_row:
+                return 0
+            end_row = arguments.get("end_row", min_row)
+            if isinstance(end_row, bool) or not isinstance(end_row, int):
+                return 0
+            end_col = min_col
+            if arguments.get("end_col") not in {None, ""}:
+                from openpyxl.utils.cell import column_index_from_string
+
+                end_col = column_index_from_string(
+                    str(arguments["end_col"]).strip().replace("$", "")
+                )
+            if end_row < min_row or end_col < min_col:
+                return 0
+            return (end_row - min_row + 1) * (end_col - min_col + 1)
+    except (TypeError, ValueError):
+        return 0
+    return 0
+
+
+def _mutation_budget_response(
+    action: Action, mutation_cells: int, cumulative_cells: int,
+) -> EnvResponse:
+    message = (
+        f"multi-call mutation budget exceeded before {action.name}: "
+        f"mutation_cells={mutation_cells}, cumulative_cells={cumulative_cells}, "
+        f"maximum={MAX_MULTI_CALL_MUTATION_CELLS}"
+    )
+    return EnvResponse(
+        observation=Observation(
+            text=message,
+            data={"error": "multi_call_mutation_budget_exceeded"},
+        ),
+        reward=0.0,
+        terminated=False,
+        truncated=False,
+        info={
+            "tool_name": action.name,
+            "tool_category": "write",
+            "tool_ok": False,
+            "tool_error": "multi_call_mutation_budget_exceeded",
+            "mutation_cells": mutation_cells,
+            "cumulative_mutation_cells": cumulative_cells,
+        },
+    )
 
 
 def _worker_seeds(seed: int, env_num: int, group_n: int) -> list[int]:
@@ -249,6 +331,7 @@ class EnvharnessSpreadsheetWorker:
         terminated = False
         truncated = False
         stop_reason = "completed"
+        cumulative_mutation_cells = 0
         for action_index, projected in enumerate(projected_actions):
             print(
                 f"[spreadsheet-worker] worker_index={self._worker_index} "
@@ -256,8 +339,35 @@ class EnvharnessSpreadsheetWorker:
                 f"episode_step={episode_step} action_index={action_index}",
                 flush=True,
             )
-            with self._stage("env_step", projected.name, episode_step):
-                response = self._env.step(projected)
+            mutation_cells = _mutation_cell_count(projected)
+            if (
+                mutation_cells
+                and cumulative_mutation_cells + mutation_cells
+                > MAX_MULTI_CALL_MUTATION_CELLS
+            ):
+                print(
+                    f"[spreadsheet-worker] worker_index={self._worker_index} "
+                    f"task_id={self._task_id or '-'} action={projected.name} "
+                    f"episode_step={episode_step} stage=mutation_budget REJECT "
+                    f"mutation_cells={mutation_cells} "
+                    f"cumulative_cells={cumulative_mutation_cells} "
+                    f"maximum={MAX_MULTI_CALL_MUTATION_CELLS}",
+                    flush=True,
+                )
+                response = _mutation_budget_response(
+                    projected, mutation_cells, cumulative_mutation_cells
+                )
+            else:
+                print(
+                    f"[spreadsheet-worker] worker_index={self._worker_index} "
+                    f"task_id={self._task_id or '-'} action={projected.name} "
+                    f"episode_step={episode_step} stage=action_arguments "
+                    f"{_action_log_detail(projected)}",
+                    flush=True,
+                )
+                with self._stage("env_step", projected.name, episode_step):
+                    response = self._env.step(projected)
+                cumulative_mutation_cells += mutation_cells
             responses.append(response)
             sub_reward = float(response.reward or 0.0)
             reward += sub_reward
@@ -267,6 +377,7 @@ class EnvharnessSpreadsheetWorker:
                 projected.name == "invalid"
                 or explicit_tool_failure
                 or sub_info.get("python_error", False)
+                or sub_info.get("failure_class")
                 or sub_info.get("error")
             )
             observation_text = response.observation.text or ""
@@ -302,6 +413,8 @@ class EnvharnessSpreadsheetWorker:
                 or projected.name in NATIVE_WRITE_TOOLS
                 or projected.name in NATIVE_RECALC_TOOLS
                 or projected.name in NATIVE_STRUCTURE_TOOLS
+                or projected.name == "validate_workbook"
+                or projected.name == "submit"
                 or sub_info.get("tool_category") == "write"
                 or sub_info.get("tool_category") == "recalc"
             ):
@@ -344,6 +457,12 @@ class EnvharnessSpreadsheetWorker:
             "multi_call_stop_reason": stop_reason,
             "multi_call_failure_index": failure_index,
             "multi_call_executed_fraction": executed_count / projected_count,
+            "multi_call_mutation_budget_exceeded": any(
+                result["info"].get("tool_error")
+                == "multi_call_mutation_budget_exceeded"
+                for result in tool_results
+            ),
+            "multi_call_mutation_cells": cumulative_mutation_cells,
         })
 
         if done:

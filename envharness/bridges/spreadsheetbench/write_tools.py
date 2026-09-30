@@ -25,7 +25,7 @@ from envharness.bridges.spreadsheetbench.read_tools import (
 
 
 MAX_WRITE_CELLS = 50_000
-MAX_FILL_CELLS = 300_000
+MAX_FILL_CELLS = 50_000
 MAX_CELL_CHARS = 8_192
 LOCK_TIMEOUT_SECONDS = 30.0
 
@@ -139,7 +139,7 @@ def _validate_static_value(value: Any) -> None:
         )
 
 
-def _validate_formula_syntax(formula: str) -> None:
+def validate_formula_syntax(formula: str) -> None:
     """Reject structural formula errors that openpyxl otherwise saves silently."""
     delimiter_pairs = {"(": ")", "{": "}"}
     closing_delimiters = {value: key for key, value in delimiter_pairs.items()}
@@ -400,7 +400,7 @@ def _fill_formula(path: str, arguments: dict[str, Any]) -> tuple[dict[str, Any],
             "formula_too_large",
             f"formula_template may not exceed {MAX_CELL_CHARS} characters",
         )
-    _validate_formula_syntax(formula)
+    validate_formula_syntax(formula)
 
     end_row = arguments.get("end_row", min_row)
     if isinstance(end_row, bool) or not isinstance(end_row, int) or end_row < min_row:

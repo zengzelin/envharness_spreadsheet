@@ -48,6 +48,7 @@ untouched. Selecting between them is purely `env.env_name`:
 | `SPREADSHEETBENCH_OBS_TRUNCATE` | Optional maximum tool observation length; default `6000`. |
 | `SPREADSHEETBENCH_PYTHON_ERROR_PENALTY` | Failed non-syntax `run_python` reward; default `-0.05`. |
 | `SPREADSHEETBENCH_SYNTAX_ERROR_PENALTY` | Syntax/indentation error reward; default `-0.1`. |
+| `SPREADSHEETBENCH_REQUIRE_VALIDATION_BEFORE_SUBMIT` | Require a successful validation/recalc of the current workbook revision before submit; launcher default `true`. |
 | `ALFWORLD_TRAIN_SUBSET_PATH` | JSONL of `{"game_file": ...}`; restricts TRAIN. Train-only. |
 | `ENVHARNESS_MUTATION_CORPUS` | JSONL of `{game_file, rules_code, in_env_actions}`; applies the matching `Rules` per train episode. Train-only. |
 | `ENVHARNESS_SUBSET_AUTHORITATIVE` | `1/true/yes` -> treat the subset as authoritative (load game COPIES outside alfworld's scanned dir). Train-only. |
@@ -84,7 +85,11 @@ Both modes also apply `verl_agent_spreadsheetbench_runtime.patch`, which adds
 Spreadsheet-RL split routing and structured rollout diagnostics.
 They also apply `verl_agent_spreadsheetbench_stall_diagnostics.patch` for
 phase heartbeats and `verl_agent_spreadsheetbench_metrics.patch` for native-tool
-metrics, weighted validation, and reward-component logging.
+metrics, weighted validation, and reward-component logging. The subsequent
+`verl_agent_spreadsheetbench_tool_metrics.patch` and
+`verl_agent_spreadsheetbench_hardening.patch` expose structured-tool,
+transaction rollback, submit-gate, formula-validation, and bounded multi-call
+diagnostics in both training and validation metrics.
 `PATCH=all` applies `verl_agent_all_changes.patch`
 instead of the route patch, followed by the same tracking lifecycle patch (a
 superset: DAPO / Qwen3-8B / webshop / SWE-Gym support; see

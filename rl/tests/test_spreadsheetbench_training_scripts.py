@@ -61,6 +61,9 @@ def test_training_pipeline_exports_native_tool_metrics() -> None:
         "env_multi_call_skipped_calls": "env/multi_call_skipped_calls_mean",
         "env_multi_call_executed_fraction": "env/multi_call_executed_fraction_mean",
         "env_multi_call_failure_index": "env/multi_call_failure_index_mean",
+        "env_multi_call_mutation_budget_exceeded": (
+            "env/multi_call_mutation_budget_exceeded_rate"
+        ),
     }.items():
         assert batch_key in rollout_source
         assert batch_key in trainer_source
@@ -94,6 +97,39 @@ def test_training_scripts_forward_recalc_limits() -> None:
         source = (ROOT / "rl/scripts" / script_name).read_text()
         assert "SPREADSHEETBENCH_MAX_RECALC_CALLS" in source
         assert "SPREADSHEETBENCH_RECALC_TIMEOUT_SECONDS" in source
+
+
+def test_training_scripts_forward_hardening_controls() -> None:
+    for script_name in (
+        "run_spreadsheetbench_grpo.sh",
+        "submit_spreadsheetbench_grpo.sh",
+    ):
+        source = (ROOT / "rl/scripts" / script_name).read_text()
+        assert "SPREADSHEETBENCH_REQUIRE_VALIDATION_BEFORE_SUBMIT" in source
+        assert "max_tool_calls_per_turn=4" in source
+
+    fetch_source = (ROOT / "rl/scripts/fetch_verl_agent.sh").read_text()
+    assert "verl_agent_spreadsheetbench_hardening.patch" in fetch_source
+    patch_source = (
+        ROOT / "rl/integration/verl_agent_spreadsheetbench_hardening.patch"
+    ).read_text()
+    for marker in (
+        "SPREADSHEETBENCH_REQUIRE_VALIDATION_BEFORE_SUBMIT",
+        "parser_tool_calls_truncated",
+        "env_python_transaction_rollback",
+        "env_submit_gate_reject",
+        "env_formula_validation_error_count",
+    ):
+        assert marker in patch_source
+    for out_of_scope_variable in (
+        "SPREADSHEETBENCH_READ_TOOL_ERROR_PENALTY",
+        "SPREADSHEETBENCH_WRITE_TOOL_ERROR_PENALTY",
+        "SPREADSHEETBENCH_RECALC_TOOL_ERROR_PENALTY",
+        "SPREADSHEETBENCH_VALIDATION_ERROR_PENALTY",
+        "SPREADSHEETBENCH_SUBMIT_GATE_PENALTY",
+        "SPREADSHEETBENCH_MAX_TOOL_CALLS_PER_TURN",
+    ):
+        assert out_of_scope_variable not in patch_source
 
 
 def test_training_pipeline_logs_spreadsheet_rollout_phase_boundaries() -> None:

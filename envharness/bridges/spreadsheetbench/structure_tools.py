@@ -24,6 +24,7 @@ _COLOR_RE = re.compile(r"^#?(?:[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$")
 _SHEET_INVALID_RE = re.compile(r"[\\/*?:\[\]]")
 _ROW_RE = re.compile(r"^([1-9]\d*)(?::([1-9]\d*))?$")
 _COL_RE = re.compile(r"^([A-Za-z]{1,3})(?::([A-Za-z]{1,3}))?$")
+MAX_FORMAT_CELLS = 50_000
 
 
 def _color(value: Any, field: str) -> str:
@@ -43,6 +44,12 @@ def _format_range(path: str, arguments: dict[str, Any]) -> tuple[dict[str, Any],
         arguments.get("range"), arguments.get("sheet_name")
     )
     min_col, min_row, max_col, max_row = _range_bounds(range_text)
+    cell_count = (max_row - min_row + 1) * (max_col - min_col + 1)
+    if cell_count > MAX_FORMAT_CELLS:
+        raise ReadToolError(
+            "range_too_large",
+            f"format has {cell_count} cells; maximum is {MAX_FORMAT_CELLS}",
+        )
     options = {key: arguments.get(key) for key in allowed - {"range", "sheet_name"}}
     if all(value is None for value in options.values()):
         raise ReadToolError("no_format_options", "provide at least one format option")
@@ -158,7 +165,7 @@ def _format_range(path: str, arguments: dict[str, Any]) -> tuple[dict[str, Any],
             workbook.close()
     payload = {
         "status": "success", "sheet": resolved_sheet, "range": range_text,
-        "formatted_cells": (max_row - min_row + 1) * (max_col - min_col + 1),
+        "formatted_cells": cell_count,
     }
     return payload, _render_payload(payload)
 

@@ -99,6 +99,101 @@ def test_run_python_classifies_exception_before_output_truncation(
     assert response.observation.text.endswith("...[output truncated]")
 
 
+def test_run_python_rolls_back_workbook_after_runtime_failure(tmp_path: Path) -> None:
+    env = _execution_env(tmp_path)
+    before = Path(env.state.output_path).read_bytes()
+
+    response = env.step(Action(name="run_python", kwargs={
+        "code": (
+            "wb = load_workbook_for_edit()\n"
+            "wb['Sheet1']['A1'] = 'must not persist'\n"
+            "save_workbook(wb)\n"
+            "raise RuntimeError('after save')"
+        )
+    }))
+
+    assert response.info["python_error"] is True
+    assert response.info["transaction_committed"] is False
+    assert response.info["transaction_rolled_back"] is True
+    assert Path(env.state.output_path).read_bytes() == before
+
+
+def test_run_python_rejects_corrupt_workbook_before_commit(tmp_path: Path) -> None:
+    env = _execution_env(tmp_path)
+    before = Path(env.state.output_path).read_bytes()
+
+    response = env.step(Action(name="run_python", kwargs={
+        "code": "open(output_path, 'wb').write(b'not an xlsx')",
+    }))
+
+    assert response.info["python_error"] is True
+    assert response.info["python_error_type"] == "WorkbookValidationError"
+    assert response.info["transaction_committed"] is False
+    assert response.info["transaction_rolled_back"] is True
+    assert Path(env.state.output_path).read_bytes() == before
+
+
+def test_run_python_restores_committed_path_after_direct_path_corruption(
+    tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    before = Path(env.state.output_path).read_bytes()
+
+    response = env.step(Action(name="run_python", kwargs={
+        "code": (
+            "import os\n"
+            "committed = os.path.join(working_directory, 'output.xlsx')\n"
+            "open(committed, 'wb').write(b'corrupt committed path')\n"
+            "raise RuntimeError('after direct corruption')"
+        ),
+    }))
+
+    assert response.info["transaction_rolled_back"] is True
+    assert Path(env.state.output_path).read_bytes() == before
+
+
+def test_run_python_rollback_replaces_agent_created_output_symlink(
+    tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    output = Path(env.state.output_path)
+    before = output.read_bytes()
+
+    response = env.step(Action(name="run_python", kwargs={
+        "code": (
+            "import os\n"
+            "committed = os.path.join(working_directory, 'output.xlsx')\n"
+            "os.unlink(committed)\n"
+            "os.symlink(output_path, committed)\n"
+            "raise RuntimeError('leave a symlink')"
+        ),
+    }))
+
+    assert response.info["transaction_rolled_back"] is True
+    assert output.is_symlink() is False
+    assert output.read_bytes() == before
+
+
+def test_run_python_commits_valid_workbook_and_reports_transaction(
+    tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+
+    response = env.step(Action(name="run_python", kwargs={
+        "code": (
+            "wb = load_workbook_for_edit()\n"
+            "wb['Sheet1']['A1'] = 'committed'\n"
+            "save_workbook(wb)"
+        ),
+    }))
+
+    workbook = openpyxl.load_workbook(env.state.output_path)
+    assert workbook["Sheet1"]["A1"].value == "committed"
+    assert response.info["transaction_committed"] is True
+    assert response.info["transaction_rolled_back"] is False
+    assert env.state.extras["workbook_revision"] == 1
+
+
 def test_run_python_timeout_reaps_child_process_output_pipes(tmp_path: Path) -> None:
     env = _execution_env(tmp_path)
     env._step_timeout = 0.2
@@ -136,6 +231,151 @@ def test_validate_workbook_checks_output_without_grading(tmp_path: Path) -> None
     assert response.terminated is False
     assert response.info["validation_ok"] is True
     assert "Sheet1" in response.observation.text
+
+
+def test_validate_workbook_rejects_malformed_formula(tmp_path: Path) -> None:
+    env = _execution_env(tmp_path)
+    workbook = openpyxl.load_workbook(env.state.output_path)
+    workbook["Sheet1"]["A1"] = "=SUM(A2:B2"
+    workbook.save(env.state.output_path)
+
+    response = env.step(Action(name="validate_workbook", kwargs={}))
+
+    assert response.info["validation_ok"] is False
+    assert response.info["formula_validation_errors"] == 1
+    assert response.reward == 0.0
+    assert "malformed formula Sheet1!A1" in response.observation.text
+
+
+def test_validate_workbook_rejects_broken_formula_reference(tmp_path: Path) -> None:
+    env = _execution_env(tmp_path)
+    workbook = openpyxl.load_workbook(env.state.output_path)
+    workbook["Sheet1"]["A1"] = "=#REF!+1"
+    workbook.save(env.state.output_path)
+
+    response = env.step(Action(name="validate_workbook", kwargs={}))
+
+    assert response.info["validation_ok"] is False
+    assert response.info["formula_validation_errors"] == 1
+    assert "broken #REF! reference" in response.observation.text
+
+
+def test_validate_workbook_rejects_formula_text_wrapper(tmp_path: Path) -> None:
+    env = _execution_env(tmp_path)
+    workbook = openpyxl.load_workbook(env.state.output_path)
+    workbook["Sheet1"]["A1"] = '="=SUM(A1:A2)"'
+    workbook.save(env.state.output_path)
+
+    response = env.step(Action(name="validate_workbook", kwargs={}))
+
+    assert response.info["validation_ok"] is False
+    assert response.info["formula_validation_errors"] == 1
+    assert "wrapped as formula text" in response.observation.text
+
+
+def test_validate_workbook_rejects_formula_looking_text_cell(tmp_path: Path) -> None:
+    env = _execution_env(tmp_path)
+    workbook = openpyxl.load_workbook(env.state.output_path)
+    cell = workbook["Sheet1"]["A1"]
+    cell.value = "=SUM(A1:A2)"
+    cell.data_type = "s"
+    workbook.save(env.state.output_path)
+
+    response = env.step(Action(name="validate_workbook", kwargs={}))
+
+    assert response.info["validation_ok"] is False
+    assert response.info["formula_validation_errors"] == 1
+    assert "stored as text" in response.observation.text
+
+
+def test_validate_workbook_accepts_quoted_delimiters_in_formula(
+    tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    workbook = openpyxl.load_workbook(env.state.output_path)
+    workbook["Sheet1"]["A1"] = '=IF(A2="(","{ok}","quoted ""text""")'
+    workbook.save(env.state.output_path)
+
+    response = env.step(Action(name="validate_workbook", kwargs={}))
+
+    assert response.info["validation_ok"] is True
+    assert response.info["formula_validation_errors"] == 0
+
+
+def test_validate_workbook_ignores_formula_errors_outside_answer_ranges(
+    tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    workbook = openpyxl.load_workbook(env.state.output_path)
+    workbook["Sheet1"]["C3"] = "=#REF!"
+    workbook.save(env.state.output_path)
+
+    response = env.step(Action(name="validate_workbook", kwargs={}))
+
+    assert response.info["validation_ok"] is True
+    assert response.info["formula_validation_errors"] == 0
+
+
+def test_submit_gate_requires_current_validation(tmp_path: Path) -> None:
+    env = _execution_env(tmp_path)
+    env._require_validation_before_submit = True
+
+    rejected = env.step(Action(name="submit", kwargs={}))
+
+    assert rejected.terminated is False
+    assert rejected.reward == 0.0
+    assert rejected.info["submit_rejected"] is True
+    assert rejected.info["error"] == "submit_validation_required"
+
+    validated = env.step(Action(name="validate_workbook", kwargs={}))
+    assert validated.info["validation_ok"] is True
+    submitted = env.step(Action(name="submit", kwargs={}))
+    assert submitted.terminated is True
+    assert submitted.info["submit_rejected"] is False
+
+
+def test_submit_gate_rejects_stale_validation_after_edit(tmp_path: Path) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+    env._require_validation_before_submit = True
+    assert env.step(Action(name="validate_workbook", kwargs={})).info[
+        "validation_ok"
+    ] is True
+    assert env.step(Action(name="write_range", kwargs={
+        "range": "A1", "data": "changed",
+    })).info["tool_ok"] is True
+
+    response = env.step(Action(name="submit", kwargs={}))
+
+    assert response.terminated is False
+    assert response.info["submit_rejected"] is True
+    assert response.info["validation_stale"] is True
+
+
+def test_recalc_with_formula_errors_does_not_satisfy_submit_gate(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+    env._require_validation_before_submit = True
+    monkeypatch.setattr(
+        "envharness.bridges.spreadsheetbench.bridge."
+        "execute_recalculate_and_read",
+        lambda *args, **kwargs: ({
+            "formula_error_cells": 1,
+            "elapsed_ms": 1.0,
+        }, "recalculated values include #REF!"),
+    )
+
+    recalculated = env.step(Action(name="recalculate_and_read", kwargs={
+        "cell_ranges": ["Sheet1!A1"],
+    }))
+    submitted = env.step(Action(name="submit", kwargs={}))
+
+    assert recalculated.info["tool_ok"] is False
+    assert recalculated.info["tool_error"] == "formula_errors_found"
+    assert env.state.extras.get("last_recalc_revision", -1) == -1
+    assert submitted.info["submit_rejected"] is True
 
 
 def test_validate_workbook_scans_large_range_sequentially(
@@ -517,6 +757,45 @@ def test_format_range_updates_style_and_dimensions(tmp_path: Path) -> None:
     assert workbook["Sheet1"]["A1"].number_format == "0.00"
     assert workbook["Sheet1"].column_dimensions["A"].width == 18
     assert workbook["Sheet1"].row_dimensions[1].height == 24
+
+
+def test_format_range_rejects_oversized_range_without_mutation(
+    tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+    before = Path(env.state.output_path).read_bytes()
+
+    response = env.step(Action(name="format_range", kwargs={
+        "sheet_name": "Sheet1",
+        "range": "A1:J10000",
+        "font": {"name": "Times New Roman", "size": 12},
+    }))
+
+    assert response.info["tool_ok"] is False
+    assert response.info["tool_error"] == "range_too_large"
+    assert "100000 cells" in response.observation.text
+    assert Path(env.state.output_path).read_bytes() == before
+
+
+def test_fill_formula_rejects_more_than_write_cell_limit_without_mutation(
+    tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    env._tool_set = "native_basic"
+    before = Path(env.state.output_path).read_bytes()
+
+    response = env.step(Action(name="fill_formula", kwargs={
+        "sheet_name": "Sheet1",
+        "start_cell": "A1",
+        "end_row": 50001,
+        "formula_template": "=1+1",
+    }))
+
+    assert response.info["tool_ok"] is False
+    assert response.info["tool_error"] == "range_too_large"
+    assert "maximum is 50000" in response.observation.text
+    assert Path(env.state.output_path).read_bytes() == before
 
 
 def test_delete_rows_rolls_back_on_invalid_range(tmp_path: Path) -> None:

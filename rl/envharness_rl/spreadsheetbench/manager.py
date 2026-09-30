@@ -34,12 +34,17 @@ Safe edit pattern:
 Check that the output workbook opens and contains the required sheets/ranges:
 <tool_call>{\"name\":\"validate_workbook\",\"arguments\":{}}</tool_call>
 
+Validation also rejects malformed formulas and broken #REF! references in the
+answer range. A successful validation applies only to the current workbook
+revision. If you edit again, validate again before submit.
+
 Submit the finished output workbook:
 <tool_call>{\"name\":\"submit\",\"arguments\":{}}</tool_call>
 
 Python imports and local variables are stateless between calls; workbook edits
 persist through output_path. Do not submit until output_path contains the final
-answer."""
+answer. run_python edits are transactional: a Python failure or an invalid xlsx
+rolls the entire call back."""
 
 _NATIVE_READ_TOOL_INSTRUCTIONS = """
 
@@ -85,7 +90,8 @@ Delete rows or columns, or manage worksheets:
 <tool_call>{"name":"delete_rows","arguments":{"sheet_name":"Sheet1","rows":["2:4"]}}</tool_call>
 <tool_call>{"name":"manage_sheet","arguments":{"operation":"rename","sheet_name":"Sheet1","new_name":"Summary"}}</tool_call>
 
-validate_workbook checks workbook structure only; it does not calculate formulas.
+validate_workbook checks structure and static formula integrity; it does not
+calculate formulas.
 After the final edit, use recalculate_and_read in a turn by itself to inspect
 cached formula values and Excel errors. It recalculates a temporary copy, never
 modifies output_path, and is limited to one call by default. It must be the last
@@ -330,6 +336,18 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
         preflight_warning_count = sum(
             len(info.get("python_preflight_warnings") or []) for info in metric_infos
         )
+        transaction_rollback = any(
+            bool(info.get("transaction_rolled_back", False))
+            for info in metric_infos
+        )
+        submit_gate_reject = any(
+            bool(info.get("submit_rejected", False))
+            for info in metric_infos
+        )
+        formula_validation_errors = sum(
+            int(info.get("formula_validation_errors", 0))
+            for info in metric_infos
+        )
         projected_call_count = int(
             env_info.get("tool_call_count", 1 if action_name else 0)
         )
@@ -355,6 +373,9 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             "parser/invalid": int(parser_diagnostic.get("invalid", 1)),
             "parser/error": parser_diagnostic.get("error", ""),
             "parser/tool_name": parser_diagnostic.get("tool_name", ""),
+            "parser/tool_calls_truncated": int(
+                parser_diagnostic.get("truncated_call_count", 0)
+            ),
             "output/char_len": int(
                 parser_diagnostic.get("output_char_len", 0)
             ),
@@ -405,6 +426,9 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             )),
             "env/python_preflight_reject": int(preflight_rejected),
             "env/python_preflight_warning_count": preflight_warning_count,
+            "env/python_transaction_rollback": int(transaction_rollback),
+            "env/submit_gate_reject": int(submit_gate_reject),
+            "env/formula_validation_error_count": formula_validation_errors,
             "env/tool_error_type": (
                 write_error_type or read_error_type or recalc_error_type or tool_error
             ),
@@ -440,6 +464,9 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             "env/multi_call_failure_index": int(
                 env_info.get("multi_call_failure_index", -1)
             ),
+            "env/multi_call_mutation_budget_exceeded": int(bool(
+                env_info.get("multi_call_mutation_budget_exceeded", False)
+            )),
             "env/multi_call_stop_reason": str(
                 env_info.get("multi_call_stop_reason", "unknown")
             ),
@@ -577,6 +604,19 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
                     for item in diagnostics if item.get("error")
                 ),
                 "calls": diagnostics,
+                "batch_truncated": int(any(
+                    item.get("batch_truncated", 0) for item in diagnostics
+                )),
+                "total_call_count": max(
+                    (int(item.get("total_call_count", len(diagnostics)))
+                     for item in diagnostics),
+                    default=len(diagnostics),
+                ),
+                "truncated_call_count": max(
+                    (int(item.get("truncated_call_count", 0))
+                     for item in diagnostics),
+                    default=0,
+                ),
             })
             parser_diagnostics.append(aggregate)
         if hasattr(self.envs, "step_many"):
@@ -591,6 +631,36 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             )
 
         for index, info in enumerate(infos):
+            truncated_count = int(
+                parser_diagnostics[index].get("truncated_call_count", 0)
+            )
+            if truncated_count:
+                original_count = int(
+                    parser_diagnostics[index].get(
+                        "total_call_count", len(action_batches[index])
+                    )
+                )
+                executed_count = int(info.get(
+                    "tool_executed_count", len(action_batches[index])
+                ))
+                admitted_skipped = int(info.get(
+                    "tool_skipped_count",
+                    max(len(action_batches[index]) - executed_count, 0),
+                ))
+                info.update({
+                    "tool_call_count": original_count,
+                    "tool_executed_count": executed_count,
+                    "tool_skipped_count": admitted_skipped + truncated_count,
+                    "multi_call": original_count > 1,
+                    "multi_call_completed": False,
+                    "multi_call_all_success": False,
+                    "multi_call_short_circuit": True,
+                    "multi_call_executed_fraction": (
+                        executed_count / original_count if original_count else 0.0
+                    ),
+                })
+                if info.get("multi_call_stop_reason") == "completed":
+                    info["multi_call_stop_reason"] = "tool_call_limit"
             info["is_action_valid"] = to_numpy(valids[index])
             info["tool_calling"] = sum(
                 int(item.get("valid", 0))
@@ -600,12 +670,28 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
                 parser_diagnostics[index], info
             )
             info.update(diagnostics)
+            feedback: list[str] = []
             if not bool(valids[index]):
                 parser_error = parser_diagnostics[index].get(
                     "error", "Tool call parse error: invalid action."
                 )
                 info["parser_error"] = parser_error
-                text_obs[index] = f"{parser_error}\n\n{str(text_obs[index] or '')}"
+                feedback.append(parser_error)
+            if parser_diagnostics[index].get("batch_truncated"):
+                total_calls = parser_diagnostics[index]["total_call_count"]
+                executed_calls = total_calls - parser_diagnostics[index][
+                    "truncated_call_count"
+                ]
+                feedback.append(
+                    "[tool batch truncated] Accepted only the first "
+                    f"{executed_calls} of {total_calls} emitted calls. Calls "
+                    "beyond that prefix were not executed; continue them in the "
+                    "next turn."
+                )
+            if feedback:
+                text_obs[index] = (
+                    "\n\n".join(feedback) + "\n\n" + str(text_obs[index] or "")
+                )
 
         for index, raw_action in enumerate(text_actions):
             action_valid = bool(valids[index])

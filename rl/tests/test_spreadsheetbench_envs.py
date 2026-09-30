@@ -125,6 +125,46 @@ def test_worker_logs_action_and_grade_with_task_context(capsys) -> None:
     assert "worker_index=88 task_id=13-1 action=submit episode_step=1 stage=grade END" in output
 
 
+def test_worker_logs_native_action_arguments_before_execution(capsys) -> None:
+    worker = EnvharnessSpreadsheetWorker(
+        seed=0,
+        data_path="/dataset",
+        max_steps=2,
+        worker_index=49,
+        env_factory=FakeSpreadsheetEnv,
+    )
+    worker.reset()
+
+    worker.step(Action(name="format_range", kwargs={
+        "sheet_name": "Sheet1",
+        "range": "A1:J10000",
+        "font": {"name": "Times New Roman", "size": 12},
+    }))
+
+    output = capsys.readouterr().out
+    assert 'arguments={"font":{"name":"Times New Roman","size":12}' in output
+    assert '"range":"A1:J10000","sheet_name":"Sheet1"}' in output
+
+
+def test_worker_does_not_log_run_python_source(capsys) -> None:
+    worker = EnvharnessSpreadsheetWorker(
+        seed=0,
+        data_path="/dataset",
+        max_steps=2,
+        worker_index=49,
+        env_factory=FakeSpreadsheetEnv,
+    )
+    worker.reset()
+
+    worker.step(Action(name="run_python", kwargs={
+        "code": "SECRET_LONG_CODE = 'do not log this'",
+    }))
+
+    output = capsys.readouterr().out
+    assert "SECRET_LONG_CODE" not in output
+    assert 'arguments={"code_chars":36}' in output
+
+
 def test_worker_logs_reset_seed_and_boundaries(capsys) -> None:
     worker = EnvharnessSpreadsheetWorker(
         seed=17,
@@ -432,6 +472,46 @@ def test_worker_reports_completed_multi_call_diagnostics() -> None:
     assert info["multi_call_stop_reason"] == "completed"
     assert info["multi_call_failure_index"] == -1
     assert info["multi_call_executed_fraction"] == 1.0
+
+
+def test_worker_stops_multi_call_before_cumulative_mutation_budget_is_exceeded(
+    capsys,
+) -> None:
+    fake = FakeSpreadsheetEnv()
+    worker = EnvharnessSpreadsheetWorker(
+        seed=0,
+        data_path="/dataset",
+        max_steps=3,
+        env_factory=lambda: fake,
+    )
+    worker.reset()
+
+    _, _, done, info = worker.step_many([
+        Action(name="format_range", kwargs={"range": "A1:J5000"}),
+        Action(name="fill_formula", kwargs={
+            "start_cell": "A1", "end_row": 50000,
+            "formula_template": "=1+1",
+        }),
+        Action(name="format_range", kwargs={"range": "K1:K2"}),
+        Action(name="submit", kwargs={}),
+    ])
+
+    assert done is False
+    assert [action.name for action in fake.actions] == [
+        "format_range", "fill_formula",
+    ]
+    assert info["tool_call_count"] == 4
+    assert info["tool_executed_count"] == 3
+    assert info["tool_skipped_count"] == 1
+    assert info["tool_failure_count"] == 1
+    assert info["multi_call_stop_reason"] == "format_range_failure"
+    assert info["multi_call_mutation_budget_exceeded"] is True
+    assert info["multi_call_mutation_cells"] == 100000
+    assert info["tool_results"][-1]["info"]["tool_error"] == (
+        "multi_call_mutation_budget_exceeded"
+    )
+    output = capsys.readouterr().out
+    assert "mutation_cells=2 cumulative_cells=100000 maximum=100000" in output
 
 
 def test_worker_seeds_keep_each_grpo_group_on_the_same_task() -> None:
