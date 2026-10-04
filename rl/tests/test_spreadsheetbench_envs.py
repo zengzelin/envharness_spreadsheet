@@ -16,6 +16,7 @@ from envharness_rl.spreadsheetbench.envs import (
     EnvharnessSpreadsheetWorker,
     _ray_get_with_diagnostics,
     _require_initialized_ray,
+    _training_shuffle_seed,
     _worker_seeds,
 )
 
@@ -181,6 +182,31 @@ def test_worker_logs_reset_seed_and_boundaries(capsys) -> None:
     assert "worker_index=9 task_id=13-1 action=reset episode_step=0 stage=reset seed=17 END" in output
 
 
+def test_worker_error_log_level_only_logs_returned_failures(
+    capsys, monkeypatch
+) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_LOG_LEVEL", "error")
+    worker = EnvharnessSpreadsheetWorker(
+        seed=0,
+        data_path="/dataset",
+        max_steps=2,
+        worker_index=12,
+        env_factory=PenalizedSpreadsheetEnv,
+    )
+    worker.reset()
+
+    worker.step(Action(name="run_python", kwargs={"code": "broken"}))
+
+    output = capsys.readouterr().out
+    assert "[spreadsheet-worker]" in output
+    assert "worker_index=12 task_id=13-1 action=run_python" in output
+    assert "FAIL" in output
+    assert "python_error=True" in output
+    assert " START" not in output
+    assert " END" not in output
+    assert "stage=action_arguments" not in output
+
+
 def test_worker_grades_current_workbook_at_max_steps() -> None:
     fake = FakeSpreadsheetEnv()
     worker = EnvharnessSpreadsheetWorker(
@@ -223,7 +249,11 @@ def test_worker_preserves_execution_penalty_when_max_step_is_graded() -> None:
     assert info["python_error_type"] == "SyntaxError"
 
 
-def test_worker_converts_transient_eval_error_to_failed_episode() -> None:
+def test_worker_converts_transient_eval_error_to_failed_episode(
+    capsys, monkeypatch
+) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_LOG_LEVEL", "error")
+
     class RecalcFailingEnv(FakeSpreadsheetEnv):
         def evaluate(self):
             self.evaluate_calls += 1
@@ -250,6 +280,12 @@ def test_worker_converts_transient_eval_error_to_failed_episode() -> None:
     assert info["task_id"] == "13-1"
     assert info["error"].startswith("eval_error: LibreOffice recalc")
     assert fake.evaluate_calls == 1
+    output = capsys.readouterr().out
+    assert "[spreadsheet-worker]" in output
+    assert "stage=grade FAIL" in output
+    assert "eval_error: LibreOffice recalc" in output
+    assert " stage=grade START" not in output
+    assert " stage=grade END" not in output
 
 
 def test_worker_still_raises_unexpected_eval_errors() -> None:
@@ -516,6 +552,17 @@ def test_worker_stops_multi_call_before_cumulative_mutation_budget_is_exceeded(
 
 def test_worker_seeds_keep_each_grpo_group_on_the_same_task() -> None:
     assert _worker_seeds(seed=20, env_num=3, group_n=2) == [20, 20, 21, 21, 22, 22]
+
+
+def test_training_shuffle_seed_is_training_only_and_can_be_disabled() -> None:
+    assert _training_shuffle_seed(is_train=True, raw_value="17") == 17
+    assert _training_shuffle_seed(is_train=True, raw_value="off") is None
+    assert _training_shuffle_seed(is_train=False, raw_value="17") is None
+
+
+def test_training_shuffle_seed_rejects_invalid_values() -> None:
+    with pytest.raises(ValueError, match="SPREADSHEETBENCH_TRAIN_SHUFFLE_SEED"):
+        _training_shuffle_seed(is_train=True, raw_value="random")
 
 
 class FakeRayLifecycle:

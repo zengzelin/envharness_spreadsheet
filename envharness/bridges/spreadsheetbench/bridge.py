@@ -121,6 +121,7 @@ from .process_utils import run_process_group
 from .dataset import (
     DATA_PATH_ENV, SBTask, load_dataset, load_spreadsheet_rl_dataset, select_task,
 )
+from .log_utils import spreadsheet_log
 from .read_tools import (
     NATIVE_READ_TOOLS,
     NATIVE_RECALC_TOOLS,
@@ -286,17 +287,19 @@ class SpreadsheetBenchEnv(ActionableEnv):
             f"step={self.state.step_count} action={action or '-'} stage={name}"
         )
         started = time.monotonic()
-        print(f"{prefix} START", flush=True)
+        spreadsheet_log(f"{prefix} START")
         try:
             yield
         except BaseException as exc:
-            print(
+            spreadsheet_log(
                 f"{prefix} ERROR elapsed_s={time.monotonic() - started:.1f} "
                 f"error={type(exc).__name__}: {exc}",
-                flush=True,
+                error=True,
             )
             raise
-        print(f"{prefix} END elapsed_s={time.monotonic() - started:.1f}", flush=True)
+        spreadsheet_log(
+            f"{prefix} END elapsed_s={time.monotonic() - started:.1f}"
+        )
 
     # -- core env interface -------------------------------------------------
 
@@ -369,6 +372,7 @@ class SpreadsheetBenchEnv(ActionableEnv):
                 instance_id,
                 multi=bool(opts.get("multi_test_case")),
                 split_file=split_file,
+                task_shuffle_seed=opts.get("task_shuffle_seed"),
             )
         self._task = task
         self.state = SpreadsheetBenchEnvState(task_id=task.id)

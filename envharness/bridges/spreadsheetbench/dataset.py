@@ -49,6 +49,7 @@ reduces to a single output-vs-golden comparison at `answer_position`.
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import os
 import re
@@ -57,6 +58,8 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import PurePosixPath
 from typing import Any, Mapping
+
+from envharness.bridges.spreadsheetbench.log_utils import spreadsheet_log
 
 # Env var the Bridge falls back to when reset_options omits `data_path`.
 DATA_PATH_ENV = "SPREADSHEETBENCH_DATA"
@@ -180,10 +183,9 @@ def _load_spreadsheet_rl_rows(
         raise RuntimeError(
             f"Spreadsheet-RL split {parquet_path!r} contains no tasks."
         )
-    print(
+    spreadsheet_log(
         f"[spreadsheet-dataset] split={parquet_path} rows={len(rows)} "
-        f"load_elapsed_s={time.monotonic() - started:.1f}",
-        flush=True,
+        f"load_elapsed_s={time.monotonic() - started:.1f}"
     )
     return rows
 
@@ -354,25 +356,71 @@ def select_spreadsheet_rl_task(
     split_file: str,
     seed: int | None,
     instance_id: str | None = None,
+    task_shuffle_seed: int | None = None,
 ) -> tuple[SBTask, int]:
     """Select a parquet row first, then materialize only that task."""
     normalized_root = os.path.abspath(os.path.expanduser(data_path))
     normalized_split = _resolve_split_path(normalized_root, split_file)
     rows = _load_spreadsheet_rl_rows(normalized_root, normalized_split)
+    logical_index = int(seed) if seed is not None else 0
+    shuffle_epoch: int | None = None
+    shuffle_position: int | None = None
     if instance_id:
         index = _spreadsheet_rl_instance_index(
             normalized_root, rows, normalized_split, str(instance_id)
         )
+    elif task_shuffle_seed is not None:
+        index, shuffle_epoch, shuffle_position = _spreadsheet_rl_shuffled_index(
+            logical_index,
+            len(rows),
+            int(task_shuffle_seed),
+        )
     else:
-        index = (int(seed) if seed is not None else 0) % len(rows)
+        index = logical_index % len(rows)
     task = _spreadsheet_rl_task_from_row(normalized_root, rows[index], index)
-    print(
-        f"[spreadsheet-dataset] split={normalized_split} row_index={index} "
-        f"task_id={task.id}",
-        flush=True,
+    spreadsheet_log(
+        f"[spreadsheet-dataset] split={normalized_split} "
+        f"logical_index={logical_index} shuffle_seed={task_shuffle_seed} "
+        f"shuffle_epoch={shuffle_epoch} shuffle_position={shuffle_position} "
+        f"row_index={index} task_id={task.id}"
     )
     _check_not_missing(task, index)
     return task, index
+
+
+@lru_cache(maxsize=4)
+def _spreadsheet_rl_permutation(
+    dataset_size: int,
+    shuffle_seed: int,
+    epoch: int,
+) -> tuple[int, ...]:
+    """Return a stable permutation for one logical pass over the dataset."""
+    if dataset_size <= 0:
+        raise ValueError(f"dataset_size must be positive, got {dataset_size}")
+    prefix = f"{int(shuffle_seed)}:{int(epoch)}:".encode("ascii")
+    return tuple(sorted(
+        range(dataset_size),
+        key=lambda index: hashlib.blake2b(
+            prefix + str(index).encode("ascii"), digest_size=16
+        ).digest(),
+    ))
+
+
+def _spreadsheet_rl_shuffled_index(
+    logical_index: int,
+    dataset_size: int,
+    shuffle_seed: int,
+) -> tuple[int, int, int]:
+    """Map a logical training index to (row, epoch, position)."""
+    if dataset_size <= 0:
+        raise ValueError(f"dataset_size must be positive, got {dataset_size}")
+    if logical_index < 0:
+        raise ValueError(f"logical_index must be non-negative, got {logical_index}")
+    epoch, position = divmod(logical_index, dataset_size)
+    permutation = _spreadsheet_rl_permutation(
+        dataset_size, shuffle_seed, epoch
+    )
+    return permutation[position], epoch, position
 
 
 @lru_cache(maxsize=8)
@@ -492,12 +540,14 @@ def base_id(instance_id: str) -> str:
 def select_task(data_path: str, seed: int | None,
                 instance_id: str | None = None,
                 multi: bool = False,
-                split_file: str | None = None) -> tuple[SBTask, int]:
+                split_file: str | None = None,
+                task_shuffle_seed: int | None = None) -> tuple[SBTask, int]:
     """Resolve (task, index) for an episode.
 
     Priority:
       1. `instance_id` (the SpreadsheetBench id string) -> exact match.
-      2. `seed % len(tasks)` -> deterministic, alfworld/swebench-style.
+      2. Spreadsheet-RL with `task_shuffle_seed` -> deterministic epoch shuffle.
+      3. `seed % len(tasks)` -> deterministic, alfworld/swebench-style.
 
     NOTE: the orchestrator injects `options["task_id"]` = the project-level
     OrchestratorConfig.task_id label (a string like "spreadsheetbench-corpus"),
@@ -507,7 +557,11 @@ def select_task(data_path: str, seed: int | None,
     """
     if split_file:
         return select_spreadsheet_rl_task(
-            data_path, split_file, seed, instance_id=instance_id
+            data_path,
+            split_file,
+            seed,
+            instance_id=instance_id,
+            task_shuffle_seed=task_shuffle_seed,
         )
     tasks = load_dataset_multi(data_path) if multi else load_dataset(data_path)
     if not tasks:

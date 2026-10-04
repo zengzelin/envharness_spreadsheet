@@ -14,6 +14,7 @@ from envharness.bridges.spreadsheetbench.bridge import (
     parse_badcase_diagnostics_options,
 )
 from envharness.bridges.spreadsheetbench.dataset import SBTask
+from envharness.bridges.spreadsheetbench.log_utils import spreadsheet_log_level
 from envharness.core.types import Action
 
 
@@ -97,6 +98,11 @@ def test_badcase_diagnostic_options_validate_modes_and_positive_limits(
         parse_badcase_diagnostics_options({"badcase_diagnostics_mode": "verbose"})
     with pytest.raises(ValueError, match="max_scan_cells must be positive"):
         parse_badcase_diagnostics_options({"badcase_max_scan_cells": 0})
+
+
+def test_spreadsheet_log_level_rejects_unknown_value() -> None:
+    with pytest.raises(ValueError, match="SPREADSHEETBENCH_LOG_LEVEL"):
+        spreadsheet_log_level("quiet")
 
 
 def test_full_badcase_diagnostics_run_after_official_failure(
@@ -362,6 +368,38 @@ def test_run_python_logs_task_and_stage(capsys, tmp_path: Path) -> None:
     output = capsys.readouterr().out
     assert "task_id=task-1 step=1 action=run_python stage=run_python START" in output
     assert "task_id=task-1 step=1 action=run_python stage=run_python END" in output
+
+
+def test_bridge_error_log_level_suppresses_success_boundaries(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_LOG_LEVEL", "error")
+    env = _execution_env(tmp_path)
+
+    env.step(Action(name="run_python", kwargs={"code": "print('ok')"}))
+
+    assert "[spreadsheet-bridge]" not in capsys.readouterr().out
+
+
+def test_bridge_error_log_level_keeps_exception(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SPREADSHEETBENCH_LOG_LEVEL", "error")
+    env = _execution_env(tmp_path)
+    monkeypatch.setattr(
+        env,
+        "_run_python",
+        lambda code: (_ for _ in ()).throw(RuntimeError("bridge exploded")),
+    )
+
+    with pytest.raises(RuntimeError, match="bridge exploded"):
+        env.step(Action(name="run_python", kwargs={"code": "print('ok')"}))
+
+    output = capsys.readouterr().out
+    assert "[spreadsheet-bridge]" in output
+    assert "stage=run_python ERROR" in output
+    assert "bridge exploded" in output
+    assert "stage=run_python START" not in output
 
 
 def test_validate_workbook_checks_output_without_grading(tmp_path: Path) -> None:

@@ -10,6 +10,7 @@ import time
 from typing import Any, Iterator
 
 from envharness.bridges.spreadsheetbench.bridge import SpreadsheetBenchEnv
+from envharness.bridges.spreadsheetbench.log_utils import spreadsheet_log
 from envharness.bridges.spreadsheetbench.read_tools import (
     NATIVE_RECALC_TOOLS, NATIVE_STRUCTURE_TOOLS, NATIVE_WRITE_TOOLS,
     _range_bounds, _split_range,
@@ -107,6 +108,29 @@ def _worker_seeds(seed: int, env_num: int, group_n: int) -> list[int]:
     if group_n <= 0:
         raise ValueError(f"group_n must be positive, got {group_n}")
     return [int(seed) + i // group_n for i in range(env_num * group_n)]
+
+
+def _training_shuffle_seed(
+    *, is_train: bool, raw_value: str | None = None
+) -> int | None:
+    """Parse the training-only Spreadsheet-RL sampling permutation seed."""
+    if not is_train:
+        return None
+    value = (
+        os.environ.get("SPREADSHEETBENCH_TRAIN_SHUFFLE_SEED", "0")
+        if raw_value is None
+        else raw_value
+    )
+    normalized = str(value).strip().lower()
+    if normalized in {"off", "none", "false"}:
+        return None
+    try:
+        return int(normalized)
+    except ValueError as exc:
+        raise ValueError(
+            "SPREADSHEETBENCH_TRAIN_SHUFFLE_SEED must be an integer or off, "
+            f"got {value!r}"
+        ) from exc
 
 
 def _require_initialized_ray(ray_module: Any) -> None:
@@ -252,18 +276,18 @@ class EnvharnessSpreadsheetWorker:
             )
 
         started = time.monotonic()
-        print(f"{prefix()} START", flush=True)
+        spreadsheet_log(f"{prefix()} START")
         try:
             yield
         except BaseException as exc:
-            print(
+            spreadsheet_log(
                 f"{prefix()} ERROR elapsed_s={time.monotonic() - started:.1f} "
-                f"error={type(exc).__name__}: {exc}", flush=True,
+                f"error={type(exc).__name__}: {exc}",
+                error=True,
             )
             raise
-        print(
-            f"{prefix()} END elapsed_s={time.monotonic() - started:.1f}",
-            flush=True,
+        spreadsheet_log(
+            f"{prefix()} END elapsed_s={time.monotonic() - started:.1f}"
         )
 
     def reset(self, task_seed: int | None = None) -> tuple[str, dict[str, Any]]:
@@ -299,6 +323,13 @@ class EnvharnessSpreadsheetWorker:
             message = str(exc)
             if not message.startswith("eval_error:"):
                 raise
+            spreadsheet_log(
+                f"[spreadsheet-worker] worker_index={self._worker_index} "
+                f"task_id={self._task_id or '-'} action=grade "
+                f"episode_step={self._episode_steps} stage=grade FAIL "
+                f"error={message}",
+                error=True,
+            )
             info["error"] = message
             info["won"] = False
             info["score"] = 0.0
@@ -333,11 +364,10 @@ class EnvharnessSpreadsheetWorker:
         stop_reason = "completed"
         cumulative_mutation_cells = 0
         for action_index, projected in enumerate(projected_actions):
-            print(
+            spreadsheet_log(
                 f"[spreadsheet-worker] worker_index={self._worker_index} "
                 f"task_id={self._task_id or '-'} action={projected.name} "
-                f"episode_step={episode_step} action_index={action_index}",
-                flush=True,
+                f"episode_step={episode_step} action_index={action_index}"
             )
             mutation_cells = _mutation_cell_count(projected)
             if (
@@ -345,25 +375,24 @@ class EnvharnessSpreadsheetWorker:
                 and cumulative_mutation_cells + mutation_cells
                 > MAX_MULTI_CALL_MUTATION_CELLS
             ):
-                print(
+                spreadsheet_log(
                     f"[spreadsheet-worker] worker_index={self._worker_index} "
                     f"task_id={self._task_id or '-'} action={projected.name} "
                     f"episode_step={episode_step} stage=mutation_budget REJECT "
                     f"mutation_cells={mutation_cells} "
                     f"cumulative_cells={cumulative_mutation_cells} "
                     f"maximum={MAX_MULTI_CALL_MUTATION_CELLS}",
-                    flush=True,
+                    error=True,
                 )
                 response = _mutation_budget_response(
                     projected, mutation_cells, cumulative_mutation_cells
                 )
             else:
-                print(
+                spreadsheet_log(
                     f"[spreadsheet-worker] worker_index={self._worker_index} "
                     f"task_id={self._task_id or '-'} action={projected.name} "
                     f"episode_step={episode_step} stage=action_arguments "
-                    f"{_action_log_detail(projected)}",
-                    flush=True,
+                    f"{_action_log_detail(projected)}"
                 )
                 with self._stage("env_step", projected.name, episode_step):
                     response = self._env.step(projected)
@@ -380,6 +409,22 @@ class EnvharnessSpreadsheetWorker:
                 or sub_info.get("failure_class")
                 or sub_info.get("error")
             )
+            if action_failed:
+                failure_details = " ".join(
+                    f"{key}={sub_info[key]}"
+                    for key in (
+                        "tool_error", "failure_class", "error",
+                        "python_error", "python_error_type", "syntax_error",
+                    )
+                    if sub_info.get(key) not in (None, "", False)
+                )
+                spreadsheet_log(
+                    f"[spreadsheet-worker] worker_index={self._worker_index} "
+                    f"task_id={self._task_id or '-'} action={projected.name} "
+                    f"episode_step={episode_step} action_index={action_index} "
+                    f"FAIL {failure_details or 'tool_failed=True'}",
+                    error=True,
+                )
             observation_text = response.observation.text or ""
             if len(observation_text) > observation_budget:
                 marker = "\n[tool observation truncated]\n"
@@ -519,6 +564,10 @@ class EnvharnessSpreadsheetEnvs:
             else ""
         )
         max_steps = int(kwargs.pop("max_steps", 10))
+        kwargs.pop("task_shuffle_seed", None)
+        task_shuffle_seed = _training_shuffle_seed(is_train=is_train)
+        if task_shuffle_seed is not None:
+            kwargs["task_shuffle_seed"] = task_shuffle_seed
         _require_initialized_ray(ray)
 
         seeds = _worker_seeds(seed, env_num, group_n)

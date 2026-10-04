@@ -95,6 +95,140 @@ def test_select_task_uses_spreadsheet_rl_split_file(tmp_path: Path, monkeypatch)
     assert task.golden_path.endswith("/task-b/target.xlsx")
 
 
+def test_error_log_level_suppresses_dataset_progress(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _write_task(
+        tmp_path,
+        "excelforum/formulas/task-a",
+        {
+            "instruction": "task-a",
+            "type": "Formulas/Functions",
+            "answer_position": "A1",
+        },
+    )
+    (tmp_path / "train_hermes.parquet").write_bytes(b"placeholder")
+    monkeypatch.setattr(
+        dataset,
+        "_read_spreadsheet_rl_parquet_rows",
+        lambda path: [{
+            "reward_model": {
+                "ground_truth": "excelforum/formulas/task-a",
+            },
+            "extra_info": {"id": "task-a"},
+        }],
+    )
+    monkeypatch.setenv("SPREADSHEETBENCH_LOG_LEVEL", "error")
+
+    task, index = dataset.select_task(
+        str(tmp_path), seed=0, split_file="train_hermes.parquet"
+    )
+
+    assert (task.id, index) == ("task-a", 0)
+    assert "[spreadsheet-dataset]" not in capsys.readouterr().out
+
+
+def test_training_shuffle_is_reproducible_without_replacement(
+    tmp_path: Path, monkeypatch
+) -> None:
+    names = [f"task-{index}" for index in range(8)]
+    for name in names:
+        _write_task(
+            tmp_path,
+            f"excelforum/formulas/{name}",
+            {
+                "instruction": name,
+                "type": "Formulas/Functions",
+                "answer_position": "A1",
+            },
+        )
+    (tmp_path / "train_hermes.parquet").write_bytes(b"placeholder")
+    rows = [
+        {
+            "reward_model": {
+                "ground_truth": f"excelforum/formulas/{name}",
+            },
+            "extra_info": {"id": name},
+        }
+        for name in names
+    ]
+    monkeypatch.setattr(
+        dataset, "_read_spreadsheet_rl_parquet_rows", lambda path: rows
+    )
+
+    first_epoch = [
+        dataset.select_task(
+            str(tmp_path),
+            seed=logical_index,
+            split_file="train_hermes.parquet",
+            task_shuffle_seed=17,
+        )[1]
+        for logical_index in range(8)
+    ]
+    repeated_epoch = [
+        dataset.select_task(
+            str(tmp_path),
+            seed=logical_index,
+            split_file="train_hermes.parquet",
+            task_shuffle_seed=17,
+        )[1]
+        for logical_index in range(8)
+    ]
+    second_epoch = [
+        dataset.select_task(
+            str(tmp_path),
+            seed=logical_index,
+            split_file="train_hermes.parquet",
+            task_shuffle_seed=17,
+        )[1]
+        for logical_index in range(8, 16)
+    ]
+
+    assert first_epoch == [6, 1, 3, 4, 7, 5, 0, 2]
+    assert repeated_epoch == first_epoch
+    assert sorted(first_epoch) == list(range(8))
+    assert second_epoch == [7, 2, 6, 1, 4, 0, 5, 3]
+    assert sorted(second_epoch) == list(range(8))
+    assert second_epoch != first_epoch
+
+
+def test_explicit_spreadsheet_rl_instance_ignores_training_shuffle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    for name in ("task-a", "task-b"):
+        _write_task(
+            tmp_path,
+            f"excelforum/formulas/{name}",
+            {"instruction": name, "type": "type", "answer_position": "A1"},
+        )
+    (tmp_path / "test_hermes.parquet").write_bytes(b"placeholder")
+    monkeypatch.setattr(
+        dataset,
+        "_read_spreadsheet_rl_parquet_rows",
+        lambda path: [
+            {
+                "reward_model": {"ground_truth": "excelforum/formulas/task-a"},
+                "extra_info": {"id": "task-a"},
+            },
+            {
+                "reward_model": {"ground_truth": "excelforum/formulas/task-b"},
+                "extra_info": {"id": "task-b"},
+            },
+        ],
+    )
+
+    task, index = dataset.select_task(
+        str(tmp_path),
+        seed=999,
+        instance_id="task-a",
+        split_file="test_hermes.parquet",
+        task_shuffle_seed=17,
+    )
+
+    assert index == 0
+    assert task.id == "task-a"
+
+
 def test_select_task_only_materializes_selected_spreadsheet_rl_row(
     tmp_path: Path, monkeypatch
 ) -> None:

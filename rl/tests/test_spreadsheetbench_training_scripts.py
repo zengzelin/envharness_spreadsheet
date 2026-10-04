@@ -109,6 +109,32 @@ def test_training_scripts_forward_hardening_controls() -> None:
         assert "max_tool_calls_per_turn=4" in source
 
 
+def test_training_scripts_forward_training_shuffle_seed() -> None:
+    for script_name in (
+        "run_spreadsheetbench_grpo.sh",
+        "submit_spreadsheetbench_grpo.sh",
+    ):
+        source = (ROOT / "rl/scripts" / script_name).read_text()
+        assert (
+            'SPREADSHEETBENCH_TRAIN_SHUFFLE_SEED='
+            '"${SPREADSHEETBENCH_TRAIN_SHUFFLE_SEED:-0}"'
+        ) in source
+        assert "export SPREADSHEETBENCH_TRAIN_SHUFFLE_SEED" in source
+
+
+def test_training_scripts_forward_spreadsheet_log_level() -> None:
+    for script_name in (
+        "run_spreadsheetbench_grpo.sh",
+        "submit_spreadsheetbench_grpo.sh",
+    ):
+        source = (ROOT / "rl/scripts" / script_name).read_text()
+        assert (
+            'SPREADSHEETBENCH_LOG_LEVEL='
+            '"${SPREADSHEETBENCH_LOG_LEVEL:-verbose}"'
+        ) in source
+        assert "export SPREADSHEETBENCH_LOG_LEVEL" in source
+
+
 def test_training_scripts_forward_badcase_diagnostics() -> None:
     for script_name in (
         "run_spreadsheetbench_grpo.sh",
