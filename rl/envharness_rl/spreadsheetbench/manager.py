@@ -12,6 +12,7 @@ import numpy as np
 
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from envharness_rl.spreadsheetbench.projection import project_action_batch
+from envharness_rl.spreadsheetbench.rollout_summary import classify_badcase
 
 
 _PYTHON_TOOL_INSTRUCTIONS = """You are solving a SpreadsheetBench task by editing the workbook with Python.
@@ -191,7 +192,7 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             f"{safe_task_id}_{self._trajectory_ids[index]}.json"
         )
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "split": self._split,
             "trajectory_id": self._trajectory_ids[index],
             "task_id": self._task_ids[index],
@@ -728,6 +729,27 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
                 )
             )
             if bool(dones[index]):
+                mode = os.environ.get(
+                    "SPREADSHEETBENCH_BADCASE_DIAGNOSTICS", "light"
+                ).strip().lower()
+                if mode != "off":
+                    final_info = infos[index]
+                    if not isinstance(
+                        final_info.get("badcase_diagnostics"), dict
+                    ):
+                        final_info["badcase_diagnostics"] = {
+                            "version": 1,
+                            "mode": mode,
+                            "eligible": not bool(final_info.get("won")),
+                            "status": (
+                                "skipped_success"
+                                if final_info.get("won") else "light_only"
+                            ),
+                        }
+                    final_info["badcase_diagnostics"] = classify_badcase(
+                        final_info=final_info,
+                        steps=self._trajectory_steps[index],
+                    )
                 self._dump_trajectory(index, infos[index])
         self._last_observations = list(text_obs)
 
@@ -773,6 +795,22 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             "reward_execution_penalty": [],
             "reward_env_total": [],
         }
+        badcase_components = {
+            name: [] for name in (
+                "badcase_policy_eligible", "badcase_full_eligible",
+                "badcase_execution_clean_score_zero", "badcase_no_submit",
+                "badcase_time_limit", "badcase_submit_gate_unrecovered",
+                "badcase_tool_call_truncated",
+                "badcase_mutation_budget_exceeded",
+                "badcase_answer_match_ratio",
+                "badcase_answer_range_untouched",
+                "badcase_likely_wrong_sheet_or_range",
+                "badcase_answer_partially_correct",
+                "badcase_formula_to_static",
+                "badcase_formula_result_mismatch",
+                "badcase_diagnostic_truncated", "badcase_diagnostic_error",
+            )
+        }
         info_keys = {
             "reward_workbook_score": "reward/workbook_score",
             "reward_execution_penalty": "reward/execution_penalty",
@@ -787,8 +825,50 @@ class SpreadsheetBenchEnvironmentManager(EnvironmentManagerBase):
             for metric_key, info_key in info_keys.items():
                 fallback = final_info.get("score", 0.0) if metric_key == "reward_workbook_score" else 0.0
                 components[metric_key].append(float(final_info.get(info_key, fallback)))
+            diagnosis = final_info.get("badcase_diagnostics") or {}
+            tags = set(diagnosis.get("failure_tags") or [])
+            policy_eligible = int(
+                bool(diagnosis) and "eval_error" not in tags
+            )
+            full_eligible = int(
+                policy_eligible
+                and bool(diagnosis.get("eligible"))
+                and diagnosis.get("status") == "complete"
+            )
+            badcase_components["badcase_policy_eligible"].append(
+                policy_eligible
+            )
+            badcase_components["badcase_full_eligible"].append(full_eligible)
+            for metric_key, tag in {
+                "badcase_execution_clean_score_zero": "execution_clean_score_zero",
+                "badcase_no_submit": "no_submit",
+                "badcase_time_limit": "time_limit",
+                "badcase_submit_gate_unrecovered": "submit_gate_unrecovered",
+                "badcase_tool_call_truncated": "tool_call_truncated",
+                "badcase_mutation_budget_exceeded": "mutation_budget_exceeded",
+                "badcase_answer_range_untouched": "answer_range_untouched",
+                "badcase_likely_wrong_sheet_or_range": "likely_wrong_sheet_or_range",
+                "badcase_answer_partially_correct": "answer_partially_correct",
+                "badcase_formula_to_static": "formula_to_static",
+                "badcase_formula_result_mismatch": "formula_result_mismatch",
+            }.items():
+                badcase_components[metric_key].append(int(tag in tags))
+            badcase_components["badcase_answer_match_ratio"].append(
+                float(diagnosis.get("answer_match_ratio", 0.0) or 0.0)
+                if full_eligible else 0.0
+            )
+            badcase_components["badcase_diagnostic_truncated"].append(int(
+                full_eligible and bool(diagnosis.get("diagnostic_truncated"))
+            ))
+            badcase_components["badcase_diagnostic_error"].append(int(
+                policy_eligible and diagnosis.get("status") == "diagnostic_error"
+            ))
         metrics.update({
             key: np.asarray(values, dtype=np.float32)
             for key, values in components.items()
+        })
+        metrics.update({
+            key: np.asarray(values, dtype=np.float32)
+            for key, values in badcase_components.items()
         })
         return metrics

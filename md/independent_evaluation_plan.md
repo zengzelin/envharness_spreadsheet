@@ -1,6 +1,23 @@
 # Spreadsheet Agent 独立评测方案与当前状态
 
-更新日期：2026-09-24
+更新日期：2026-09-30
+
+## 0.3 2026-09-30 njceph5 / sgceph1 最新结果
+
+最新完整实验台账、配置边界和失败分析统一记录在
+`md/experiment_results_20260930.md`。关键结论如下：
+
+- njceph5 `20260926_155341` 在其旧评测协议下由 Base `68/399` 提升到 Step 40
+  `117/399`，后续 Step 60/80/100 均未超过 Step 40；
+- sgceph1 `20260922_105252` 由 Base `97/399` 提升到 Step 50/100 的 `110/399`；
+- sgceph1 hardened run `20260926_232503` 当前由 Base `90/399` 提升到 Step 60
+  `114/399`，Step 80 回落到 `104/399`；
+- hardened run 的 Step 100 evaluation 因单个 `format_range` actor 等待 600 秒超时而失败，
+  没有可用的完整 399 条结果；
+- 三组的 commit/submit gate 不同，只能组内比较，不能把最高数字直接当成统一 leaderboard。
+
+当前 hardened 协议的 checkpoint 首选是 Step 60。同步 mutation 上限后，应在同一 checkout
+重新评测 Base、Step 60、Step 100，再运行严格 paired comparison。
 
 ## 0.1 2026-09-24 专用评测工具
 
@@ -244,3 +261,22 @@ bash rl/scripts/submit_spreadsheetbench_grpo.sh
 完成数据重叠审计和 manifest 数据指纹后，才能把跨 split 结果称为严格 held-out。
 训练中的固定 64-task fast-val 只用于健康检查和趋势观测，checkpoint 选择仍以完整
 399-task paired evaluation 为准。
+
+## 6. 2026-10-01 badcase 正式评测流程
+
+正式评测入口 `rl/scripts/submit_spreadsheetbench_eval.sh` 默认设置：
+
+```bash
+SPREADSHEETBENCH_BADCASE_DIAGNOSTICS=full \
+SPREADSHEETBENCH_BADCASE_MAX_SCAN_CELLS=200000 \
+SPREADSHEETBENCH_BADCASE_MAX_EXAMPLES=20 \
+bash rl/scripts/submit_spreadsheetbench_eval.sh LABEL=/path/to/model
+```
+
+每个 run 在 `${RUN_DIR}` 下自动生成 `badcases.jsonl` 和 `badcase_summary.json`，原始 schema-v2
+轨迹仍在 `${RUN_DIR}/rollouts/env/val`。报告生成失败会打印 warning，但不会改写评测结果。
+run manifest 记录诊断模式和两个上限，便于跨 checkpoint 核对协议。
+
+在完整 399 条之前，先用 `VAL_SIZE=4 VAL_CONCURRENCY=4`、确定性解码跑 smoke，核对轨迹、
+JSONL、summary 与 W&B 的分母。诊断不保存失败 workbook；公式和格式证据不进入官方评分，
+其中格式 mismatch 只具有信息性。训练过程保持默认 `light`，避免 workbook 扫描影响吞吐。

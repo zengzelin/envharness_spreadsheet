@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+PY="${PY:-$(command -v python || command -v python3)}"
 
 usage() {
   cat <<'EOF'
@@ -98,6 +99,9 @@ for spec in "$@"; do
   SPREADSHEET_RL_VAL_FILE="${SPREADSHEET_RL_VAL_FILE}" \
   SPREADSHEETBENCH_TOOL_SET="${SPREADSHEETBENCH_TOOL_SET:-native_basic}" \
   SPREADSHEETBENCH_HISTORY_MODE="${SPREADSHEETBENCH_HISTORY_MODE:-compact}" \
+  SPREADSHEETBENCH_BADCASE_DIAGNOSTICS="${SPREADSHEETBENCH_BADCASE_DIAGNOSTICS:-full}" \
+  SPREADSHEETBENCH_BADCASE_MAX_SCAN_CELLS="${SPREADSHEETBENCH_BADCASE_MAX_SCAN_CELLS:-200000}" \
+  SPREADSHEETBENCH_BADCASE_MAX_EXAMPLES="${SPREADSHEETBENCH_BADCASE_MAX_EXAMPLES:-20}" \
   RUN_ROOT="${RUN_ROOT}" \
   RUN_DIR="${run_dir}" \
   RUN_TS="${run_ts}" \
@@ -105,6 +109,14 @@ for spec in "$@"; do
   WANDB_NAME="${exp_name}" \
   WANDB_PROJECT="${WANDB_PROJECT:-envharness_rl_spreadsheetbench}" \
   bash "${SCRIPT_DIR}/submit_spreadsheetbench_grpo.sh"
+
+  if ! PYTHONPATH="${ROOT}:${ROOT}/rl:${ROOT}/third_party/verl-agent${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${PY}" "${SCRIPT_DIR}/summarize_spreadsheetbench_rollouts.py" \
+      "${run_dir}" --split val \
+      --badcase-jsonl-output "${run_dir}/badcases.jsonl" \
+      --badcase-summary-output "${run_dir}/badcase_summary.json"; then
+    echo "[spreadsheet-eval] warning: badcase report generation failed for ${run_dir}" >&2
+  fi
 
   echo "[spreadsheet-eval] completed label=${label} run_dir=${run_dir}"
 done

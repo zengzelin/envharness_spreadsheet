@@ -85,6 +85,9 @@ Reset options (passed through `options` in reset()):
                                    (default -0.1).
     require_validation_before_submit: bool -- require a current successful
                             validate_workbook or recalculate_and_read result.
+    badcase_diagnostics_mode: str -- off, light, or full (default light).
+    badcase_max_scan_cells: int -- shared full-diagnostic coordinate budget.
+    badcase_max_examples: int -- maximum retained mismatch examples.
     tool_set: str        -- python (default), native_read, or native_basic.
 """
 from __future__ import annotations
@@ -100,7 +103,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Iterator
+from typing import Any, ClassVar, Iterator, Mapping
 
 from envharness.core.actionable_env import ActionableEnv
 from envharness.core.registry import register_env
@@ -110,6 +113,10 @@ from envharness.core.types import (
     TaskSummary,
 )
 from . import online_judge_eval
+from .badcase_diagnostics import (
+    DiagnosticLimits,
+    diagnose_failed_workbook,
+)
 from .process_utils import run_process_group
 from .dataset import (
     DATA_PATH_ENV, SBTask, load_dataset, load_spreadsheet_rl_dataset, select_task,
@@ -143,10 +150,48 @@ DEFAULT_PREVIEW_ROWS = 20
 DEFAULT_PREVIEW_COLS = 16
 DEFAULT_PYTHON_ERROR_PENALTY = -0.05
 DEFAULT_SYNTAX_ERROR_PENALTY = -0.1
+DEFAULT_BADCASE_DIAGNOSTICS_MODE = "light"
+DEFAULT_BADCASE_MAX_SCAN_CELLS = 200_000
+DEFAULT_BADCASE_MAX_EXAMPLES = 20
+BADCASE_DIAGNOSTICS_MODES = frozenset({"off", "light", "full"})
 _PYTHON_EXCEPTION_RE = re.compile(
     r"(?m)^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)):\s*"
 )
 _SYNTAX_ERROR_TYPES = {"SyntaxError", "IndentationError", "TabError"}
+
+
+def parse_badcase_diagnostics_options(
+    options: Mapping[str, Any],
+) -> tuple[str, DiagnosticLimits]:
+    mode = str(options.get(
+        "badcase_diagnostics_mode",
+        os.environ.get(
+            "SPREADSHEETBENCH_BADCASE_DIAGNOSTICS",
+            DEFAULT_BADCASE_DIAGNOSTICS_MODE,
+        ),
+    )).strip().lower()
+    if mode not in BADCASE_DIAGNOSTICS_MODES:
+        raise ValueError(
+            "badcase_diagnostics_mode must be off, light, or full; "
+            f"got {mode!r}"
+        )
+    limits = DiagnosticLimits(
+        max_scan_cells=int(options.get(
+            "badcase_max_scan_cells",
+            os.environ.get(
+                "SPREADSHEETBENCH_BADCASE_MAX_SCAN_CELLS",
+                str(DEFAULT_BADCASE_MAX_SCAN_CELLS),
+            ),
+        )),
+        max_examples=int(options.get(
+            "badcase_max_examples",
+            os.environ.get(
+                "SPREADSHEETBENCH_BADCASE_MAX_EXAMPLES",
+                str(DEFAULT_BADCASE_MAX_EXAMPLES),
+            ),
+        )),
+    )
+    return mode, limits
 
 
 def _safe_file_stem(value: str) -> str:
@@ -219,6 +264,8 @@ class SpreadsheetBenchEnv(ActionableEnv):
         self._python_error_penalty: float = DEFAULT_PYTHON_ERROR_PENALTY
         self._syntax_error_penalty: float = DEFAULT_SYNTAX_ERROR_PENALTY
         self._require_validation_before_submit = False
+        self._badcase_diagnostics_mode = DEFAULT_BADCASE_DIAGNOSTICS_MODE
+        self._badcase_diagnostic_limits = DiagnosticLimits()
         self._tool_set: str = normalize_tool_set(
             os.environ.get("SPREADSHEETBENCH_TOOL_SET", "python")
         )
@@ -291,6 +338,10 @@ class SpreadsheetBenchEnv(ActionableEnv):
                 "1", "true", "yes", "on",
             }
         self._require_validation_before_submit = bool(require_validation)
+        (
+            self._badcase_diagnostics_mode,
+            self._badcase_diagnostic_limits,
+        ) = parse_badcase_diagnostics_options(opts)
         self._tool_set = normalize_tool_set(
             opts.get("tool_set")
             or os.environ.get("SPREADSHEETBENCH_TOOL_SET", "python")
@@ -1166,13 +1217,49 @@ exec(compile(source, agent_script, "exec"), namespace)
             passed, msg = online_judge_eval.compare_workbooks(
                 golden, output_path, task.instruction_type, task.answer_position,
             )
+        metrics: dict[str, Any] = {
+            "won": bool(passed),
+            "diff": msg[:300],
+            "answer_position": task.answer_position,
+            "submitted": self.state.submitted,
+            "steps": self.state.step_count,
+        }
+        if self._badcase_diagnostics_mode != "off":
+            diagnostics: dict[str, Any] = {
+                "version": 1,
+                "mode": self._badcase_diagnostics_mode,
+                "eligible": not bool(passed),
+                "status": "skipped_success" if passed else "light_only",
+            }
+            if not passed and self._badcase_diagnostics_mode == "full":
+                try:
+                    with self._stage("badcase_diagnostics", action="grade"):
+                        workbook_diagnostics = diagnose_failed_workbook(
+                            self.state.input_path,
+                            golden,
+                            output_path,
+                            task.answer_position,
+                            limits=self._badcase_diagnostic_limits,
+                        )
+                    diagnostics.update(workbook_diagnostics)
+                    diagnostics.update({
+                        "version": 1,
+                        "mode": "full",
+                        "eligible": True,
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    diagnostics = {
+                        "version": 1,
+                        "mode": "full",
+                        "eligible": True,
+                        "status": "diagnostic_error",
+                        "diagnostic_error_type": type(exc).__name__,
+                    }
+            metrics["badcase_diagnostics"] = diagnostics
         return EvaluationResult(
             success=bool(passed),
             score=1.0 if passed else 0.0,
-            metrics={"won": bool(passed), "diff": msg[:300],
-                     "answer_position": task.answer_position,
-                     "submitted": self.state.submitted,
-                     "steps": self.state.step_count},
+            metrics=metrics,
         )
 
     def _cached_golden(self, task: SBTask) -> str:

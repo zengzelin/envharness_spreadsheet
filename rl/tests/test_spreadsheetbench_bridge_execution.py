@@ -5,12 +5,15 @@ from pathlib import Path
 import time
 
 import openpyxl
+import pytest
 
 from envharness.bridges.spreadsheetbench import recalc_tools, write_tools
 from envharness.bridges.spreadsheetbench.bridge import (
     SpreadsheetBenchEnv,
     SpreadsheetBenchEnvState,
+    parse_badcase_diagnostics_options,
 )
+from envharness.bridges.spreadsheetbench.dataset import SBTask
 from envharness.core.types import Action
 
 
@@ -46,6 +49,145 @@ def _tool_payload(response) -> dict:
     marker = "last tool output:\n"
     assert marker in response.observation.text
     return json.loads(response.observation.text.split(marker, 1)[1])
+
+
+def _grading_task(tmp_path: Path, expected: object) -> SBTask:
+    golden_path = tmp_path / "golden.xlsx"
+    workbook = openpyxl.Workbook()
+    workbook.active.title = "Sheet1"
+    workbook["Sheet1"]["A1"] = expected
+    workbook.save(golden_path)
+    workbook.close()
+    return SBTask(
+        id="task-1",
+        instruction="Write A1",
+        instruction_type="Cell-Level Manipulation",
+        answer_position="Sheet1!A1",
+        answer_sheet="Sheet1",
+        init_path=str(tmp_path / "input.xlsx"),
+        golden_path=str(golden_path),
+    )
+
+
+def test_badcase_diagnostic_options_validate_modes_and_positive_limits(
+    monkeypatch,
+) -> None:
+    for name in (
+        "SPREADSHEETBENCH_BADCASE_DIAGNOSTICS",
+        "SPREADSHEETBENCH_BADCASE_MAX_SCAN_CELLS",
+        "SPREADSHEETBENCH_BADCASE_MAX_EXAMPLES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    mode, limits = parse_badcase_diagnostics_options({})
+    assert mode == "light"
+    assert limits.max_scan_cells == 200_000
+    assert limits.max_examples == 20
+
+    mode, limits = parse_badcase_diagnostics_options({
+        "badcase_diagnostics_mode": "FULL",
+        "badcase_max_scan_cells": "17",
+        "badcase_max_examples": 3,
+    })
+    assert mode == "full"
+    assert limits.max_scan_cells == 17
+    assert limits.max_examples == 3
+
+    with pytest.raises(ValueError, match="off, light, or full"):
+        parse_badcase_diagnostics_options({"badcase_diagnostics_mode": "verbose"})
+    with pytest.raises(ValueError, match="max_scan_cells must be positive"):
+        parse_badcase_diagnostics_options({"badcase_max_scan_cells": 0})
+
+
+def test_full_badcase_diagnostics_run_after_official_failure(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    env._recalc_golden = False
+    env._badcase_diagnostics_mode = "full"
+    task = _grading_task(tmp_path, "expected")
+    monkeypatch.setattr(
+        "envharness.bridges.spreadsheetbench.bridge."
+        "online_judge_eval.recalc_with_libreoffice",
+        lambda *args, **kwargs: True,
+    )
+
+    result = env._grade(task)
+
+    assert result.success is False
+    assert result.score == 0.0
+    assert result.metrics["diff"].startswith("value diff at A1")
+    diagnostics = result.metrics["badcase_diagnostics"]
+    assert diagnostics["mode"] == "full"
+    assert diagnostics["eligible"] is True
+    assert diagnostics["status"] == "complete"
+    assert diagnostics["answer_cells_mismatched"] == 1
+
+
+def test_full_badcase_diagnostics_do_not_run_on_success(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    env._recalc_golden = False
+    env._badcase_diagnostics_mode = "full"
+    workbook = openpyxl.load_workbook(env.state.output_path)
+    workbook["Sheet1"]["A1"] = "expected"
+    workbook.save(env.state.output_path)
+    workbook.close()
+    task = _grading_task(tmp_path, "expected")
+    monkeypatch.setattr(
+        "envharness.bridges.spreadsheetbench.bridge."
+        "online_judge_eval.recalc_with_libreoffice",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        "envharness.bridges.spreadsheetbench.bridge.diagnose_failed_workbook",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("diagnostics must not scan successful workbooks")
+        ),
+    )
+
+    result = env._grade(task)
+
+    assert result.success is True
+    assert result.score == 1.0
+    assert result.metrics["badcase_diagnostics"] == {
+        "version": 1,
+        "mode": "full",
+        "eligible": False,
+        "status": "skipped_success",
+    }
+
+
+def test_badcase_diagnostic_errors_do_not_change_official_failure(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    env = _execution_env(tmp_path)
+    env._recalc_golden = False
+    env._badcase_diagnostics_mode = "full"
+    task = _grading_task(tmp_path, "expected")
+    monkeypatch.setattr(
+        "envharness.bridges.spreadsheetbench.bridge."
+        "online_judge_eval.recalc_with_libreoffice",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        "envharness.bridges.spreadsheetbench.bridge.diagnose_failed_workbook",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("private path")),
+    )
+
+    result = env._grade(task)
+
+    assert result.success is False
+    assert result.score == 0.0
+    assert result.metrics["diff"].startswith("value diff at A1")
+    assert result.metrics["badcase_diagnostics"] == {
+        "version": 1,
+        "mode": "full",
+        "eligible": True,
+        "status": "diagnostic_error",
+        "diagnostic_error_type": "RuntimeError",
+    }
 
 
 def test_run_python_predefines_paths_and_workbook_helpers(tmp_path: Path) -> None:

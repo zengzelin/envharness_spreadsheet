@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections import Counter
 import json
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Mapping, Sequence
 
 
 def _ratio(numerator: int, denominator: int) -> float:
@@ -17,6 +17,171 @@ def _projected_actions(step: dict) -> list[dict]:
         action = step.get("projected_action") or {}
         actions = action if isinstance(action, list) else [action]
     return [action for action in actions if isinstance(action, dict)]
+
+
+def classify_badcase(
+    *,
+    final_info: Mapping[str, Any],
+    steps: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Merge workbook evidence with episode execution evidence."""
+    existing = final_info.get("badcase_diagnostics")
+    diagnostics = dict(existing) if isinstance(existing, Mapping) else {}
+    diagnostics.setdefault("version", 1)
+    diagnostics.setdefault("mode", "legacy")
+
+    error = str(final_info.get("error") or "")
+    if error.startswith("eval_error:"):
+        diagnostics.update({
+            "eligible": False,
+            "status": "excluded_eval_error",
+            "tool_all_success": False,
+            "failure_tags": ["eval_error"],
+        })
+        return diagnostics
+
+    won = bool(final_info.get("won"))
+    if not diagnostics:
+        diagnostics = {"version": 1, "mode": "legacy"}
+    diagnostics.setdefault("eligible", not won)
+    diagnostics.setdefault(
+        "status", "skipped_success" if won else "unavailable"
+    )
+
+    parser_invalid = False
+    tool_error = False
+    validation_error = False
+    submit_gate_reject = False
+    truncated = False
+    mutation_budget_exceeded = False
+    formula_validation_error = False
+    for step in steps:
+        parser_invalid |= not bool(step.get("action_valid", True))
+        step_diagnostics = step.get("diagnostics") or {}
+        step_info = step.get("info") or {}
+        truncated |= int(step_diagnostics.get(
+            "parser/tool_calls_truncated", 0
+        )) > 0
+        submit_gate_reject |= bool(
+            step_diagnostics.get("env/submit_gate_reject")
+            or step_info.get("submit_rejected")
+        )
+        mutation_budget_exceeded |= bool(
+            step_diagnostics.get("env/multi_call_mutation_budget_exceeded")
+            or step_info.get("multi_call_mutation_budget_exceeded")
+        )
+        formula_validation_error |= bool(
+            step_diagnostics.get("env/formula_validation_error_count")
+            or step_info.get("formula_validation_errors")
+        )
+        validation_error |= step_info.get("validation_ok") is False
+        tool_results = step_info.get("tool_results")
+        if isinstance(tool_results, list):
+            tool_error |= any(
+                isinstance(result, Mapping) and not bool(result.get("ok"))
+                for result in tool_results
+            )
+        tool_error |= any(bool(step_diagnostics.get(name)) for name in (
+            "env/python_error", "env/read_tool_error", "env/write_tool_error",
+            "env/recalc_tool_error", "env/multi_call_partial_failure",
+        ))
+
+    tool_all_success = not (parser_invalid or tool_error or validation_error)
+    diagnostics["tool_all_success"] = tool_all_success
+    if won:
+        diagnostics["failure_tags"] = []
+        return diagnostics
+
+    tags = set(str(tag) for tag in diagnostics.get("failure_tags") or [])
+    if not bool(final_info.get("submitted")):
+        tags.add("no_submit")
+    if bool(final_info.get("time_limit_reached")):
+        tags.add("time_limit")
+    if submit_gate_reject and not bool(final_info.get("submitted")):
+        tags.add("submit_gate_unrecovered")
+    if truncated:
+        tags.add("tool_call_truncated")
+    if mutation_budget_exceeded:
+        tags.add("mutation_budget_exceeded")
+    if tool_error:
+        tags.add("tool_error")
+    if formula_validation_error:
+        tags.add("formula_validation_error")
+    if (
+        steps and tool_all_success
+        and float(final_info.get("score", 0.0) or 0.0) == 0.0
+    ):
+        tags.add("execution_clean_score_zero")
+
+    if diagnostics.get("status") == "complete":
+        scanned = int(diagnostics.get("answer_cells_scanned", 0) or 0)
+        matched = int(diagnostics.get("answer_cells_matched", 0) or 0)
+        mismatched = int(diagnostics.get("answer_cells_mismatched", 0) or 0)
+        if scanned and matched and mismatched:
+            tags.add("answer_partially_correct")
+        if bool(diagnostics.get("answer_range_untouched")):
+            tags.add("answer_range_untouched")
+            if int(diagnostics.get("outside_answer_cells_changed", 0) or 0) > 0:
+                tags.add("likely_wrong_sheet_or_range")
+        if int(diagnostics.get("formula_to_static_count", 0) or 0) > 0:
+            tags.add("formula_to_static")
+        if int(diagnostics.get("formula_result_mismatch_count", 0) or 0) > 0:
+            tags.add("formula_result_mismatch")
+        if int(diagnostics.get("format_mismatch_count", 0) or 0) > 0:
+            tags.add("format_mismatch_info")
+    if bool(diagnostics.get("diagnostic_truncated")):
+        tags.add("diagnostic_truncated")
+    if diagnostics.get("status") == "diagnostic_error":
+        tags.add("diagnostic_error")
+
+    diagnostics["failure_tags"] = sorted(tags)
+    return diagnostics
+
+
+_BADCASE_EVIDENCE_FIELDS = (
+    "answer_cells_total", "answer_cells_scanned", "answer_cells_matched",
+    "answer_cells_mismatched", "answer_match_ratio",
+    "answer_cells_changed_from_input", "answer_required_change_count",
+    "answer_range_untouched", "outside_answer_cells_changed",
+    "mutated_sheets", "formula_cells_expected", "formula_cells_output",
+    "formula_to_static_count", "formula_result_mismatch_count",
+    "format_mismatch_count", "diagnostic_cells_scanned",
+    "diagnostic_truncated", "diagnostic_error_type", "first_mismatches",
+)
+
+
+def collect_badcase_records(paths: Iterable[Path]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            trajectory = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        final_info = trajectory.get("final_info") or {}
+        if bool(final_info.get("won")):
+            continue
+        diagnosis = classify_badcase(
+            final_info=final_info,
+            steps=trajectory.get("steps") or [],
+        )
+        evidence = {
+            field: diagnosis[field]
+            for field in _BADCASE_EVIDENCE_FIELDS
+            if field in diagnosis
+        }
+        records.append({
+            "task_id": str(trajectory.get("task_id") or "unknown"),
+            "trajectory": str(path),
+            "score": float(final_info.get("score", 0.0) or 0.0),
+            "submitted": bool(final_info.get("submitted")),
+            "time_limit_reached": bool(final_info.get("time_limit_reached")),
+            "diagnostic_mode": str(diagnosis.get("mode") or "legacy"),
+            "diagnostic_status": str(diagnosis.get("status") or "unavailable"),
+            "diagnostic_eligible": bool(diagnosis.get("eligible")),
+            "failure_tags": list(diagnosis.get("failure_tags") or []),
+            "evidence": evidence,
+        })
+    return sorted(records, key=lambda item: (item["task_id"], item["trajectory"]))
 
 
 def collect_multi_call_events(paths: Iterable[Path]) -> list[dict]:
@@ -142,6 +307,11 @@ def summarize_trajectories(paths: Iterable[Path]) -> dict:
     multi_call_executed_fraction_sum = 0.0
     multi_call_stop_reasons: Counter[str] = Counter()
     multi_call_failure_indexes: Counter[str] = Counter()
+    badcase_tag_counts: Counter[str] = Counter()
+    badcase_tag_cooccurrences: Counter[str] = Counter()
+    badcase_policy_episodes = complete_failures = unavailable_failures = 0
+    answer_match_ratio_sum = 0.0
+    diagnostic_errors = diagnostic_truncated = 0
 
     for path in paths:
         try:
@@ -150,6 +320,33 @@ def summarize_trajectories(paths: Iterable[Path]) -> dict:
             continue
         episodes += 1
         final_info = trajectory.get("final_info") or {}
+        badcase = classify_badcase(
+            final_info=final_info,
+            steps=trajectory.get("steps") or [],
+        )
+        failure_tags = [str(tag) for tag in badcase.get("failure_tags") or []]
+        if "eval_error" not in failure_tags:
+            badcase_policy_episodes += 1
+            badcase_tag_counts.update(failure_tags)
+            for first_index, first in enumerate(failure_tags):
+                for second in failure_tags[first_index + 1:]:
+                    badcase_tag_cooccurrences[f"{first}|{second}"] += 1
+            if not bool(final_info.get("won")):
+                if badcase.get("status") == "complete":
+                    complete_failures += 1
+                    answer_match_ratio_sum += float(
+                        badcase.get("answer_match_ratio", 0.0) or 0.0
+                    )
+                elif badcase.get("status") in {
+                    "unavailable", "light_only", "output_missing", "load_error",
+                }:
+                    unavailable_failures += 1
+                diagnostic_errors += int(
+                    badcase.get("status") == "diagnostic_error"
+                )
+                diagnostic_truncated += int(bool(
+                    badcase.get("diagnostic_truncated")
+                ))
         successes += int(bool(final_info.get("won")))
         submitted += int(bool(final_info.get("submitted")))
         time_limit += int(bool(final_info.get("time_limit_reached")))
@@ -367,4 +564,55 @@ def summarize_trajectories(paths: Iterable[Path]) -> dict:
         "tool_counts": dict(tool_counts.most_common()),
         "projected_tool_counts": dict(projected_tool_counts.most_common()),
         "error_types": dict(error_types.most_common()),
+        "badcase_policy_episode_count": badcase_policy_episodes,
+        "badcase_complete_failure_count": complete_failures,
+        "badcase_unavailable_failure_count": unavailable_failures,
+        "badcase_tag_counts": dict(badcase_tag_counts.most_common()),
+        "badcase_tag_cooccurrences": dict(
+            badcase_tag_cooccurrences.most_common()
+        ),
+        "execution_clean_score_zero_rate": _ratio(
+            badcase_tag_counts["execution_clean_score_zero"],
+            badcase_policy_episodes,
+        ),
+        "no_submit_rate": _ratio(
+            badcase_tag_counts["no_submit"], badcase_policy_episodes
+        ),
+        "submit_gate_unrecovered_rate": _ratio(
+            badcase_tag_counts["submit_gate_unrecovered"],
+            badcase_policy_episodes,
+        ),
+        "tool_call_truncated_episode_rate": _ratio(
+            badcase_tag_counts["tool_call_truncated"],
+            badcase_policy_episodes,
+        ),
+        "mutation_budget_exceeded_episode_rate": _ratio(
+            badcase_tag_counts["mutation_budget_exceeded"],
+            badcase_policy_episodes,
+        ),
+        "answer_match_ratio_failed_mean": (
+            answer_match_ratio_sum / complete_failures
+            if complete_failures else 0.0
+        ),
+        "answer_range_untouched_rate": _ratio(
+            badcase_tag_counts["answer_range_untouched"], complete_failures
+        ),
+        "likely_wrong_sheet_or_range_rate": _ratio(
+            badcase_tag_counts["likely_wrong_sheet_or_range"], complete_failures
+        ),
+        "answer_partially_correct_rate": _ratio(
+            badcase_tag_counts["answer_partially_correct"], complete_failures
+        ),
+        "formula_to_static_rate": _ratio(
+            badcase_tag_counts["formula_to_static"], complete_failures
+        ),
+        "formula_result_mismatch_rate": _ratio(
+            badcase_tag_counts["formula_result_mismatch"], complete_failures
+        ),
+        "diagnostic_truncated_rate": _ratio(
+            diagnostic_truncated, complete_failures
+        ),
+        "diagnostic_error_rate": _ratio(
+            diagnostic_errors, badcase_policy_episodes
+        ),
     }

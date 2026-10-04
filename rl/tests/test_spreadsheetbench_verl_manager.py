@@ -366,7 +366,7 @@ def test_manager_dumps_terminal_trajectory_with_raw_and_projected_actions(
     files = list((tmp_path / "train").glob("*.json"))
     assert len(files) == 1
     trajectory = json.loads(files[0].read_text())
-    assert trajectory["schema_version"] == 1
+    assert trajectory["schema_version"] == 2
     assert trajectory["split"] == "train"
     assert trajectory["task_id"] == "task-1"
     assert trajectory["steps"][0]["model_output"].startswith("<tool_call>")
@@ -380,6 +380,14 @@ def test_manager_dumps_terminal_trajectory_with_raw_and_projected_actions(
     )
     assert trajectory["steps"][0]["reward"] == 0.75
     assert trajectory["final_info"]["won"] is True
+    assert trajectory["final_info"]["badcase_diagnostics"] == {
+        "version": 1,
+        "mode": "light",
+        "eligible": False,
+        "status": "skipped_success",
+        "tool_all_success": True,
+        "failure_tags": [],
+    }
     assert infos[0]["tool_calling"] == 1
 
 
@@ -616,6 +624,16 @@ def test_manager_exposes_terminal_reward_components() -> None:
                 "reward/workbook_score": 0.75,
                 "reward/execution_penalty": -0.2,
                 "reward/env_total": 0.55,
+                "badcase_diagnostics": {
+                    "status": "complete",
+                    "eligible": True,
+                    "answer_match_ratio": 0.5,
+                    "diagnostic_truncated": False,
+                    "failure_tags": [
+                        "answer_partially_correct",
+                        "execution_clean_score_zero",
+                    ],
+                },
             },
         ]],
     )
@@ -624,3 +642,8 @@ def test_manager_exposes_terminal_reward_components() -> None:
     assert success["reward_workbook_score"].tolist() == [0.75]
     assert success["reward_execution_penalty"].tolist() == pytest.approx([-0.2])
     assert success["reward_env_total"].tolist() == pytest.approx([0.55])
+    assert success["badcase_policy_eligible"].tolist() == [1.0]
+    assert success["badcase_full_eligible"].tolist() == [1.0]
+    assert success["badcase_execution_clean_score_zero"].tolist() == [1.0]
+    assert success["badcase_answer_partially_correct"].tolist() == [1.0]
+    assert success["badcase_answer_match_ratio"].tolist() == [0.5]

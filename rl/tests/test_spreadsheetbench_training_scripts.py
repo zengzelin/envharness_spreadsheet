@@ -108,6 +108,39 @@ def test_training_scripts_forward_hardening_controls() -> None:
         assert "SPREADSHEETBENCH_REQUIRE_VALIDATION_BEFORE_SUBMIT" in source
         assert "max_tool_calls_per_turn=4" in source
 
+
+def test_training_scripts_forward_badcase_diagnostics() -> None:
+    for script_name in (
+        "run_spreadsheetbench_grpo.sh",
+        "submit_spreadsheetbench_grpo.sh",
+    ):
+        source = (ROOT / "rl/scripts" / script_name).read_text()
+        assert "SPREADSHEETBENCH_BADCASE_DIAGNOSTICS" in source
+        assert "SPREADSHEETBENCH_BADCASE_MAX_SCAN_CELLS" in source
+        assert "SPREADSHEETBENCH_BADCASE_MAX_EXAMPLES" in source
+    eval_source = (
+        ROOT / "rl/scripts/submit_spreadsheetbench_eval.sh"
+    ).read_text()
+    assert 'SPREADSHEETBENCH_BADCASE_DIAGNOSTICS="${SPREADSHEETBENCH_BADCASE_DIAGNOSTICS:-full}"' in eval_source
+    assert "--badcase-jsonl-output" in eval_source
+    assert "--badcase-summary-output" in eval_source
+
+
+def test_training_pipeline_exports_badcase_metrics() -> None:
+    trainer_source = (
+        ROOT / "third_party/verl-agent/verl/trainer/ppo/ray_trainer.py"
+    ).read_text()
+    for name in (
+        "badcase_policy_eligible",
+        "badcase_full_eligible",
+        "badcase_execution_clean_score_zero",
+        "badcase_answer_match_ratio",
+        "val/env/execution_clean_score_zero_rate",
+        "val/env/answer_match_ratio_failed_mean",
+        "val/env/diagnostic_error_rate",
+    ):
+        assert name in trainer_source
+
     fetch_source = (ROOT / "rl/scripts/fetch_verl_agent.sh").read_text()
     assert "verl_agent_spreadsheetbench_hardening.patch" in fetch_source
     patch_source = (
@@ -115,6 +148,8 @@ def test_training_scripts_forward_hardening_controls() -> None:
     ).read_text()
     for marker in (
         "SPREADSHEETBENCH_REQUIRE_VALIDATION_BEFORE_SUBMIT",
+        "SPREADSHEETBENCH_BADCASE_DIAGNOSTICS",
+        "badcase_policy_eligible",
         "parser_tool_calls_truncated",
         "env_python_transaction_rollback",
         "env_submit_gate_reject",
@@ -195,6 +230,18 @@ def test_loader_scale_smoke_exercises_128_actor_reset_without_model() -> None:
     assert "cleanup failed after primary error" in source
     assert "group task mismatch" in source
     assert "LOADER SCALE SMOKE OK" in source
+
+
+def test_worker_smoke_covers_compact_badcase_artifact_without_workbook() -> None:
+    source = (
+        ROOT / "rl/scripts/smoke_spreadsheetbench_worker.py"
+    ).read_text()
+
+    assert '"badcase_diagnostics_mode": "full"' in source
+    assert "classify_badcase" in source
+    assert "collect_badcase_records" in source
+    assert "summarize_trajectories" in source
+    assert 'rglob("*.xlsx")' in source
 
 
 def test_placeholder_rows_are_offline_text_agent_examples() -> None:
@@ -603,24 +650,44 @@ def test_compare_evals_reports_paired_outcomes_and_diagnostics(
             "base_won": True,
             "candidate_won": True,
             "transition": "both_success",
+            "base_failure_tags": [],
+            "candidate_failure_tags": [],
+            "failure_tag_transition": {
+                "added": [], "removed": [], "retained": [],
+            },
         },
         {
             "task_id": "b",
             "base_won": True,
             "candidate_won": False,
             "transition": "base_only",
+            "base_failure_tags": [],
+            "candidate_failure_tags": ["tool_error"],
+            "failure_tag_transition": {
+                "added": ["tool_error"], "removed": [], "retained": [],
+            },
         },
         {
             "task_id": "c",
             "base_won": False,
             "candidate_won": True,
             "transition": "candidate_only",
+            "base_failure_tags": ["tool_error"],
+            "candidate_failure_tags": [],
+            "failure_tag_transition": {
+                "added": [], "removed": ["tool_error"], "retained": [],
+            },
         },
         {
             "task_id": "d",
             "base_won": False,
             "candidate_won": True,
             "transition": "candidate_only",
+            "base_failure_tags": ["tool_error"],
+            "candidate_failure_tags": [],
+            "failure_tag_transition": {
+                "added": [], "removed": ["tool_error"], "retained": [],
+            },
         },
     ]
     assert report["base"]["python_error_ratio"] == pytest.approx(0.25)

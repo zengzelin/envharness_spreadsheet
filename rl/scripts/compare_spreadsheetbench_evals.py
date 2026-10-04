@@ -8,7 +8,10 @@ import math
 from pathlib import Path
 from typing import Any, Iterable
 
-from envharness_rl.spreadsheetbench.rollout_summary import summarize_trajectories
+from envharness_rl.spreadsheetbench.rollout_summary import (
+    classify_badcase,
+    summarize_trajectories,
+)
 
 
 COMPARISON_ENV_FIELDS = (
@@ -95,6 +98,7 @@ def _load_run(run_dir: Path, expected_tasks: int | None) -> dict[str, Any]:
         raise ValueError(f"no validation trajectories found: {trajectory_dir}")
 
     outcomes: dict[str, bool | None] = {}
+    failure_tags_by_task: dict[str, list[str]] = {}
     evaluator_error_tasks: list[str] = []
     duplicates: list[str] = []
     for path in paths:
@@ -105,6 +109,13 @@ def _load_run(run_dir: Path, expected_tasks: int | None) -> dict[str, Any]:
         if task_id in outcomes:
             duplicates.append(task_id)
         final_info = trajectory.get("final_info") or {}
+        diagnosis = classify_badcase(
+            final_info=final_info,
+            steps=trajectory.get("steps") or [],
+        )
+        failure_tags_by_task[task_id] = list(
+            diagnosis.get("failure_tags") or []
+        )
         error = str(final_info.get("error") or "")
         if error.startswith("eval_error:"):
             outcomes[task_id] = None
@@ -159,8 +170,16 @@ def _load_run(run_dir: Path, expected_tasks: int | None) -> dict[str, Any]:
         "multi_call_stop_reasons": summary["multi_call_stop_reasons"],
         "multi_call_failure_indexes": summary["multi_call_failure_indexes"],
         "tool_calls_per_turn": summary["tool_calls_per_turn"],
+        "badcase_tag_counts": summary["badcase_tag_counts"],
+        "badcase_complete_failure_count": summary[
+            "badcase_complete_failure_count"
+        ],
+        "badcase_unavailable_failure_count": summary[
+            "badcase_unavailable_failure_count"
+        ],
         "comparison_config": _comparison_config(manifest),
         "outcomes": outcomes,
+        "failure_tags_by_task": failure_tags_by_task,
     }
     return result
 
@@ -168,7 +187,7 @@ def _load_run(run_dir: Path, expected_tasks: int | None) -> dict[str, Any]:
 def _public_result(result: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value for key, value in result.items()
-        if key not in {"outcomes", "comparison_config"}
+        if key not in {"outcomes", "comparison_config", "failure_tags_by_task"}
     }
 
 
@@ -236,11 +255,24 @@ def compare_runs(
                 both_failed += 1
                 transition = "both_failed"
                 paired_deltas.append(0)
+            base_tags = list(base["failure_tags_by_task"].get(task_id) or [])
+            candidate_tags = list(
+                candidate["failure_tags_by_task"].get(task_id) or []
+            )
+            base_tag_set = set(base_tags)
+            candidate_tag_set = set(candidate_tags)
             task_results.append({
                 "task_id": task_id,
                 "base_won": base_won,
                 "candidate_won": candidate_won,
                 "transition": transition,
+                "base_failure_tags": base_tags,
+                "candidate_failure_tags": candidate_tags,
+                "failure_tag_transition": {
+                    "added": sorted(candidate_tag_set - base_tag_set),
+                    "removed": sorted(base_tag_set - candidate_tag_set),
+                    "retained": sorted(base_tag_set & candidate_tag_set),
+                },
             })
         public_candidate = _public_result(candidate)
         public_candidate["config_mismatches"] = mismatches

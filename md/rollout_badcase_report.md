@@ -501,3 +501,44 @@ step 5 将 native parser 有效率从 `0.746` 提高到 `0.944`，Python 错误�
 后续 checkpoint 选择以固定验证集的 workbook success rate 为主，不再用包含执行惩罚的
 `val/text/test_score` 代替任务准确率。代码稳定化方案和 TODO 见
 `md/grpo_stabilization_plan.md`。
+
+## 2026-09-30 大范围格式化导致整批评测失败
+
+sgceph1 `20260926_232503` 的 Step 100 在完整 399 条评测中只完成部分任务。失败点不是
+GPU OOM 或模型加载，而是 Ray `operation=step` 等待 600 秒后仍只有 63/64 actor 返回。
+pending actor 对应：
+
+```text
+task_id=spreadsheetbench_verified/spreadsheet/1_399-14
+action=run_python,format_range,format_range,validate_workbook
+```
+
+该任务要求对整个 sheet 使用指定字体。模型连续发出两个 `format_range`，而当时 sgceph1
+代码没有 `MAX_FORMAT_CELLS` 和单轮 mutation budget，导致超大空白范围可能被逐单元格
+实例化和保存。一个 actor 卡死最终中止整批评测。
+
+该 badcase 对应两层修复：
+
+1. 工具层：`format_range` 和 `fill_formula` 单次最多 50K cells，单轮 mutation 累计最多
+   100K cells；超限返回可恢复工具错误，不进入实际 workbook mutation。
+2. 评测层：保留 pending actor/task/action 诊断；后续应增加 per-tool 超时或将单任务工具
+   超时计为该任务失败，避免一个 badcase 中止完整 399 条评测。
+
+完整跨集群结果见 `md/experiment_results_20260930.md`。
+
+## 2026-10-01 workbook 零分 badcase 观测
+
+轨迹 schema v2 在 terminal `final_info.badcase_diagnostics` 中记录多标签失败证据，覆盖
+未提交、达到步数上限、submit gate 未恢复、工具调用截断、mutation budget 超限，以及
+答案区域未修改、疑似写错 sheet/range、部分完成、公式静态化和公式结果错误。正式评测使用
+`full`，训练默认使用不扫描 workbook 的 `light`；诊断异常与扫描截断都有显式状态。
+
+这些标签和 `answer_match_ratio` 只用于观测，不参与 reward、官方 workbook 比较或
+checkpoint 成功判定。格式差异采用归一化 style 比较，仅作为 `format_mismatch_info`
+信息，不应解释成官方零分原因。控制台不会打印完整 Python、单元格值或公式文本；轨迹仍按
+既有方案保留原始动作供训练诊断。
+
+离线分析可生成逐失败任务 `badcases.jsonl`、聚合 `badcase_summary.json`，paired comparison
+还会给出 Base/candidate 标签及 added/removed/retained 转移。各比率必须结合
+`badcase_policy_episode_count`、`badcase_complete_failure_count` 和 unavailable/truncated
+计数阅读，不能把未执行 full 诊断的任务当作零发生率。

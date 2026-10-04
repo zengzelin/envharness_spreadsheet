@@ -83,7 +83,9 @@ if [ -e "$DEST" ]; then
      grep -q 'tool_format_range' "$DEST/agent_system/multi_turn_rollout/rollout_loop.py" &&
      grep -q 'parser_tool_calls_truncated' "$DEST/agent_system/multi_turn_rollout/rollout_loop.py" &&
      grep -q 'SPREADSHEETBENCH_REQUIRE_VALIDATION_BEFORE_SUBMIT' "$DEST/agent_system/environments/env_manager.py" &&
+     grep -q 'SPREADSHEETBENCH_BADCASE_DIAGNOSTICS' "$DEST/agent_system/environments/env_manager.py" &&
      grep -q 'reward_workbook_score' "$DEST/verl/trainer/ppo/ray_trainer.py" &&
+     grep -q 'badcase_policy_eligible' "$DEST/verl/trainer/ppo/ray_trainer.py" &&
      grep -q 'success_rate_weights' "$DEST/verl/trainer/ppo/ray_trainer.py" &&
      grep -q '_val_only = bool(config.trainer.get("val_only", False))' "$DEST/agent_system/environments/env_manager.py" &&
      grep -q 'def finish' "$DEST/verl/utils/tracking.py"; then

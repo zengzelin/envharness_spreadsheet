@@ -1,19 +1,27 @@
 diff --git a/agent_system/environments/env_manager.py b/agent_system/environments/env_manager.py
+index 9f203c3..45852e4 100644
 --- a/agent_system/environments/env_manager.py
 +++ b/agent_system/environments/env_manager.py
-@@ -656,6 +656,8 @@
+@@ -656,6 +656,14 @@ def make_envs(config):
                  "SPREADSHEETBENCH_PYTHON_ERROR_PENALTY", "-0.05")),
              "syntax_error_penalty": float(os.environ.get(
                  "SPREADSHEETBENCH_SYNTAX_ERROR_PENALTY", "-0.1")),
 +            "require_validation_before_submit": os.environ.get(
 +                "SPREADSHEETBENCH_REQUIRE_VALIDATION_BEFORE_SUBMIT", "true"),
++            "badcase_diagnostics_mode": os.environ.get(
++                "SPREADSHEETBENCH_BADCASE_DIAGNOSTICS", "light"),
++            "badcase_max_scan_cells": int(os.environ.get(
++                "SPREADSHEETBENCH_BADCASE_MAX_SCAN_CELLS", "200000")),
++            "badcase_max_examples": int(os.environ.get(
++                "SPREADSHEETBENCH_BADCASE_MAX_EXAMPLES", "20")),
          }
          _train_reset_options = dict(_common_reset_options)
          _val_reset_options = dict(_common_reset_options)
 diff --git a/agent_system/multi_turn_rollout/rollout_loop.py b/agent_system/multi_turn_rollout/rollout_loop.py
+index 31eb7f6..665cb2b 100644
 --- a/agent_system/multi_turn_rollout/rollout_loop.py
 +++ b/agent_system/multi_turn_rollout/rollout_loop.py
-@@ -486,6 +486,7 @@
+@@ -486,6 +486,7 @@ class TrajectoryCollector:
                  'parser_native_valid': 'parser/native_valid',
                  'parser_recovered': 'parser/recovered',
                  'parser_invalid': 'parser/invalid',
@@ -21,7 +29,7 @@ diff --git a/agent_system/multi_turn_rollout/rollout_loop.py b/agent_system/mult
                  'output_char_len': 'output/char_len',
                  'output_has_think': 'output/has_think',
                  'output_has_markdown_fence': 'output/has_markdown_fence',
-@@ -494,6 +495,9 @@
+@@ -494,6 +495,9 @@ class TrajectoryCollector:
                  'env_syntax_error': 'env/syntax_error',
                  'env_python_runtime_error': 'env/python_runtime_error',
                  'env_python_timeout': 'env/python_timeout',
@@ -31,10 +39,19 @@ diff --git a/agent_system/multi_turn_rollout/rollout_loop.py b/agent_system/mult
                  'env_read_tool_call': 'env/read_tool_call',
                  'env_read_tool_success': 'env/read_tool_success',
                  'env_read_tool_error': 'env/read_tool_error',
+@@ -520,6 +524,7 @@ class TrajectoryCollector:
+                 'env_multi_call_skipped_calls': 'env/multi_call_skipped_calls',
+                 'env_multi_call_executed_fraction': 'env/multi_call_executed_fraction',
+                 'env_multi_call_failure_index': 'env/multi_call_failure_index',
++                'env_multi_call_mutation_budget_exceeded': 'env/multi_call_mutation_budget_exceeded',
+                 'tool_run_python': 'tool/run_python',
+                 'tool_list_sheets': 'tool/list_sheets',
+                 'tool_inspect_range': 'tool/inspect_range',
 diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index 441ca48..2ca5a22 100644
 --- a/verl/trainer/ppo/ray_trainer.py
 +++ b/verl/trainer/ppo/ray_trainer.py
-@@ -225,6 +225,7 @@
+@@ -225,6 +225,7 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
          'parser_native_valid': 'parser/native_valid_ratio',
          'parser_recovered': 'parser/recovered_ratio',
          'parser_invalid': 'parser/invalid_ratio',
@@ -42,7 +59,7 @@ diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
          'output_char_len': 'output/char_len_mean',
          'output_has_think': 'output/has_think_ratio',
          'output_has_markdown_fence': 'output/has_markdown_fence_ratio',
-@@ -233,6 +234,9 @@
+@@ -233,6 +234,9 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
          'env_syntax_error': 'env/syntax_error_ratio',
          'env_python_runtime_error': 'env/python_runtime_error_ratio',
          'env_python_timeout': 'env/python_timeout_ratio',
@@ -52,21 +69,140 @@ diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
          'env_read_tool_call': 'env/read_tool_call_ratio',
          'env_write_tool_call': 'env/write_tool_call_ratio',
          'env_recalc_tool_call': 'env/recalc_tool_call_ratio',
-@@ -942,6 +946,7 @@
-             'parser_native_valid': 'val/parser/native_valid_ratio',
-             'parser_recovered': 'val/parser/recovered_ratio',
-             'parser_invalid': 'val/parser/invalid_ratio',
-+            'parser_tool_calls_truncated': 'val/parser/tool_calls_truncated_mean',
-             'output_char_len': 'val/output/char_len_mean',
-             'output_has_think': 'val/output/has_think_ratio',
-             'output_has_markdown_fence': 'val/output/has_markdown_fence_ratio',
-@@ -950,6 +955,9 @@
-             'env_syntax_error': 'val/env/syntax_error_ratio',
-             'env_python_runtime_error': 'val/env/python_runtime_error_ratio',
-             'env_python_timeout': 'val/env/python_timeout_ratio',
-+            'env_python_transaction_rollback': 'val/env/python_transaction_rollback_ratio',
-+            'env_submit_gate_reject': 'val/env/submit_gate_reject_ratio',
-+            'env_formula_validation_error_count': 'val/env/formula_validation_error_count_mean',
-             'env_read_tool_call': 'val/env/read_tool_call_ratio',
-             'env_write_tool_call': 'val/env/write_tool_call_ratio',
-             'env_recalc_tool_call': 'val/env/recalc_tool_call_ratio',
+@@ -247,6 +251,7 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
+         'episode_multi_call': 'episode/multi_call_ratio',
+         'episode_projected_multi_call': 'episode/projected_multi_call_ratio',
+         'env_multi_call_partial_failure': 'env/multi_call_partial_failure_rate',
++        'env_multi_call_mutation_budget_exceeded': 'env/multi_call_mutation_budget_exceeded_rate',
+         'tool_run_python': 'tool/run_python_ratio',
+         'tool_list_sheets': 'tool/list_sheets_ratio',
+         'tool_inspect_range': 'tool/inspect_range_ratio',
+@@ -875,7 +880,14 @@ class RayPPOTrainer:
+             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+             tool_calling_list.append(test_output_gen_batch.non_tensor_batch['tool_callings'])
+             traj_uid_list.append(test_output_gen_batch.non_tensor_batch['traj_uid'])
++            _, unique_trajectory_indexes = np.unique(
++                test_output_gen_batch.non_tensor_batch['traj_uid'],
++                return_index=True,
++            )
+             for key in (
++                'parser_tool_calls_truncated',
++                'env_python_transaction_rollback', 'env_submit_gate_reject',
++                'env_formula_validation_error_count',
+                 'env_read_tool_call', 'env_read_tool_success', 'env_read_tool_error',
+                 'env_write_tool_call', 'env_write_tool_success', 'env_write_tool_error',
+                 'env_recalc_tool_call', 'env_recalc_tool_success', 'env_recalc_tool_error',
+@@ -887,13 +899,31 @@ class RayPPOTrainer:
+                 'env_multi_call_partial_failure', 'env_multi_call_completed',
+                 'env_multi_call_all_success', 'env_multi_call_short_circuit',
+                 'env_multi_call_skipped_calls', 'env_multi_call_executed_fraction',
+-                'env_multi_call_failure_index', 'tool_fill_formula',
++                'env_multi_call_failure_index',
++                'env_multi_call_mutation_budget_exceeded', 'tool_fill_formula',
+                 'tool_format_range', 'tool_delete_rows', 'tool_delete_columns',
+                 'tool_manage_sheet', 'tool_recalculate_and_read',
++                'badcase_policy_eligible', 'badcase_full_eligible',
++                'badcase_execution_clean_score_zero', 'badcase_no_submit',
++                'badcase_time_limit', 'badcase_submit_gate_unrecovered',
++                'badcase_tool_call_truncated',
++                'badcase_mutation_budget_exceeded',
++                'badcase_answer_match_ratio',
++                'badcase_answer_range_untouched',
++                'badcase_likely_wrong_sheet_or_range',
++                'badcase_answer_partially_correct',
++                'badcase_formula_to_static',
++                'badcase_formula_result_mismatch',
++                'badcase_diagnostic_truncated', 'badcase_diagnostic_error',
+             ):
+                 if key in test_output_gen_batch.non_tensor_batch:
++                    values = test_output_gen_batch.non_tensor_batch[key].astype(
++                        np.float32
++                    )
++                    if key.startswith('badcase_'):
++                        values = values[unique_trajectory_indexes]
+                     validation_diagnostics.setdefault(key, []).append(
+-                        test_output_gen_batch.non_tensor_batch[key].astype(np.float32)
++                        values
+                     )
+             unique_trajectories = len(np.unique(
+                 test_output_gen_batch.non_tensor_batch['traj_uid']
+@@ -979,11 +1009,16 @@ class RayPPOTrainer:
+         for key, values in validation_diagnostics.items():
+             combined = np.concatenate(values, axis=0)
+             metric_name = {
++                'parser_tool_calls_truncated': 'parser/tool_calls_truncated_mean',
++                'env_python_transaction_rollback': 'env/python_transaction_rollback_ratio',
++                'env_submit_gate_reject': 'env/submit_gate_reject_ratio',
++                'env_formula_validation_error_count': 'env/formula_validation_error_count_mean',
+                 'episode_tool_calls_per_turn': 'episode/tool_calls_per_turn',
+                 'episode_projected_tool_calls_per_turn': 'episode/projected_tool_calls_per_turn',
+                 'episode_multi_call': 'episode/multi_call_ratio',
+                 'episode_projected_multi_call': 'episode/projected_multi_call_ratio',
+                 'env_multi_call_partial_failure': 'env/multi_call_partial_failure_rate',
++                'env_multi_call_mutation_budget_exceeded': 'env/multi_call_mutation_budget_exceeded_rate',
+                 'tool_fill_formula': 'tool/fill_formula_ratio',
+                 'env_recalc_tool_call': 'env/recalc_tool_call_ratio',
+                 'env_recalc_elapsed_ms': 'env/recalc_elapsed_ms_mean',
+@@ -1000,6 +1035,62 @@ class RayPPOTrainer:
+             }.get(key)
+             if metric_name is not None:
+                 metric_dict[f'val/{metric_name}'] = np.mean(combined).item()
++        for numerator_key, (metric_name, denominator_key) in {
++            'badcase_execution_clean_score_zero': (
++                'val/env/execution_clean_score_zero_rate',
++                'badcase_policy_eligible'),
++            'badcase_no_submit': (
++                'val/env/no_submit_rate', 'badcase_policy_eligible'),
++            'badcase_time_limit': (
++                'val/env/time_limit_rate', 'badcase_policy_eligible'),
++            'badcase_submit_gate_unrecovered': (
++                'val/env/submit_gate_unrecovered_rate',
++                'badcase_policy_eligible'),
++            'badcase_tool_call_truncated': (
++                'val/env/tool_call_truncated_episode_rate',
++                'badcase_policy_eligible'),
++            'badcase_mutation_budget_exceeded': (
++                'val/env/mutation_budget_exceeded_episode_rate',
++                'badcase_policy_eligible'),
++            'badcase_answer_match_ratio': (
++                'val/env/answer_match_ratio_failed_mean',
++                'badcase_full_eligible'),
++            'badcase_answer_range_untouched': (
++                'val/env/answer_range_untouched_rate',
++                'badcase_full_eligible'),
++            'badcase_likely_wrong_sheet_or_range': (
++                'val/env/likely_wrong_sheet_or_range_rate',
++                'badcase_full_eligible'),
++            'badcase_answer_partially_correct': (
++                'val/env/answer_partially_correct_rate',
++                'badcase_full_eligible'),
++            'badcase_formula_to_static': (
++                'val/env/formula_to_static_rate', 'badcase_full_eligible'),
++            'badcase_formula_result_mismatch': (
++                'val/env/formula_result_mismatch_rate',
++                'badcase_full_eligible'),
++            'badcase_diagnostic_truncated': (
++                'val/env/diagnostic_truncated_rate',
++                'badcase_full_eligible'),
++            'badcase_diagnostic_error': (
++                'val/env/diagnostic_error_rate', 'badcase_policy_eligible'),
++        }.items():
++            if (
++                numerator_key not in validation_diagnostics
++                or denominator_key not in validation_diagnostics
++            ):
++                continue
++            numerators = np.concatenate(
++                validation_diagnostics[numerator_key], axis=0
++            )
++            denominators = np.concatenate(
++                validation_diagnostics[denominator_key], axis=0
++            )
++            denominator = float(np.sum(denominators))
++            metric_dict[metric_name] = (
++                float(np.sum(numerators) / denominator)
++                if denominator else 0.0
++            )
+         if 'episode_projected_multi_call' in validation_diagnostics:
+             multi_mask = np.concatenate(
+                 validation_diagnostics['episode_projected_multi_call'], axis=0

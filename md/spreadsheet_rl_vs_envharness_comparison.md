@@ -915,3 +915,45 @@ train、validation、env trajectory 和离线 summary 已补充：
    preflight reject、formula error、episode length 和 wall time。
 4. 候选 checkpoint 再跑完整 399 条 paired evaluation；五阶段工具不能只凭 fast-val
    或 parser 指标判定有效。
+
+## 23. 2026-09-30：跨集群实验验收结果
+
+完整表格和目录映射见 `md/experiment_results_20260930.md`。当前已经得到三组不可跨组混用、
+但各自内部有效的 Verified-399 结果：
+
+| 集群/训练 run | Base | 最佳 checkpoint | 最佳结果 | 组内增益 |
+| --- | ---: | --- | ---: | ---: |
+| njceph5 `20260926_155341` | 68/399 | Step 40 | 117/399 | +49 tasks |
+| sgceph1 `20260922_105252` | 97/399 | Step 50/100 | 110/399 | +13 tasks |
+| sgceph1 `20260926_232503` hardened | 90/399 | Step 60 | 114/399 | +24 tasks |
+
+这说明 native tools、multi-call 与稳定化训练总体能够提高 workbook success，但提升通常在
+40-60 步附近达到峰值。后续 parser 和 multi-call 指标继续变好时，任务成功率仍可能回落，
+因此工具协议正确性已不是唯一瓶颈。
+
+sgceph1 Step 100 的完整评测没有完成：任务 `spreadsheetbench_verified/spreadsheet/1_399-14`
+在同一轮执行 `run_python,format_range,format_range,validate_workbook`，单 actor 超过 600 秒，
+使整个 Ray validation batch 失败。对比代码确认该 sgceph1 checkout 仍保留
+`MAX_FILL_CELLS=300_000`，且缺少 `MAX_FORMAT_CELLS` 和单轮 mutation budget；njceph5
+已经加入 50K/50K/100K 防护。
+
+从 njceph5 训练日志统计，50K/100K 防护不会明显限制当前数据：正常大范围 format/fill
+最大约 41.4K，超过 50K 的 fill 仅来自 93K/100K 的错误范围，100K multi-call budget
+拒绝的也都是 702K 或 1,048,568-cell 异常调用。该限制应同步到 sgceph1 后，再用相同
+hardened harness 重评 Base、Step 60 和 Step 100。
+
+## 24. 2026-10-01：官方评分与诊断证据分层
+
+新增 badcase 观测后，官方 `compare_workbooks()`、success/score 和 reward 路径保持不变。
+只有官方失败任务在 `full` 模式下才额外加载 input/golden/output，并在共享 200K coordinate
+预算内采集答案命中率、修改位置、公式和值及归一化 style 证据；最多保留 20 个紧凑示例，
+不保存失败 xlsx。
+
+公式文本不同但重算值一致时不标成公式失败。`formula_to_static` 和
+`formula_result_mismatch` 是失败解释证据；`format_mismatch_info` 仅说明扫描到的 style
+不同，不等价于官方 scorer 因格式扣分。执行历史标签可以与 workbook 标签同时出现，分类
+采用多标签而不是互斥单因归因。
+
+训练默认 `light` 只记录执行侧证据，正式独立评测默认 `full`。分析 checkpoint 时应同时看
+官方 success、诊断完整/不可用/截断分母和 paired 标签转移，不应使用诊断 match ratio
+替代 workbook success，也不应在积累稳定性证据前把它加入 reward shaping。
