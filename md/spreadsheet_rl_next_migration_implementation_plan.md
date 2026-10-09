@@ -10,6 +10,29 @@
 
 **Spec:** `md/spreadsheet_rl_vs_envharness_comparison.md`
 
+## 2026-10-09 状态快照
+
+本计划主体是 2026-09-20 至 09-24 的原始实施步骤，里面的逐 commit checkbox 和
+`Base=122/399` gate 只代表当时协议，不再作为当前 leaderboard 或现行 TODO。实际代码已按
+后续五阶段迁移与 hardening 提交完成；当前状态如下：
+
+- [x] Milestone 1：`VAL_SIZE` / `VAL_CONCURRENCY` 解耦，399/64 full validation 已多次验收；
+- [x] Milestone 2：有界原子 `fill_formula`、公式校验和 rollback 已实现；
+- [x] Milestone 3：每轮最多 4 个 tool call、顺序执行、截断反馈及训练/离线指标已实现；
+- [x] Milestone 4：`format_range`、行列删除、sheet 管理和 Linux 中间重算已实现；
+- [x] mutation 单次 50K、单轮 100K、损坏 xlsx 不提交、修改后重新校验等 hardening 已进入
+  `main`；
+- [x] Base/候选 full-399 评测、badcase 报告和长训练均已实际运行；
+- [x] train dataset shuffle 已提交为 `45426b7`；
+- [ ] 当前 `main` 的完整 `rl/tests` 仍需在 Python 3.11 训练镜像重跑；
+- [ ] 128 actor 专用 loader scale smoke 的 180 秒门槛没有独立验收报告；
+- [ ] Step100 的 `119/399` 需要第二 shuffle seed 复现；
+- [ ] manifest 仍缺 dirty-worktree/diff checksum 和 dataset/task fingerprint。
+
+当前统一 hardened 协议的 Base 是本次 checkout 下重新评测得到的 `94/399`，不能再使用历史
+`122/399` 作为 stop/go gate。所有新结论以 `md/experiment_results_20260930.md` 的最新章节
+为准。
+
 ## Global Constraints
 
 - 固定基座模型为 `Qwen3-4B-Thinking-2507`，不在本计划中切换模型。

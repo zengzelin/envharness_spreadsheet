@@ -294,7 +294,8 @@ python -m pytest -q rl/tests
 - [x] 新增 128 actor scale smoke 脚本和运行文档。
 - [ ] 在训练镜像中运行完整 `rl/tests`（当前编辑节点没有项目 Python/pytest）。
 - [ ] 实际执行 128 actor scale smoke 并达到 180 秒验收线。
-- [ ] 完成 5-step Spreadsheet-RL 训练验证。
+- [x] 完成 5-step Spreadsheet-RL 训练验证；后续 `20261001_221238` 和
+  `20261004_202150` 均已运行到 100+ step，loader 不再是训练启动瓶颈。
 
 ### 2026-09-18 实施记录
 
@@ -313,6 +314,14 @@ python -m pytest -q rl/tests
 当前编辑节点只有 Python 3.6，且未安装 pytest，无法执行本项目要求的 Python 3.11+
 测试。代码验证必须在训练镜像中完成；未通过测试和 scale smoke 前，实施状态仍视为
 “代码完成、运行验收未完成”。
+
+### 2026-10-09 状态修订
+
+上段是 2026-09-18 的历史环境说明。之后已经完成多次 100+ step、16 prompts × 8 rollout
+的真实训练，证明 lazy selection 能支撑当前训练规模；因此 5-step 训练验收已完成。独立
+`smoke_spreadsheetbench_loader_scale.py` 是否达到严格 180 秒门槛没有留存可核对报告，仍保持
+未完成。当前文档编辑节点甚至没有 `python` 命令，完整 `rl/tests` 的最终状态也不能仅根据
+旧日志推断，需在训练镜像重新执行后再勾选。
 
 ### 2026-09-18 Ray worker 导入修复
 

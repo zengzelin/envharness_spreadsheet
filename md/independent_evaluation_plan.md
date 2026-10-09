@@ -1,6 +1,39 @@
 # Spreadsheet Agent 独立评测方案与当前状态
 
-更新日期：2026-09-30
+更新日期：2026-10-09
+
+## 0.4 2026-10-09 当前 checkpoint 结论
+
+最新完整台账见 `md/experiment_results_20260930.md`（文件名为历史名称，内容已更新到
+2026-10-09）。当前统一 hardened/full-399 协议下：
+
+- SG1 无 shuffle run `20261001_221238` 的最佳点为 Step 70 `107/399`，相对 Base
+  `102/399` 只净增 5 条，exact McNemar `p=0.625`，没有可靠提升；
+- NJ5 shufflefix run `20261004_202150` 的 Step 100 为 `119/399`，相对本组 Base
+  `94/399` 净增 25 条，exact McNemar `p=0.005228`；
+- NJ5 Step 110 回落到 `101/399`，相对 Step 100 净少 18 条，说明峰值后继续训练会退化；
+- 由于 Step 100 是多个 checkpoint 中事后挑选的最佳点，仍需第二训练 seed 复现；
+- 固定 64 条 fast-val 只用于健康检查。该 run 的 fast-val 没有识别出 full-399 的 Step 100
+  提升，不能用 fast-val 单独选择 checkpoint。
+
+### 并行评测的 Ray 隔离
+
+Ceph 代码目录可以共享，但不同 Ray 集群的运行状态和输出不得共享。每个评测集群必须设置
+唯一的：
+
+```text
+CLUSTER_ID
+RAY_RUN_DIR
+RAY_STATE_FILE
+HOSTFILE
+LOG_FILE
+RUN_ROOT
+```
+
+`submit_spreadsheetbench_eval.sh` 会在单个集群内按 `LABEL=MODEL` 顺序评测；若要并行，应把
+checkpoint 分配给多个相互隔离的 Ray 集群。不要在仍承担训练任务的节点执行会调用
+`ray stop --force` 的 `mpi_ray_up.sh`。W&B 密钥只应通过预先设置的环境变量传入，不应写进
+文档或可提交脚本；曾暴露在 shell/Ray job 信息中的密钥应轮换。
 
 ## 0.3 2026-09-30 njceph5 / sgceph1 最新结果
 
@@ -16,8 +49,8 @@
   没有可用的完整 399 条结果；
 - 三组的 commit/submit gate 不同，只能组内比较，不能把最高数字直接当成统一 leaderboard。
 
-当前 hardened 协议的 checkpoint 首选是 Step 60。同步 mutation 上限后，应在同一 checkout
-重新评测 Base、Step 60、Step 100，再运行严格 paired comparison。
+本节为 2026-09-30 的历史判断，已被 0.4 节的新 full-399 结果取代。当前首选候选为 NJ5
+shufflefix Step 100，但在第二 seed 复现前只能视为“最强单次结果”。
 
 ## 0.1 2026-09-24 专用评测工具
 
@@ -253,8 +286,9 @@ bash rl/scripts/submit_spreadsheetbench_grpo.sh
 2. 增加数据审计脚本，输出 split 行数、有效任务数、缺失文件以及跨 split ID/hash 重叠。
 3. [x] 通过 `VAL_SIZE` / `VAL_CONCURRENCY` 支持完整验证分批，避免验证规模等于 actor 数。
 4. [x] 基于 env trajectory 输出逐任务 paired summary，而不只记录聚合 success rate。
-5. [部分完成] run manifest 已记录模型路径、Git commit 和关键行为参数；dataset 文件 hash
-   和任务 ID 列表仍待补充。
+5. [部分完成] run manifest 已记录模型路径、Git commit 和关键行为参数；dataset 文件 hash、
+   task ID 列表、dirty-worktree 标志和 diff checksum 仍待补充。NJ5 shufflefix run 在修改
+   已生效但提交 `45426b7` 尚未创建时启动，说明只记录 `git rev-parse HEAD` 不足以还原实验。
 6. [x] multi-call 评测诊断区分完整执行、全部成功和短路，并输出停止原因、失败位置及
    逐 turn JSONL badcase；正式对比表展示 completed rate 和 short-circuit rate。
 
@@ -280,3 +314,7 @@ run manifest 记录诊断模式和两个上限，便于跨 checkpoint 核对协�
 在完整 399 条之前，先用 `VAL_SIZE=4 VAL_CONCURRENCY=4`、确定性解码跑 smoke，核对轨迹、
 JSONL、summary 与 W&B 的分母。诊断不保存失败 workbook；公式和格式证据不进入官方评分，
 其中格式 mismatch 只具有信息性。训练过程保持默认 `light`，避免 workbook 扫描影响吞吐。
+
+该流程已在 NJ5 `runs/parallel_eval/shufflefix_20261004_202150` 完整跑通；Base、Step10-110
+共 12 个评测点均生成 399 条结果和 `badcase_summary.json`。因此报告链路已经完成真实
+full-399 验收，后续重点是复现统计提升和改进语义 badcase，而不是继续搭建评测入口。

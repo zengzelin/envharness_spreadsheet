@@ -1,4 +1,6 @@
-# Spreadsheet Agent 实验结果汇总（截至 2026-09-30）
+# Spreadsheet Agent 实验结果汇总（截至 2026-10-09）
+
+> 文件名保留 `20260930` 以避免破坏既有引用；本文内容已持续更新到 2026-10-09。
 
 本文统一记录 njceph5 与 sgceph1 上已经完成的 Spreadsheet-RL 训练和
 Verified-399 独立评测。checkpoint 选择以 399 条任务的 workbook success 为主，
@@ -6,7 +8,7 @@ Verified-399 独立评测。checkpoint 选择以 399 条任务的 workbook succe
 
 ## 1. 可比性边界
 
-以下三组结果分别使用了不同的代码 commit 或 submit 协议，只能在各自组内比较：
+早期三组结果分别使用了不同的代码 commit 或 submit 协议，只能在各自组内比较：
 
 | 组别 | 训练 run | 代码/协议 | 说明 |
 | --- | --- | --- | --- |
@@ -115,12 +117,128 @@ action=run_python,format_range,format_range,validate_workbook
 6. submit gate、工具实现和 mutation 上限会改变 agent 行为，Base 与 checkpoint 必须在
    同一 checkout、同一 manifest 配置下重评。
 
-## 6. 下一步
+## 6. 2026-10-01：SG1 无 shuffle 长训练
 
-1. 把 njceph5 的 50K/100K mutation 防护同步到 sgceph1，并补充 limit-reject 指标。
-2. 在同一 hardened harness 下重评 Base、Step 60 和 Step 100；不要只提高 actor timeout。
-3. 使用 `compare_spreadsheetbench_evals.py` 输出逐任务 paired gain/loss、McNemar 检验和
-   badcase JSONL。
-4. 对比 Step 60 新做对、后续 checkpoint 又做错、以及所有 checkpoint 始终失败的任务。
-5. 下一轮训练不应只延长步数；优先修正公式/范围语义、重算协议使用率和大范围 mutation
-   分块策略。
+训练目录：
+
+```text
+sgceph1/runs/grpo_spreadsheetbench_diagnostic_20261001_221238
+```
+
+该 run 使用 hardened harness、固定 399 条确定性验证，但训练数据仍按 parquet 原顺序取样，
+没有在训练开始时打乱 5,925 条任务。100 个训练 step 只覆盖前部约 1,600 个 task position，
+因此任务顺序可能成为训练偏差来源。
+
+| 模型 | 成功数 | Success rate | Test score | 相对本组 Base |
+| --- | ---: | ---: | ---: | ---: |
+| Base | 102/399 | 25.56% | 0.1952 | - |
+| Step 10 | 96/399 | 24.06% | 0.1476 | -1.50 pp |
+| Step 20 | 101/399 | 25.31% | 0.1684 | -0.25 pp |
+| Step 30 | 104/399 | 26.07% | 0.1792 | +0.50 pp |
+| Step 40 | 101/399 | 25.31% | 0.1531 | -0.25 pp |
+| Step 50 | 95/399 | 23.81% | 0.1612 | -1.75 pp |
+| Step 60 | 106/399 | 26.57% | 0.1855 | +1.00 pp |
+| **Step 70** | **107/399** | **26.82%** | **0.1964** | **+1.25 pp** |
+| Step 80 | 98/399 | 24.56% | 0.1610 | -1.00 pp |
+| Step 90 | 103/399 | 25.81% | 0.1709 | +0.25 pp |
+| Step 100 | 104/399 | 26.07% | 0.1610 | +0.50 pp |
+
+Step 70 相对 Base 只净增 5 个成功任务；逐任务 exact McNemar `p=0.625`，没有统计显著
+提升。工具错误减少，但 execution-clean score-zero 增加，说明协议执行变好没有转化为
+工作簿语义正确性。该 run 不能作为“继续增加训练步数就会提升”的证据。
+
+## 7. 2026-10-04：NJ5 shufflefix 长训练与全量评测
+
+训练与评测目录：
+
+```text
+runs/grpo_spreadsheetbench_diagnostic_20261004_202150
+runs/parallel_eval/shufflefix_20261004_202150
+```
+
+该 run 启动日志确认 `data.shuffle=true`、`train_shuffle_seed=0`。启动时 shuffle 修改已在
+工作区生效，但尚未形成后来的提交 `45426b7`，因此 manifest 中记录的 commit 仍可能是
+`18f9142`。这是实验溯源限制，不代表实际训练没有启用 shuffle。
+
+| 模型 | 成功数 | Success rate | Test score | 相对本组 Base |
+| --- | ---: | ---: | ---: | ---: |
+| Base | 94/399 | 23.56% | 0.1573 | - |
+| Step 10 | 107/399 | 26.82% | 0.1762 | +3.26 pp |
+| Step 20 | 101/399 | 25.31% | 0.1588 | +1.75 pp |
+| Step 30 | 109/399 | 27.32% | 0.1734 | +3.76 pp |
+| Step 40 | 100/399 | 25.06% | 0.1484 | +1.50 pp |
+| Step 50 | 110/399 | 27.57% | 0.1744 | +4.01 pp |
+| Step 60 | 97/399 | 24.31% | 0.1523 | +0.75 pp |
+| Step 70 | 98/399 | 24.56% | 0.1783 | +1.00 pp |
+| Step 80 | 107/399 | 26.82% | **0.1966** | +3.26 pp |
+| Step 90 | 101/399 | 25.31% | 0.1448 | +1.75 pp |
+| **Step 100** | **119/399** | **29.82%** | 0.1930 | **+6.27 pp** |
+| Step 110 | 101/399 | 25.31% | 0.1601 | +1.75 pp |
+
+### 7.1 Step 100 的统计结论
+
+Step 100 相对 Base：
+
+- Base 失败、Step 100 成功：50 条；
+- Base 成功、Step 100 失败：25 条；
+- 净增加 25 条，success rate 提高 6.27 pp；
+- exact McNemar `p=0.005228`。
+
+这是当前统一 hardened/full-399 协议下最强的 checkpoint 结果。但 Step 100 是从多个
+checkpoint 中事后选出的最佳点，存在 multiple-checkpoint selection 偏差；必须用第二训练
+seed 或独立重复实验确认，不能仅凭一次 run 宣称 shuffle 已建立因果提升。
+
+Step 110 回落到 101/399，相对 Step 100 净少 18 条，exact McNemar `p=0.02734`。因此
+Step 100 后继续训练已出现显著退化，当前不支持盲目延长训练。
+
+### 7.2 Badcase 转移
+
+| 失败标签 | Base | Step 100 | Step 110 |
+| --- | ---: | ---: | ---: |
+| `tool_error` | 178 | 100 | 84 |
+| `no_submit` | 24 | 16 | 19 |
+| `formula_to_static` | 92 | 63 | 63 |
+| `likely_wrong_sheet_or_range` | 44 | 29 | 27 |
+| `formula_result_mismatch` | 173 | 169 | 182 |
+| `execution_clean_score_zero` | 127 | 180 | 214 |
+
+Step 100 明显减少工具错误、未提交、公式静态化和疑似错误范围，但公式结果错误几乎没有
+下降；`execution_clean_score_zero_rate` 反而从 31.83% 升到 45.11%。Step 110 的
+`tool_error` 继续降到 84，成功数却降到 101，且公式结果错误升到 182。这证明工具执行
+指标只能解释协议熟练度，不能替代 workbook success；当前主要瓶颈已经是公式和任务语义。
+
+### 7.3 训练动态
+
+对比 Step 1-10 与 Step 102-111 的训练窗口：
+
+- train success 均值约从 0.2477 升到 0.2814，但 81-90 窗口达到约 0.3241 后回落；
+- valid action 从约 0.8245 升到 0.9431，parser invalid 从 0.1755 降到 0.0569；
+- Python error 从约 0.0514 降到 0.0332，preflight reject 从 0.0300 降到 0.0056；
+- multi-call all-success 从约 0.6760 升到 0.8275，short-circuit 从 0.2805 降到 0.1489；
+- inspect-range 使用下降，recalc 和 submitted-after-recalc 仍很低；
+- response length 与 prompt clipping 上升，entropy 从约 0.2248 降到 0.1036，KL loss 上升。
+
+没有发现数值崩溃或梯度异常；模型主要学会了动作协议和工具执行，后期语义正确性进入平台
+并出现策略收缩。训练内 64 条 fast-val 没有稳定超过 Base，而 full-399 的 Step 100 明显
+更好，进一步确认 fast-val 只能做健康检查，不能用于最终 checkpoint 排名。
+
+## 8. 当前状态与下一步
+
+### 已完成
+
+- [x] 50K 单次 mutation、100K 单轮累计预算和 limit-reject 指标已进入两边 `main`；
+- [x] badcase schema、离线 JSONL/summary、validation/W&B 指标已实现；
+- [x] Base 与候选 checkpoint 的 full-399 顺序/并行评测流程已跑通；
+- [x] 训练集 shuffle 已实现并提交为 `45426b7`；
+- [x] SG1 无 shuffle run 与 NJ5 shufflefix run 已完成全量 checkpoint 对比。
+
+### 仍需完成
+
+1. 用相同 commit、配置和 full-399 协议复现一个新的 shuffle seed，确认 Step100 提升；
+2. 将 Step80、Step100 作为重点候选，同时增加更密集的 80-110 区间保存/全量评测或采用
+   early stopping，避免错过峰值；
+3. 优先改善公式语义、主动 inspect、重算后提交和执行成功但零分的问题，不再只优化
+   parser/tool-error；
+4. manifest 增加 dirty-worktree 标志、diff checksum、dataset fingerprint 和 task ID 列表；
+5. 并行 Ray 评测继续使用独立 `CLUSTER_ID`、`RAY_STATE_FILE`、`HOSTFILE`、`LOG_FILE`
+   和 `RUN_ROOT`；不得在活跃训练节点运行会调用 `ray stop --force` 的启动脚本。

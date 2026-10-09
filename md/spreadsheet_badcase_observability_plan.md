@@ -2,7 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Draft for review; this document does not authorize implementation.
+**Status（2026-10-09）：** 已实现并进入 `main`。核心实现提交为 `18f9142`，训练 shuffle
+与日志级别配套修改在 `45426b7`。下方原始 task checklist 保留作为设计/审计记录；当前
+验收状态以“Implementation status”一节为准。
 
 **Goal:** Preserve the official SpreadsheetBench score and reward semantics while adding bounded, structured observability that explains failed episodes and produces per-task badcase records during experiments.
 
@@ -256,7 +258,27 @@ Rejected because diagnostic match ratios have not yet been validated as stable r
 
 ---
 
-## Implementation tasks
+## Implementation status（2026-10-09）
+
+- [x] Task 1：有界 workbook failure diagnostics 已实现并有专项测试；
+- [x] Task 2：bridge 集成、`off|light|full` 配置和诊断故障隔离已实现；
+- [x] Task 3：schema-v2、多标签分类、旧 schema 兼容和 denominator-aware 汇总已实现；
+- [x] Task 4：`badcases.jsonl`、`badcase_summary.json` 和 paired transition 已实现；
+- [x] Task 5：trainer/W&B 指标、launcher 默认值、manifest 字段和评测后自动报告已实现；
+- [x] Task 6 的代码、文档和真实 full-399 formal-eval 已完成；NJ5
+  `runs/parallel_eval/shufflefix_20261004_202150` 已生成 12 个评测点的报告；
+- [ ] 在当前 `main` 上重新跑完整 `rl/tests`：2026-10-09 文档编辑节点没有 `python`
+  命令，仍需在训练镜像完成最终回归；
+- [ ] 独立 CPU worker smoke 没有可核对的运行产物，暂不标记完成。
+
+实际 full-399 结果显示观测链路没有改变官方评分，并成功揭示“tool error 下降但
+execution-clean score-zero 上升”的分离现象。具体分布见 `md/rollout_badcase_report.md`，
+checkpoint 结果见 `md/experiment_results_20260930.md`。
+
+## Historical implementation task checklist
+
+以下 checkbox 是实施前按 commit 粒度编写的原始步骤，不再作为当前完成状态来源。实际改动
+集中提交于 `18f9142`，没有强行拆成计划中的六个 commit。
 
 ### Task 1: Bounded workbook failure diagnostics
 

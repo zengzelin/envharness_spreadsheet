@@ -1,6 +1,8 @@
 # Spreadsheet GRPO 稳定化结论与 TODO
 
-更新日期：2026-09-19
+更新日期：2026-10-09
+
+> 第 1-3 节保留 2026-09-19 的历史基线。当前结论和现行 TODO 以第 6 节为准。
 
 ## 1. 全量 399 条验证集结论
 
@@ -111,14 +113,15 @@ bash rl/scripts/submit_spreadsheetbench_grpo.sh
 - [x] 检查 epoch/step 预算冲突；
 - [x] 导出 workbook score、执行惩罚、环境总 reward 和无效动作惩罚；
 - [ ] 在训练镜像执行完整 `rl/tests`；
-- [ ] 用两次连续 validation 核对 task ID 集合完全一致；
-- [ ] 跑上述 10-step 低学习率诊断实验。
+- [x] 用固定 task index 和 full-399 产物核对 validation 任务集合一致；
+- [x] 已运行低学习率诊断和后续 100+ step 长训练，结果见实验汇总。
 
 ### P1：根据诊断实验决定 reward 修改
 
 - [ ] 比较 `workbook_score`、`execution_penalty`、invalid-action penalty 与最终
   `success_rate` 的相关性；
-- [ ] 统计 `returncode=0` 但 workbook score 为 0 的轨迹；
+- [x] 统计 `returncode=0` 但 workbook score 为 0 的轨迹，并导出
+  `execution_clean_score_zero`；
 - [ ] 将写工具错误细分为公式被拒绝、shape 不匹配、sheet/range 不存在和 workbook
   损坏；
 - [ ] 若 workbook score 没有改善但 penalty 持续下降，降低 shaping penalty 权重或改为
@@ -128,9 +131,9 @@ bash rl/scripts/submit_spreadsheetbench_grpo.sh
 
 - [ ] 评估 `write_range` 是否需要显式支持公式，而不是将公式一律拒绝为 static-value
   error；
-- [ ] 增加提交前的轻量 workbook 自检，减少未提交和撞到 turn 上限；
-- [ ] 研究单轮多工具调用，降低细粒度工具导致的 episode 膨胀；
-- [ ] 建立固定 64 条 fast-val 清单和独立 399 条 paired-eval 汇总脚本。
+- [x] 增加提交前 workbook 校验、重算 freshness 和 submit gate；
+- [x] 实现单轮最多 4 个工具调用及 multi-call 执行/短路指标；
+- [x] 建立固定 64 条 fast-val 和独立 399 条 paired-eval 汇总流程。
 
 ## 5. 验收标准
 
@@ -141,3 +144,31 @@ bash rl/scripts/submit_spreadsheetbench_grpo.sh
 3. 启动日志和 manifest 能还原学习率、KL 和惩罚配置；
 4. `EPOCHS < TOTAL_TRAINING_STEPS` 时启动立即失败并给出明确错误；
 5. 完整 399 条评测继续以 success count/rate 为 checkpoint 主指标。
+
+## 6. 2026-10-09 当前状态
+
+### 已完成并有真实实验验收
+
+- [x] hardened harness、mutation 上限、损坏 workbook 回滚、公式/`#REF!` 校验；
+- [x] bounded multi-call、`fill_formula`、格式/结构工具和中间重算；
+- [x] badcase light/full 两级观测、离线 summary 和 W&B/validation 指标；
+- [x] 399 条验证与 64 并发解耦，Base/多 checkpoint 全量评测已跑通；
+- [x] train dataset shuffle 已进入 `main`，固定 seed 写入启动配置；
+- [x] NJ5 shufflefix Step 100 达到 `119/399`，相对本组 Base 净增 25 条；
+- [x] 确认 Step 110 回落到 `101/399`，继续训练不是当前默认策略。
+
+### 尚未完成
+
+- [ ] 在可用 Python 3.11/训练镜像中重新执行当前 `main` 的完整 `rl/tests`。2026-10-09
+  文档编辑节点没有 `python` 命令，不能把此前修复前的测试结果当成最终验收；
+- [ ] 用第二个 shuffle seed 复现 Step 100 的 full-399 提升；
+- [ ] 完成 `workbook_score`、执行 penalty、invalid-action penalty 与 success 的定量相关性分析；
+- [ ] 将写工具错误进一步细分为 shape mismatch、sheet/range 不存在和公式校验错误；
+- [ ] 对 Base→Step100 gain/loss 与 Step100→Step110 regression 做逐任务语义归因；
+- [ ] 为 manifest 增加 dirty flag、diff checksum、dataset hash 和完整 task ID fingerprint。
+
+### 当前训练决策
+
+下一轮保持 harness、reward 和模型不变，只改变训练 shuffle seed 做复现。候选选择必须使用
+full-399；fast-val 只监控服务健康和明显退化。若第二 seed 再次在 80-110 步达到峰值，应
+增加该区间评测密度或 early stopping；若不能复现，则先分析 paired badcase，不继续加长训练。

@@ -542,3 +542,53 @@ checkpoint 成功判定。格式差异采用归一化 style 比较，仅作为 `
 还会给出 Base/candidate 标签及 added/removed/retained 转移。各比率必须结合
 `badcase_policy_episode_count`、`badcase_complete_failure_count` 和 unavailable/truncated
 计数阅读，不能把未执行 full 诊断的任务当作零发生率。
+
+## 2026-10-09 shufflefix full-399 badcase 结论
+
+NJ5 `runs/parallel_eval/shufflefix_20261004_202150` 已对 Base 和 Step10-110 完成正式
+full-diagnostics 评测。最佳 Step 100 为 `119/399`，Base 为 `94/399`。以下对比来自各 run
+的 `badcase_summary.json`：
+
+| 指标/标签 | Base | Step 100 | Step 110 |
+| --- | ---: | ---: | ---: |
+| 成功任务 | 94 | 119 | 101 |
+| `tool_error` | 178 | 100 | 84 |
+| `no_submit` | 24 | 16 | 19 |
+| `tool_call_truncated` | 13 | 4 | 9 |
+| `formula_to_static` | 92 | 63 | 63 |
+| `likely_wrong_sheet_or_range` | 44 | 29 | 27 |
+| `formula_result_mismatch` | 173 | 169 | 182 |
+| `execution_clean_score_zero` | 127 | 180 | 214 |
+| `answer_match_ratio_failed_mean` | 0.2760 | 0.2707 | 0.2903 |
+
+### 可以确认的改善
+
+- 模型更少产生工具错误、未提交、调用截断和公式静态化；
+- Step 100 的 multi-call completed rate 从 Base 的 65.74% 提高到 81.34%，short-circuit
+  rate 从 34.26% 降到 18.66%；
+- 疑似写错 sheet/range 的失败数从 44 降到 29；
+- mutation budget exceeded 为 0，说明 50K/100K 上限在本次 full-399 中没有误伤正常任务。
+
+### 仍然存在的主要问题
+
+1. 公式结果错误几乎没有改善，Step 110 甚至恶化到 182 条；
+2. `execution_clean_score_zero` 随训练显著增加，说明“工具全部执行成功”越来越不能代表任务
+   正确；
+3. Step 110 的 `tool_error` 比 Step 100 更低，但 workbook success 少 18 条，不能把降低
+   tool error 直接当作训练目标；
+4. `submitted_after_recalc_rate` 在 Step 100 只有约 0.25%，Step 110 为 0，模型仍很少形成
+   “修改—重算—检查—提交”闭环；
+5. failed-task 的平均 answer match ratio 没有随成功率稳定上升，partial correctness 暂时不适合
+   未经校准直接并入 reward。
+
+### 后续 badcase 分析优先级
+
+按以下集合抽取具体任务，而不是只看聚合标签：
+
+1. Base 失败、Step 100 成功的 50 条：识别真正学到的公式/range 模式；
+2. Base 成功、Step 100 失败的 25 条：识别训练引入的回归；
+3. Step 100 成功、Step 110 失败的任务：定位后期策略收缩；
+4. Step 100 中 `execution_clean_score_zero + formula_result_mismatch` 的任务：优先分析公式语义；
+5. 有 recalc 调用但未在 recalc 后 submit 的任务：检查工具提示、调用顺序和 turn 预算。
+
+格式差异仍只作为信息证据；这些标签都不应在未经独立 A/B 验证前直接转换成 reward。

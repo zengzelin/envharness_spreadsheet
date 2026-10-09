@@ -939,8 +939,8 @@ sgceph1 Step 100 的完整评测没有完成：任务 `spreadsheetbench_verified
 
 从 njceph5 训练日志统计，50K/100K 防护不会明显限制当前数据：正常大范围 format/fill
 最大约 41.4K，超过 50K 的 fill 仅来自 93K/100K 的错误范围，100K multi-call budget
-拒绝的也都是 702K 或 1,048,568-cell 异常调用。该限制应同步到 sgceph1 后，再用相同
-hardened harness 重评 Base、Step 60 和 Step 100。
+拒绝的也都是 702K 或 1,048,568-cell 异常调用。这里提出的“同步到 sgceph1 后重评”是
+2026-09-30 的历史下一步，目前 hardening 已进入双方 `main`，并已由后续 full-399 评测取代。
 
 ## 24. 2026-10-01：官方评分与诊断证据分层
 
@@ -957,3 +957,27 @@ hardened harness 重评 Base、Step 60 和 Step 100。
 训练默认 `light` 只记录执行侧证据，正式独立评测默认 `full`。分析 checkpoint 时应同时看
 官方 success、诊断完整/不可用/截断分母和 paired 标签转移，不应使用诊断 match ratio
 替代 workbook success，也不应在积累稳定性证据前把它加入 reward shaping。
+
+## 25. 2026-10-09：shufflefix 实验后的阶段判断
+
+当前 `main` 已包含两类关键补充：提交 `18f9142` 的 badcase observability，以及提交
+`45426b7` 的 train dataset shuffle/logging 修正。SG1 无 shuffle run `20261001_221238`
+在 full-399 上没有可靠提升；NJ5 shufflefix run `20261004_202150` 的 Step 100 从本组 Base
+`94/399` 提高到 `119/399`，exact McNemar `p=0.005228`，但 Step 110 又回落到 `101/399`。
+
+这组证据更新了下一阶段优先级：
+
+1. 保留 EnvHarness + verl-agent 当前架构，不再以“迁移更多工具”作为首要工作；
+2. 用第二 shuffle seed 复现 Step100，而不是继续单次 run 到更高 step；
+3. checkpoint 选择使用 full-399，64-task fast-val 仅用于健康检查；
+4. 优先处理公式语义、主动 inspect、recalc 后验证/提交和 execution-clean score-zero；
+5. 不把 badcase 标签直接加入 reward。Step100 的工具错误大幅下降，但公式错误几乎不变，
+   已证明执行 shaping 与最终 workbook success 可能分离；
+6. 增强实验 manifest，记录 dirty state、diff checksum、dataset fingerprint 和 task IDs。
+
+并行评测时共享 Ceph 数据没有问题，但 Ray 状态必须按集群隔离：每个集群使用不同的
+`CLUSTER_ID`、`RAY_RUN_DIR`、`RAY_STATE_FILE`、`HOSTFILE`、`LOG_FILE` 和 `RUN_ROOT`。
+不得在仍承担训练任务的节点执行会调用 `ray stop --force` 的集群启动脚本。
+
+完整 checkpoint 表、paired 统计和 TODO 见 `md/experiment_results_20260930.md`；具体失败
+分布见 `md/rollout_badcase_report.md`。
