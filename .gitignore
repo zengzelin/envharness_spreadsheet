@@ -9,3 +9,6 @@ experiments/spreadsheetbench/data/
 
 # Local logs, Ray connection state, and training outputs.
 runs/
+
+# Local isolated implementation worktrees.
+.worktrees/
