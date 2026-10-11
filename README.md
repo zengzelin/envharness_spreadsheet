@@ -5,7 +5,18 @@ Check out our [paper](https://arxiv.org/abs/2608.19880) and [webpage](https://en
 ## 🔥 Updates
 
 <!-- FILL: one dated bullet per release / acceptance / follow-up, newest first. -->
+- [2026-10-10] 新增 [Spreadsheet Work Agent](SPREADSHEET_WORK_AGENT.md)：一个基于
+  事务式、校验感知 Spreadsheet Agent Harness 的工作簿原生 Agent 项目，支持 GRPO 训练
+  和失败诊断。
 - [2026-08-21] We released our [paper](https://arxiv.org/abs/2608.19880) and [website](https://envharness.com/).
+
+## 重点项目：Spreadsheet Work Agent
+
+[Spreadsheet Work Agent](SPREADSHEET_WORK_AGENT.md) 通过“检查—修改—重算—校验—提交”
+闭环处理长程工作簿任务。其 Spreadsheet Agent Harness 提供表格原生工具、事务回滚、有界
+多工具调用、版本感知提交、官方工作簿评测、GRPO 集成和结构化 Badcase 诊断。
+
+项目首页包含系统架构、可复现训练与 full-399 评测入口、当前实验证据、限制及后续路线。
 
 ## 🏴󠁶󠁵󠁭󠁡󠁰󠁿 Overview
 

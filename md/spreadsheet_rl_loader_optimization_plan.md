@@ -1,6 +1,12 @@
 # Spreadsheet-RL Loader 优化实施计划
 
-> **执行要求：** 实施时按任务顺序推进，每个任务先补失败测试，再写最小实现并验证。本文只定义修改方案，当前尚未修改 loader 代码。
+> **历史计划说明（起始于 2026-09-18）：** loader 懒加载、单行物化和 reset 阶段观测后来
+> 已进入代码，但独立 128 actor scale acceptance 仍缺正式报告。下方 checkbox 保留最初
+> TDD 计划，不用来判断当前实现状态；请以
+> [`spreadsheet_work_agent_status.md`](spreadsheet_work_agent_status.md) 为准。
+
+> **原始执行要求（撰写时）：** 实施时按任务顺序推进，每个任务先补失败测试，再写最小
+> 实现并验证。本文最初只定义修改方案；后续实际状态以顶部链接的状态页为准。
 
 **目标：** 消除 Spreadsheet-RL 训练启动阶段 128 个 Ray actor 并发全量扫描 5,925 个任务目录导致的 reset 超时，同时保持任务选择、group rollout、显式 `instance_id` 和现有全量枚举接口的行为兼容。
 

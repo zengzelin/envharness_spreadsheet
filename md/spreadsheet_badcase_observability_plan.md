@@ -1,5 +1,10 @@
 # SpreadsheetBench Badcase Observability Implementation Plan
 
+> **历史计划说明（实施期：2026-10-01 至 2026-10-09）：** 本文的 task checklist 保留
+> 原设计与审计过程；核心能力已经实现，少数运行验收仍待补充。判断当前完成情况请使用
+> [`spreadsheet_work_agent_status.md`](spreadsheet_work_agent_status.md)，不要按下方未回填的
+> granular checkbox 重新实现功能。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Status（2026-10-09）：** 已实现并进入 `main`。核心实现提交为 `18f9142`，训练 shuffle

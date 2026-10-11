@@ -1,5 +1,13 @@
 # EnvHarness on SpreadsheetBench
 
+> **查找当前训练使用的 Spreadsheet Agent？** 请从
+> [Spreadsheet Work Agent](../../SPREADSHEET_WORK_AGENT.md) 开始。加固后的
+> Spreadsheet Agent Harness、原生工具、GRPO 启动脚本、full-399 评测和 Badcase 诊断
+> 均通过 [`rl/`](../../rl/README.md) 操作。
+>
+> 下文记录的是另一条 Corpus 与 Reasoning Bank 研究复现流程，仍可用于复现实验，但不是
+> 当前 Spreadsheet Work Agent 训练使用的运行时。
+
 [RUCKBReasoning/SpreadsheetBench](https://github.com/RUCKBReasoning/SpreadsheetBench).
 Each episode runs in a per-episode sandbox working directory holding a copy of
 the task's input spreadsheet; the policy manipulates it with `run_python(code)`

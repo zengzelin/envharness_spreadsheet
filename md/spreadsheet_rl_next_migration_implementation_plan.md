@@ -1,5 +1,10 @@
 # Spreadsheet-RL 下一阶段迁移实施计划
 
+> **历史计划说明（原始执行期：2026-09-20 至 2026-09-24）：** 本文的逐步骤 checkbox
+> 保留原实施顺序和审计信息，部分能力后来通过其他提交完成，因此未逐项回填不等于当前
+> 功能缺失。当前 authoritative 状态见
+> [`spreadsheet_work_agent_status.md`](spreadsheet_work_agent_status.md)。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在不替换现有 EnvHarness + verl-agent 训练主线的前提下，依次实现完整验评分批、`fill_formula`、单轮多工具调度和剩余高价值表格工具。
